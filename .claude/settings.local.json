@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import py_compile; py_compile.compile\\('iec104_parser.py', doraise=True\\); py_compile.compile\\('gui/main_window.py', doraise=True\\); py_compile.compile\\('gui/about_dialog.py', doraise=True\\); py_compile.compile\\('main.py', doraise=True\\); print\\('All files compiled OK'\\)\")",
+      "Bash(python -c \"from iec104_parser import IEC104Parser, SignalType, TypeID, COT, QualityDescriptor, parse_cp56time2a, parse_cp24time2a; print\\('SignalType.YX.label:', SignalType.YX.label\\); print\\('SignalType.YC.color_hex:', SignalType.YC.color_hex\\); print\\('SignalType.from_ioa\\(0x000100\\):', SignalType.from_ioa\\(0x000100\\).label\\); print\\('SignalType.from_ioa\\(0x010100\\):', SignalType.from_ioa\\(0x010100\\).label\\); print\\('SignalType.from_ioa\\(0x020100\\):', SignalType.from_ioa\\(0x020100\\).label\\); print\\('SignalType.from_ioa\\(0x030100\\):', SignalType.from_ioa\\(0x030100\\).label\\); print\\('SignalType.from_ioa\\(0x040100\\):', SignalType.from_ioa\\(0x040100\\).label\\); print\\('SignalType.from_type_id\\(1\\):', SignalType.from_type_id\\(1\\).label\\); print\\('SignalType.from_type_id\\(45\\):', SignalType.from_type_id\\(45\\).label\\); print\\('SignalType.from_type_id\\(47\\):', SignalType.from_type_id\\(47\\).label\\); print\\('COT.get_description\\(6\\):', COT.get_description\\(6\\)\\); print\\('COT.get_description\\(0x86\\):', COT.get_description\\(0x86\\)\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(python -m PyInstaller --name=\"IEC104_Parser\" --onefile --windowed --noconfirm --clean main.py)"
+    ]
+  }
+}
