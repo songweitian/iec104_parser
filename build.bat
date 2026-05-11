@@ -32,7 +32,7 @@ REM 构建
 echo [构建] 正在创建可执行文件...
 python -m PyInstaller ^
     --name="IEC104_Parser" ^
-    --onefile ^
+    --onedir ^
     --windowed ^
     --icon=NONE ^
     --add-data=".;." ^

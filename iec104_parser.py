@@ -183,15 +183,17 @@ class SignalType(IntEnum):
     @classmethod
     def from_ioa(cls, ioa: int) -> "SignalType":
         """根据IOA地址判定信号类型"""
-        if ioa < 0x010000:
+        if ioa == 0:
+            return cls.OTHER
+        if ioa <= 0x4000:          # 0x0001 ~ 0x4000 → 遥信
             return cls.YX
-        elif ioa < 0x020000:
+        elif ioa <= 0x5000:        # 0x4001 ~ 0x5000 → 遥测
             return cls.YC
-        elif ioa < 0x030000:
+        elif ioa <= 0x6100:        # 0x6001 ~ 0x6100 → 遥控
             return cls.YK
-        elif ioa < 0x040000:
+        elif ioa <= 0x6400:        # 0x6201 ~ 0x6400 → 遥调
             return cls.YT
-        elif ioa < 0x050000:
+        elif ioa <= 0x6600:        # 0x6401 ~ 0x6600 → 遥脉(电度)
             return cls.YM
         return cls.OTHER
 
@@ -731,6 +733,7 @@ class IEC104Parser:
         cleaned = hex_string.replace(" ", "").replace("\n", "").replace("\r", "")
         cleaned = cleaned.replace("0x", "").replace("0X", "")
         cleaned = cleaned.replace(",", "").replace("[", "").replace("]", "")
+        cleaned = cleaned.replace(".", "")  # 日志格式中的分隔符
         cleaned = ''.join(c for c in cleaned if c in '0123456789ABCDEFabcdef')
         if len(cleaned) % 2 != 0:
             raise ValueError("十六进制字符串长度为奇数")
@@ -794,20 +797,20 @@ class IEC104Parser:
         )
 
         # 传送原因 (2字节, 低字节在前)
+        # Byte 0: Cause(bit0-5) + P/N(bit6) + T(bit7)
+        # Byte 1: Originator Address (ORG)
         cot = data[2] + (data[3] << 8)
         asdu.cot = cot
         asdu.cot_cause = cot & 0x3F
         asdu.cot_test = bool((cot >> 7) & 1)
         asdu.cot_pn = bool((cot >> 6) & 1)
-
-        # 源发方地址(ORG)
-        asdu.org = data[4]
+        asdu.org = data[3]  # 源发方地址 = COT高字节
 
         # 公共地址 (2字节, 低字节在前)
-        asdu.common_address = data[5] + (data[6] << 8)
+        asdu.common_address = data[4] + (data[5] << 8)
 
         # 信息元素
-        elem_data = data[7:]
+        elem_data = data[6:]
         offset = 0
         prev_ioa = 0
 

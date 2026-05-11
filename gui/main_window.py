@@ -4,6 +4,7 @@
 
 import os
 import sys
+import re
 import json
 import csv
 import struct
@@ -22,7 +23,7 @@ from PyQt5.QtWidgets import (
     QDialogButtonBox, QFormLayout
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QThread, QTimer
-from PyQt5.QtGui import QFont, QColor, QTextCursor, QIcon, QPalette
+from PyQt5.QtGui import QFont, QColor, QTextCursor, QIcon, QPalette, QPainter, QBrush, QPen, QPixmap
 
 # 确保能找到父模块
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -65,11 +66,16 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.parser = IEC104Parser()
         self.all_frames: List[IEC104Frame] = []
+        self._byte_position_map = []
+        self._frame_byte_offset = []
+        self._current_frame_idx = 0
         self.capture_worker: Optional[CaptureWorker] = None
 
         self.setWindowTitle(self.APP_TITLE)
         self.resize(1320, 840)
         self.setMinimumSize(900, 640)
+
+        self._setup_icon()
 
         self._setup_ui()
         self._setup_menu()
@@ -207,10 +213,9 @@ class MainWindow(QMainWindow):
         self.result_tabs.addTab(self.table_widget, "报文列表")
 
         # 标签页3: 十六进制对照
-        self.hex_view = QPlainTextEdit()
+        self.hex_view = QTextEdit()
         self.hex_view.setReadOnly(True)
         self.hex_view.setFont(QFont("Consolas", 10))
-        self.hex_view.setLineWrapMode(QPlainTextEdit.NoWrap)
         self.result_tabs.addTab(self.hex_view, "原始十六进制")
 
         right_layout.addWidget(self.result_tabs)
@@ -265,6 +270,22 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
         toolbar.addAction("关于", self._on_about)
 
+    def _setup_icon(self):
+        """创建应用程序图标"""
+        pixmap = QPixmap(64, 64)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setBrush(QColor("#1565C0"))
+        painter.setPen(Qt.NoPen)
+        painter.drawRoundedRect(4, 4, 56, 56, 10, 10)
+        painter.setPen(QPen(Qt.white, 2))
+        font = QFont("Arial", 18, QFont.Bold)
+        painter.setFont(font)
+        painter.drawText(pixmap.rect(), Qt.AlignCenter, "104")
+        painter.end()
+        self.setWindowIcon(QIcon(pixmap))
+
     def _setup_statusbar(self):
         """设置状态栏"""
         self.statusbar = QStatusBar()
@@ -301,28 +322,101 @@ class MainWindow(QMainWindow):
     # 解析
     # ==================================================================
 
-    def _on_parse(self):
-        """解析报文"""
-        raw_text = self.hex_input.toPlainText()
-        lines = raw_text.strip().split("\n")
+    def _is_log_format(self, text: str) -> bool:
+        """检测是否为通信日志格式 (时间戳 + RX/TX + 可能含 . 分隔符)"""
+        return bool(re.search(r'\d{2}:\d{2}:\d{2}\.\d{3}\s+(RX|TX):', text)) or \
+               bool(re.search(r'\b[0-9A-Fa-f]{2}\s+\.', text))
 
+    def _hex_to_lines(self, raw_text: str):
+        """智能拆分报文：支持日志格式、换行合并、批量解析"""
+        # 检测日志格式
+        if self._is_log_format(raw_text):
+            return self._parse_log_format(raw_text)
+
+        # 去除空白字符，提取纯十六进制
+        cleaned = ''.join(c for c in raw_text if c in '0123456789ABCDEFabcdef')
+
+        # 尝试将整个输入作为单条报文解析 (自动合并换行)
+        if cleaned and len(cleaned) % 2 == 0 and cleaned[:2].lower() == '68':
+            try:
+                raw_bytes = bytes.fromhex(cleaned)
+                if len(raw_bytes) >= 6 and raw_bytes[0] == 0x68:
+                    apdu_len = raw_bytes[1]
+                    if apdu_len + 2 == len(raw_bytes):
+                        return [cleaned]
+            except ValueError:
+                pass
+
+        # 回退：按行拆分 (批量解析模式)
+        lines = raw_text.strip().split("\n")
         hex_lines = []
         for line in lines:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
             hex_lines.append(line)
+        return hex_lines
+
+    def _parse_log_format(self, text: str) -> list:
+        """解析通信日志格式，返回十六进制报文列表"""
+        lines = text.strip().split('\n')
+        blocks = []      # 报文块列表
+        current_hex = [] # 当前块的十六进制行
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            # 检测时间戳 + 方向头 (如: "13:25:00.692 RX:")
+            m = re.match(r'[\d:.\s]+(RX|TX):\s*$', line)
+            if m:
+                if current_hex:
+                    blocks.append(' '.join(current_hex))
+                    current_hex = []
+                continue
+
+            # 检测纯方向头 (如: "RX:" 或 "TX:")
+            m = re.match(r'^(RX|TX):\s*$', line)
+            if m:
+                if current_hex:
+                    blocks.append(' '.join(current_hex))
+                    current_hex = []
+                continue
+
+            # 十六进制数据行
+            if re.search(r'[0-9A-Fa-f]{2}', line):
+                current_hex.append(line)
+
+        # 最后一个块
+        if current_hex:
+            blocks.append(' '.join(current_hex))
+
+        return blocks
+
+    def _on_parse(self):
+        """解析报文"""
+        raw_text = self.hex_input.toPlainText()
+        hex_lines = self._hex_to_lines(raw_text)
 
         if not hex_lines:
             QMessageBox.information(self, "提示", "请输入十六进制报文数据")
             return
+
+        # Build byte-to-text-position map for highlighting
+        self._byte_position_map = self._build_byte_position_map(raw_text)
+        self._frame_byte_offset = []
+        byte_offset = 0
+        for hl in hex_lines:
+            self._frame_byte_offset.append(byte_offset)
+            cleaned = ''.join(c for c in hl if c in '0123456789ABCDEFabcdef')
+            byte_offset += len(cleaned) // 2
 
         self.lbl_line_count.setText(f"{len(hex_lines)} 行")
         self.parser.clear()
         self.all_frames = self.parser.parse_multiple(hex_lines)
 
         self._populate_table()
-        self._populate_tree(0)
         self._update_status_stats()
 
         self.result_tabs.setCurrentIndex(1)
@@ -336,6 +430,8 @@ class MainWindow(QMainWindow):
         self.hex_input.clear()
         self.parser.clear()
         self.all_frames.clear()
+        self._byte_position_map = []
+        self._frame_byte_offset = []
         self.tree_widget.clear()
         self.table_widget.setRowCount(0)
         self.hex_view.clear()
@@ -538,6 +634,23 @@ class MainWindow(QMainWindow):
     # 填充表格/树
     # ==================================================================
 
+    def _row_color_for_frame(self, frame: IEC104Frame) -> QColor:
+        """根据帧类型返回行背景色"""
+        if frame.error:
+            return QColor("#FFF0F0")  # 错误: 浅红
+        if not frame.apci:
+            return QColor("#FFFFFF")
+        ftype = frame.apci.frame_type
+        if ftype == "I-format":
+            if frame.signal_type == SignalType.YK or frame.signal_type == SignalType.YT:
+                return QColor("#FFF8E1")  # 控制: 浅橙
+            return QColor("#F5FAFF")  # 数据: 浅蓝
+        elif ftype == "S-format":
+            return QColor("#F5FFF5")  # 确认: 浅绿
+        elif ftype == "U-format":
+            return QColor("#FFF5FA")  # 控制: 浅粉
+        return QColor("#FFFFFF")
+
     def _populate_table(self):
         """填充报文列表表格"""
         self.table_widget.setRowCount(0)
@@ -545,7 +658,13 @@ class MainWindow(QMainWindow):
             row = self.table_widget.rowCount()
             self.table_widget.insertRow(row)
 
-            self._set_table_item(row, 0, str(frame.index))
+            # 行背景色
+            row_color = self._row_color_for_frame(frame)
+
+            # 序号
+            idx_item = QTableWidgetItem(str(frame.index))
+            idx_item.setBackground(row_color)
+            self.table_widget.setItem(row, 0, idx_item)
 
             # 方向
             dir_item = QTableWidgetItem(frame.direction)
@@ -553,6 +672,7 @@ class MainWindow(QMainWindow):
                 dir_item.setForeground(QColor("#E91E63"))
             elif "子站→主站" in frame.direction:
                 dir_item.setForeground(QColor("#2196F3"))
+            dir_item.setBackground(row_color)
             self.table_widget.setItem(row, 1, dir_item)
 
             # 信号类型
@@ -560,6 +680,7 @@ class MainWindow(QMainWindow):
             if frame.signal_type != SignalType.OTHER:
                 sig_item.setForeground(QColor(frame.signal_type.color_hex))
                 sig_item.setFont(QFont(self.font().family(), self.font().pointSize(), QFont.Bold))
+            sig_item.setBackground(row_color)
             self.table_widget.setItem(row, 2, sig_item)
 
             # 类型标识
@@ -567,43 +688,50 @@ class MainWindow(QMainWindow):
                 tid_text = f"{frame.asdu.type_id}: {TypeID.get_description(frame.asdu.type_id)}"
             else:
                 tid_text = frame.apci.frame_type if frame.apci else "-"
-            self._set_table_item(row, 3, tid_text)
+            self._set_table_item(row, 3, tid_text, row_color)
 
             # 传送原因
             if frame.asdu:
                 cot_text = f"({frame.asdu.cot_cause}) {COT.get_description(frame.asdu.cot)}"
             else:
                 cot_text = "-"
-            self._set_table_item(row, 4, cot_text)
+            self._set_table_item(row, 4, cot_text, row_color)
 
             # 公共地址
             ca_text = f"0x{frame.asdu.common_address:04X}" if frame.asdu else "-"
-            self._set_table_item(row, 5, ca_text)
+            self._set_table_item(row, 5, ca_text, row_color)
 
             # 对象数
             obj_text = str(frame.asdu.number_of_objects) if frame.asdu else "-"
-            self._set_table_item(row, 6, obj_text)
+            self._set_table_item(row, 6, obj_text, row_color)
 
             # 值 (汇总)
             if frame.asdu and frame.asdu.information_elements:
                 vals = []
                 for elem in frame.asdu.information_elements:
                     vals.append(elem.value_desc)
-                self._set_table_item(row, 7, " | ".join(vals))
+                self._set_table_item(row, 7, " | ".join(vals), row_color)
             else:
-                self._set_table_item(row, 7, "-")
+                self._set_table_item(row, 7, "-", row_color)
 
             # 描述
             desc = frame.description if frame.description else (frame.error if frame.error else "")
-            self._set_table_item(row, 8, desc)
+            self._set_table_item(row, 8, desc, row_color)
 
         self.table_widget.resizeColumnsToContents()
-        # 确保关键列有足够宽度
         self.table_widget.setColumnWidth(2, 60)
         self.table_widget.setColumnWidth(7, 300)
 
-    def _set_table_item(self, row: int, col: int, text: str):
+        # 自动选中第一条报文
+        if self.all_frames and self.table_widget.rowCount() > 0:
+            self._current_frame_idx = 0
+            self.table_widget.selectRow(0)
+            self._populate_tree(0)
+
+    def _set_table_item(self, row: int, col: int, text: str, bg: QColor = None):
         item = QTableWidgetItem(text)
+        if bg:
+            item.setBackground(bg)
         self.table_widget.setItem(row, col, item)
 
     def _populate_tree(self, frame_index: int):
@@ -615,8 +743,9 @@ class MainWindow(QMainWindow):
 
         frame = self.all_frames[frame_index]
 
-        # 根节点
-        self._add_tree_item(None, f"报文 #{frame.index}", frame.raw_hex, "")
+        # 根节点 (整个报文)
+        self._add_tree_item(None, f"报文 #{frame.index}", frame.raw_hex, "",
+                           byte_range=(0, frame.apci.total_length if frame.apci else 0))
 
         # 基本信息
         info_root = self._add_tree_item(None, "基本信息", "", "")
@@ -639,26 +768,32 @@ class MainWindow(QMainWindow):
         if frame.description:
             self._add_tree_item(info_root, "描述", frame.description, "")
 
-        # APCI
+        # APCI (字节0-5)
         if frame.apci:
             apci = frame.apci
             apci_root = self._add_tree_item(
-                None, "APCI (应用规约控制信息)", "", "帧控制信息")
-            self._add_tree_item(apci_root, "起始字节", f"0x{apci.start_byte:02X} (68H)", "固定0x68")
+                None, "APCI (应用规约控制信息)", "", "帧控制信息",
+                byte_range=(0, 6))
+            self._add_tree_item(apci_root, "起始字节", f"0x{apci.start_byte:02X} (68H)", "固定0x68",
+                               byte_range=(0, 1))
             self._add_tree_item(apci_root, "APDU长度", f"{apci.apdu_length} 字节",
-                                f"总帧长={apci.total_length}字节")
+                                f"总帧长={apci.total_length}字节",
+                                byte_range=(1, 2))
             self._add_tree_item(apci_root, "帧类型", apci.frame_type,
-                                self._frame_type_desc(apci.frame_type))
+                                self._frame_type_desc(apci.frame_type),
+                                byte_range=(2, 6))
             self._add_tree_item(apci_root, "发送序号SN", str(apci.send_seq),
                                 "Send Sequence Number")
             self._add_tree_item(apci_root, "接收序号RN", str(apci.recv_seq),
                                 "Receive Sequence Number")
 
-        # ASDU
+        # ASDU (字节6+)
         if frame.asdu:
             asdu = frame.asdu
+            asdu_end = frame.apci.total_length if frame.apci else 6 + len(asdu.raw_data)
             asdu_root = self._add_tree_item(
-                None, "ASDU (应用服务数据单元)", "", "应用数据")
+                None, "ASDU (应用服务数据单元)", "", "应用数据",
+                byte_range=(6, asdu_end))
 
             sig_color = QColor(asdu.signal_type.color_hex) \
                 if asdu.signal_type != SignalType.OTHER else None
@@ -668,22 +803,26 @@ class MainWindow(QMainWindow):
 
             self._add_tree_item(asdu_root, "类型标识",
                                 f"{asdu.type_id} ({TypeID.get_name(asdu.type_id)})",
-                                TypeID.get_description(asdu.type_id))
+                                TypeID.get_description(asdu.type_id),
+                                byte_range=(6, 7))
             self._add_tree_item(asdu_root, "VSQ (可变结构限定词)",
                                 f"0x{asdu.vsq:02X}",
                                 f"对象数={asdu.number_of_objects}, "
-                                f"地址类型={'顺序' if asdu.is_sequence else '离散'}")
+                                f"地址类型={'顺序' if asdu.is_sequence else '离散'}",
+                                byte_range=(7, 8))
             self._add_tree_item(asdu_root, "传送原因",
                                 f"0x{asdu.cot:04X} ({asdu.cot_cause})",
                                 COT.get_description(asdu.cot) +
                                 (", 试验" if asdu.cot_test else "") +
-                                (", 否定确认" if asdu.cot_pn else ""))
+                                (", 否定确认" if asdu.cot_pn else ""),
+                                byte_range=(8, 10))
             self._add_tree_item(asdu_root, "源发方地址(ORG)",
                                 f"0x{asdu.org:02X} ({asdu.org})",
-                                "发方/源地址(OCTET)")
+                                "COT高字节/源发方地址")
             self._add_tree_item(asdu_root, "公共地址(ASDU地址)",
                                 f"0x{asdu.common_address:04X} ({asdu.common_address})",
-                                "公共地址/ASDU地址(2字节)")
+                                "公共地址/ASDU地址(2字节)",
+                                byte_range=(10, 12))
 
             # 信息元素
             for i, elem in enumerate(asdu.information_elements):
@@ -722,7 +861,7 @@ class MainWindow(QMainWindow):
         }.get(st, "")
 
     def _add_tree_item(self, parent, col0: str, col1: str, col2: str,
-                       fg_color: QColor = None) -> QTreeWidgetItem:
+                       fg_color: QColor = None, byte_range: tuple = None) -> QTreeWidgetItem:
         if parent:
             item = QTreeWidgetItem(parent)
         else:
@@ -733,6 +872,8 @@ class MainWindow(QMainWindow):
         if fg_color:
             for col in range(3):
                 item.setForeground(col, fg_color)
+        if byte_range:
+            item.setData(0, Qt.UserRole, byte_range)
         return item
 
     def _frame_type_desc(self, ftype: str) -> str:
@@ -744,16 +885,42 @@ class MainWindow(QMainWindow):
             return "未编号控制格式(启动/停止/测试)"
         return ""
 
-    def _update_hex_view(self, frame_index: int):
-        """更新十六进制视图"""
+    def _update_hex_view(self, frame_index: int, highlight_start: int = -1, highlight_end: int = -1):
+        """更新十六进制视图，可选高亮指定字节范围"""
         if frame_index < 0 or frame_index >= len(self.all_frames):
             return
         frame = self.all_frames[frame_index]
-        self.hex_view.setPlainText(
-            f"# 报文 #{frame.index} 原始十六进制\n\n"
-            f"原始: {frame.raw_hex}\n\n"
-            f"格式化:\n{self._format_hex(frame.raw_hex)}"
+        html = self._format_hex_html(frame.raw_hex, highlight_start, highlight_end)
+        self.hex_view.setHtml(
+            f"<p style='color:#666;font-family:Consolas;font-size:10pt'>"
+            f"# 报文 #{frame.index} 原始十六进制</p>"
+            f"<p style='font-family:Consolas;font-size:10pt'>{html}</p>"
         )
+
+    def _format_hex_html(self, raw: str, hl_start: int = -1, hl_end: int = -1) -> str:
+        """格式化十六进制为HTML，支持高亮指定字节范围"""
+        cleaned = raw.replace(" ", "").replace("\n", "")
+        cleaned = ''.join(c for c in cleaned if c in '0123456789ABCDEFabcdef')
+        if len(cleaned) % 2 != 0:
+            return raw
+
+        parts = []
+        for i in range(0, len(cleaned), 2):
+            if i > 0:
+                if i % 32 == 0:
+                    parts.append("<br>")
+                else:
+                    parts.append(" ")
+            byte_idx = i // 2
+            hex_byte = cleaned[i:i+2].upper()
+            if hl_start <= byte_idx < hl_end:
+                parts.append(
+                    f'<span style="background-color:#FFEB3B;color:#000;'
+                    f'padding:1px 2px;border-radius:2px">{hex_byte}</span>'
+                )
+            else:
+                parts.append(hex_byte)
+        return "".join(parts)
 
     def _format_hex(self, raw: str) -> str:
         """格式化十六进制字符串，每16字节换行"""
@@ -776,12 +943,122 @@ class MainWindow(QMainWindow):
 
     def _on_table_click(self, row: int, col: int):
         """表格行点击 -> 显示详情树和十六进制"""
+        self._current_frame_idx = row
         self._populate_tree(row)
         self.result_tabs.setCurrentIndex(0)
 
     def _on_tree_select(self):
-        """树节点选择"""
-        pass
+        """树节点选择时高亮对应原始报文位置（输入区和十六进制视图）"""
+        items = self.tree_widget.selectedItems()
+        if not items:
+            self._update_hex_view(self._current_frame_idx)
+            self._clear_input_highlight()
+            return
+
+        item = items[0]
+        byte_range = item.data(0, Qt.UserRole)
+        if byte_range:
+            self._update_hex_view(self._current_frame_idx,
+                                  highlight_start=byte_range[0],
+                                  highlight_end=byte_range[1])
+            self._highlight_input_bytes(byte_range[0], byte_range[1], self._current_frame_idx)
+        else:
+            self._update_hex_view(self._current_frame_idx)
+            self._clear_input_highlight()
+
+    def _clear_input_highlight(self):
+        """清除输入区高亮"""
+        self.hex_input.setExtraSelections([])
+
+    def _highlight_input_bytes(self, start_byte: int, end_byte: int, frame_index: int = 0):
+        """在原始报文输入区高亮指定字节范围"""
+        byte_map = getattr(self, '_byte_position_map', [])
+        frame_offsets = getattr(self, '_frame_byte_offset', [])
+
+        # Convert frame-relative to global byte index
+        if frame_index < len(frame_offsets):
+            offset = frame_offsets[frame_index]
+            start_byte += offset
+            end_byte += offset
+
+        if start_byte >= len(byte_map) or end_byte > len(byte_map):
+            return
+
+        text_start = byte_map[start_byte]
+        text_end = byte_map[end_byte - 1] + 1
+
+        cursor = self.hex_input.textCursor()
+        cursor.setPosition(text_start)
+        cursor.setPosition(text_end, QTextCursor.KeepAnchor)
+
+        extra_sel = QTextEdit.ExtraSelection()
+        extra_sel.format.setBackground(QColor("#FFEB3B"))
+        extra_sel.format.setForeground(QColor("#000000"))
+        extra_sel.cursor = cursor
+        self.hex_input.setExtraSelections([extra_sel])
+
+    def _build_byte_position_map(self, text: str) -> list:
+        """构建字节索引到原始文本位置的映射。
+        处理普通十六进制和带时间戳/方向标记的通信日志格式。
+        返回 list[byte_idx] = text_position_of_first_hex_char。
+        """
+        byte_map = []
+        is_log = self._is_log_format(text)
+        i = 0
+        n = len(text)
+
+        while i < n:
+            if is_log:
+                rest = text[i:]
+                # 跳过纯元数据行 (时间戳 + RX/TX，行尾无十六进制数据)
+                m = re.match(r'[\d:.\s]+(?:RX|TX):[ \t]*[\r\n]+', rest)
+                if m:
+                    i += m.end()
+                    continue
+                m = re.match(r'^(?:RX|TX):[ \t]*[\r\n]+', rest)
+                if m:
+                    i += m.end()
+                    continue
+
+                # 跳过行首的元数据前缀 (时间戳 + RX/TX + 空格，后面跟十六进制数据)
+                m = re.match(r'[\d:.\s]+(?:RX|TX):[ \t]*', rest)
+                if m:
+                    i += m.end()
+                else:
+                    m = re.match(r'^(?:RX|TX):[ \t]*', rest)
+                    if m:
+                        i += m.end()
+
+            # 从当前位置开始收集十六进制字节对
+            byte_start = None
+            byte_chars = []
+            while i < n:
+                c = text[i]
+                if c in '0123456789ABCDEFabcdef':
+                    if byte_start is None:
+                        byte_start = i
+                    byte_chars.append(c)
+                    if len(byte_chars) == 2:
+                        byte_map.append(byte_start)
+                        byte_chars = []
+                        byte_start = None
+                elif c in '\r\n':
+                    i += 1
+                    break
+                # else: 分隔符 (. 或 空格), 忽略
+                i += 1
+            else:
+                break  # 文本结束
+
+        return byte_map
+
+    def _current_frame_index(self) -> int:
+        """获取当前展示的报文索引"""
+        for i in range(self.table_widget.rowCount()):
+            item = self.table_widget.item(i, 0)
+            if item and item.isSelected():
+                return i
+        return 0
 
     def _on_about(self):
         """关于对话框"""
