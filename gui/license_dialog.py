@@ -1,0 +1,113 @@
+"""
+激活对话框
+"""
+
+from PyQt5.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QLineEdit, QGroupBox, QFormLayout, QMessageBox, QApplication
+)
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QFont
+
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from license import get_hardware_fingerprint, get_license_info, activate
+
+
+class LicenseDialog(QDialog):
+    """激活对话框"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("软件激活")
+        self.setFixedSize(450, 320)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        self._setup_ui()
+        self._check_license()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+        layout.setContentsMargins(20, 16, 20, 16)
+
+        # 标题
+        title = QLabel("IEC104 报文解析器 - 激活")
+        title.setFont(QFont("Microsoft YaHei", 14, QFont.Bold))
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+
+        # 状态
+        self.lbl_status = QLabel("")
+        self.lbl_status.setAlignment(Qt.AlignCenter)
+        self.lbl_status.setStyleSheet("font-size: 11pt; padding: 8px;")
+        layout.addWidget(self.lbl_status)
+
+        # 硬件指纹
+        fp_group = QGroupBox("硬件指纹")
+        fp_layout = QFormLayout()
+        self.lbl_fingerprint = QLabel(get_hardware_fingerprint())
+        self.lbl_fingerprint.setFont(QFont("Consolas", 10))
+        self.lbl_fingerprint.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        fp_layout.addRow("指纹:", self.lbl_fingerprint)
+        fp_group.setLayout(fp_layout)
+        layout.addWidget(fp_group)
+
+        # 激活码输入
+        input_group = QGroupBox("输入激活码")
+        input_layout = QHBoxLayout()
+        self.code_input = QLineEdit()
+        self.code_input.setPlaceholderText("XXXX-XXXX-XXXX-XXXX")
+        self.code_input.setFont(QFont("Consolas", 11))
+        self.code_input.setMaxLength(19)
+        input_layout.addWidget(self.code_input)
+
+        self.btn_activate = QPushButton("激活")
+        self.btn_activate.setMinimumWidth(70)
+        self.btn_activate.clicked.connect(self._on_activate)
+        input_layout.addWidget(self.btn_activate)
+        input_group.setLayout(input_layout)
+        layout.addWidget(input_group)
+
+        # 提示
+        hint = QLabel("请将硬件指纹发送给开发者获取激活码")
+        hint.setStyleSheet("color: #666; font-size: 9pt;")
+        hint.setAlignment(Qt.AlignCenter)
+        layout.addWidget(hint)
+
+        layout.addStretch()
+
+        # 关闭按钮
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(close_btn)
+        layout.addLayout(btn_layout)
+
+    def _check_license(self):
+        """检查当前激活状态"""
+        info = get_license_info()
+        if info["activated"]:
+            self.lbl_status.setText("✅ 已激活")
+            self.lbl_status.setStyleSheet("color: #4CAF50; font-size: 11pt; padding: 8px;")
+            self.code_input.setEnabled(False)
+            self.btn_activate.setEnabled(False)
+        else:
+            self.lbl_status.setText("⚠ 未激活 - 仅支持单条报文解析")
+            self.lbl_status.setStyleSheet("color: #FF9800; font-size: 11pt; padding: 8px;")
+
+    def _on_activate(self):
+        """执行激活"""
+        code = self.code_input.text().strip()
+        if not code:
+            QMessageBox.warning(self, "提示", "请输入激活码")
+            return
+
+        success, msg = activate(code)
+        if success:
+            QMessageBox.information(self, "成功", msg)
+            self._check_license()
+        else:
+            QMessageBox.warning(self, "失败", msg)

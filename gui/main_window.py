@@ -78,7 +78,6 @@ class ParseWorker(QThread):
     def run(self):
         """在后台线程中执行解析"""
         try:
-            from copy import copy
             # 创建独立的解析器副本，避免线程间干扰
             worker_parser = IEC104Parser(self.parse_mode)
             worker_parser.set_master_send_first(IEC104Parser.DEFAULT_MASTER_FIRST)
@@ -358,6 +357,7 @@ class MainWindow(QMainWindow):
         self._dark_theme = False
         self._current_theme = "light"
         self._auto_detect = True
+        self._is_activated = False
 
         # 后台解析相关
         self._parse_worker: Optional[ParseWorker] = None
@@ -375,6 +375,7 @@ class MainWindow(QMainWindow):
         self._setup_toolbar()
         self._setup_statusbar()
 
+        self._check_license()
         self._update_status_stats()
 
         self.hex_input.setPlainText(
@@ -642,6 +643,8 @@ class MainWindow(QMainWindow):
         tools_menu.addAction("IOA地址别名(&I)...", self._on_manage_aliases, "Ctrl+Shift+I")
 
         help_menu = menubar.addMenu("帮助(&H)")
+        help_menu.addAction("软件激活(&A)...", self._open_license_dialog)
+        help_menu.addSeparator()
         help_menu.addAction("关于(&A)...", self._on_about)
 
     def _setup_toolbar(self):
@@ -881,10 +884,6 @@ class MainWindow(QMainWindow):
         self.table_widget.setRowCount(0)
         self.hex_view.clear()
 
-        # 预处理输入区颜色（仅普通模式）
-        if self.parse_mode == ParseMode.NORMAL:
-            self._apply_input_line_colors()
-
         # 自动检测模式
         if self._auto_detect:
             detected = self._auto_detect_mode(raw_text)
@@ -892,7 +891,9 @@ class MainWindow(QMainWindow):
                 self.parse_mode = detected
                 idx = self.mode_combo.findData(detected)
                 if idx >= 0:
+                    self.mode_combo.blockSignals(True)
                     self.mode_combo.setCurrentIndex(idx)
+                    self.mode_combo.blockSignals(False)
                 self.statusbar.showMessage(f"自动检测到 {detected.value.upper()} 模式", 2000)
 
         # 启动后台解析
@@ -959,6 +960,10 @@ class MainWindow(QMainWindow):
             self._frame_input_lines = self._parse_worker._frame_input_lines
         else:
             self._frame_input_lines = [[] for _ in self.all_frames]
+
+        # 应用输入行颜色（仅普通模式）
+        if self.parse_mode == ParseMode.NORMAL:
+            self._apply_input_line_colors()
 
         # 更新UI
         self._last_send_seq = -1
@@ -1169,6 +1174,8 @@ class MainWindow(QMainWindow):
 
     def _on_export_csv(self):
         """导出CSV - 支持筛选后导出"""
+        if not self._require_license():
+            return
         if not self.all_frames:
             QMessageBox.information(self, "提示", "没有可导出的数据")
             return
@@ -1229,6 +1236,8 @@ class MainWindow(QMainWindow):
 
     def _on_export_json(self):
         """导出JSON - 支持筛选后导出"""
+        if not self._require_license():
+            return
         if not self.all_frames:
             QMessageBox.information(self, "提示", "没有可导出的数据")
             return
@@ -1310,6 +1319,8 @@ class MainWindow(QMainWindow):
 
     def _on_export_txt(self):
         """导出TXT - 支持筛选后导出"""
+        if not self._require_license():
+            return
         if not self.all_frames:
             QMessageBox.information(self, "提示", "没有可导出的数据")
             return
@@ -2281,7 +2292,6 @@ class MainWindow(QMainWindow):
             self.lbl_search_count.setText("")
             return
 
-        import re
         try:
             pattern = re.compile(text, re.IGNORECASE)
         except re.error:
@@ -2336,6 +2346,8 @@ class MainWindow(QMainWindow):
 
     def _on_import_file(self):
         """导入文件（支持多选）"""
+        if not self._require_license():
+            return
         paths, _ = QFileDialog.getOpenFileNames(
             self, "导入报文文件", "",
             "报文文件 (*.txt *.log *.hex *.dat *.bin *.pcap);;所有文件 (*.*)"
@@ -2515,6 +2527,8 @@ class MainWindow(QMainWindow):
 
     def _open_generator(self):
         """打开帧生成器对话框"""
+        if not self._require_license():
+            return
         from gui.generator_dialog import GeneratorDialog
         dialog = GeneratorDialog(self)
         if dialog.exec_() == QDialog.Accepted:
@@ -2522,6 +2536,8 @@ class MainWindow(QMainWindow):
 
     def _open_compare(self):
         """打开报文对比"""
+        if not self._require_license():
+            return
         from gui.compare_dialog import CompareDialog
         dialog = CompareDialog(self)
         dialog.exec_()
@@ -2585,7 +2601,7 @@ class MainWindow(QMainWindow):
 
     def _quick_add_alias(self, ioa: int):
         """快捷添加IOA别名"""
-        from gui.ioa_alias_dialog import save_aliases, load_aliases, invalidate_alias_cache
+        from gui.ioa_alias_dialog import save_aliases, load_aliases
         alias, ok = QInputDialog.getText(self, "添加别名",
                                           f"为 IOA=0x{ioa:06X} 设置别名:")
         if ok and alias:
@@ -2631,8 +2647,39 @@ class MainWindow(QMainWindow):
         """关于对话框"""
         AboutDialog(self.APP_TITLE, self.APP_VERSION).exec_()
 
+    def _check_license(self):
+        """检查授权状态"""
+        from license import is_activated
+        self._is_activated = is_activated()
+        if not self._is_activated:
+            self.setWindowTitle(f"{self.APP_TITLE} [未激活 - 仅支持单条解析]")
+
+    def _require_license(self) -> bool:
+        """检查是否需要激活，未激活则提示并返回False"""
+        if self._is_activated:
+            return True
+        QMessageBox.information(self, "功能限制",
+                                "此功能需要激活后使用。\n\n"
+                                "请在 帮助 → 软件激活 中输入激活码。\n"
+                                "将硬件指纹发送给开发者即可获取激活码。")
+        return False
+
+    def _open_license_dialog(self):
+        """打开激活对话框"""
+        from gui.license_dialog import LicenseDialog
+        dialog = LicenseDialog(self)
+        dialog.exec_()
+        # 重新检查授权状态
+        old_status = self._is_activated
+        self._check_license()
+        if self._is_activated and not old_status:
+            self.setWindowTitle(self.APP_TITLE)
+            QMessageBox.information(self, "激活成功", "软件已激活，所有功能已解锁！")
+
     def _open_history_manager(self):
         """打开历史报文管理"""
+        if not self._require_license():
+            return
         from gui.history_dialog import HistoryDialog
         dialog = HistoryDialog(self)
         if dialog.exec_() == QDialog.Accepted and dialog.selected_session:
