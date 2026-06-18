@@ -625,20 +625,26 @@ class MainWindow(QMainWindow):
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
 
-        toolbar.addAction("解析", self._on_parse)
-        toolbar.addAction("导入", self._on_import_file)
+        act_parse = toolbar.addAction("解析", self._on_parse)
+        act_parse.setToolTip("解析报文 (F5)")
+        act_import = toolbar.addAction("导入", self._on_import_file)
+        act_import.setToolTip("导入文件 (Ctrl+I)")
         toolbar.addSeparator()
-        toolbar.addAction("生成报文", self._open_generator)
+        act_gen = toolbar.addAction("生成报文", self._open_generator)
+        act_gen.setToolTip("帧生成器 (Ctrl+G)")
         toolbar.addSeparator()
-        toolbar.addAction("CSV", self._on_export_csv)
-        toolbar.addAction("JSON", self._on_export_json)
+        act_csv = toolbar.addAction("CSV", self._on_export_csv)
+        act_csv.setToolTip("导出CSV (Ctrl+Shift+C)")
+        act_json = toolbar.addAction("JSON", self._on_export_json)
+        act_json.setToolTip("导出JSON (Ctrl+Shift+J)")
         toolbar.addSeparator()
         self._left_panel_visible = True
         self._toggle_input_action = toolbar.addAction("◀ 隐藏输入")
         self._toggle_input_action.triggered.connect(self._toggle_input_panel)
         self._toggle_input_action.setToolTip("折叠/展开原始报文输入面板 (Ctrl+B)")
         toolbar.addSeparator()
-        toolbar.addAction("关于", self._on_about)
+        act_about = toolbar.addAction("关于", self._on_about)
+        act_about.setToolTip("关于本软件")
 
     def _setup_icon(self):
         """创建应用程序图标"""
