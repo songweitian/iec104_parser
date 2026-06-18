@@ -1975,7 +1975,7 @@ class MainWindow(QMainWindow):
     def _locate_original_message(self, row: int):
         """定位原始报文 - 滚动到输入区对应位置并高亮"""
         line_map = getattr(self, '_frame_input_lines', [])
-        if row >= len(line_map) or not line_map[row]:
+        if row < 0 or row >= len(line_map) or not line_map[row]:
             self.statusbar.showMessage("未找到对应的原始报文位置", 2000)
             return
 
