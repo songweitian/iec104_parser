@@ -96,6 +96,21 @@ class TypeID(IntEnum):
     C_CD_NA_1   = 106  # 延迟获取命令
     C_TS_TA_1   = 107  # 带CP56Time2a时标的测试命令
 
+    # 控制方向 - 参数命令
+    P_ME_NA_1   = 108  # 参数（归一化值）
+    P_ME_NB_1   = 109  # 参数（标度化值）
+    P_ME_NC_1   = 110  # 参数（短浮点）
+
+    # 文件传输
+    F_FR_NA_1   = 120  # 文件 ready
+    F_SR_NA_1   = 121  # 文件 select
+    F_SC_NA_1   = 122  # 文件 call/abort
+    F_LS_NA_1   = 123  # 文件 last section
+    F_FA_NA_1   = 124  # 文件确认
+    F_SG_NA_1   = 125  # 文件 segment
+    F_DR_TA_1   = 126  # 文件目录
+    F_SC_NB_1   = 127  # 文件 call/abort (带名称)
+
     @classmethod
     def get_name(cls, type_id: int) -> str:
         try:
@@ -108,7 +123,7 @@ class TypeID(IntEnum):
         """判断类型标识的方向"""
         if 1 <= type_id <= 44 or type_id == 70:
             return "监视方向"
-        elif 45 <= type_id <= 69 or 100 <= type_id <= 107:
+        elif 45 <= type_id <= 69 or 100 <= type_id <= 110 or 120 <= type_id <= 127:
             return "控制方向"
         elif 128 <= type_id <= 255:
             return "自定义范围"
@@ -172,6 +187,17 @@ class TypeID(IntEnum):
             105: "复位进程命令",
             106: "延迟获取命令",
             107: "测试命令(CP56Time2a)",
+            108: "参数(归一化)",
+            109: "参数(标度化)",
+            110: "参数(短浮点)",
+            120: "文件 ready",
+            121: "文件 select",
+            122: "文件 call/abort",
+            123: "文件 last section",
+            124: "文件确认",
+            125: "文件 segment",
+            126: "文件目录",
+            127: "文件 call/abort(带名称)",
         }
         return descriptions.get(type_id, "未知")
 
@@ -613,7 +639,7 @@ def parse_log_format_blocks(text: str) -> tuple:
 # ============================================================================
 
 # TypeID 集合：用于方向判定
-_CONTROL_TYPE_IDS = set(range(45, 65)) | set(range(100, 108))
+_CONTROL_TYPE_IDS = set(range(45, 65)) | set(range(100, 111)) | set(range(120, 128))
 _MONITOR_TYPE_IDS = set(range(1, 41)) | {70}
 
 
@@ -1337,6 +1363,79 @@ class IEC104Parser:
             elif type_id in (58, 59, 60, 61, 62, 63, 64):
                 consumed = self._parse_control_command_timestamp(type_id, data, elem)
 
+            elif type_id == 5:  # M_ST_NA_1 步位置信息 (遥测): step(1) + QDS(1) = 2
+                if len(data) >= 2:
+                    elem.value = data[0]
+                    elem.value_desc = f"步位置={data[0]} | DEC={data[0]} HEX=0x{data[0]:02X}"
+                    elem.quality = QualityDescriptor(data[1])
+                    consumed = 2
+
+            elif type_id == 6:  # M_ST_TA_1 带时标的步位置信息 (遥测): step(1) + QDS(1) + CP24Time2a(3) = 5
+                if len(data) >= 2:
+                    elem.value = data[0]
+                    elem.value_desc = f"步位置={data[0]} | DEC={data[0]} HEX=0x{data[0]:02X}"
+                    elem.quality = QualityDescriptor(data[1])
+                    consumed = 2
+                    if len(data) >= 5:
+                        elem.timestamp = parse_cp24time2a(data[2:5])
+                        consumed = 5
+
+            elif type_id == 7:  # M_BO_NA_1 32比特串 (遥测): bitstring(4) + QDS(1) = 5
+                if len(data) >= 5:
+                    elem.value = struct.unpack('<I', data[0:4])[0]
+                    elem.value_desc = f"32比特串={elem.value} | DEC={elem.value} HEX=0x{elem.value:08X}"
+                    elem.quality = QualityDescriptor(data[4])
+                    consumed = 5
+
+            elif type_id == 8:  # M_BO_TA_1 带时标的32比特串 (遥测): bitstring(4) + QDS(1) + CP24Time2a(3) = 8
+                if len(data) >= 5:
+                    elem.value = struct.unpack('<I', data[0:4])[0]
+                    elem.value_desc = f"32比特串={elem.value} | DEC={elem.value} HEX=0x{elem.value:08X}"
+                    elem.quality = QualityDescriptor(data[4])
+                    consumed = 5
+                    if len(data) >= 8:
+                        elem.timestamp = parse_cp24time2a(data[5:8])
+                        consumed = 8
+
+            elif type_id == 12:  # M_ME_TB_1 带时标的标度化值 (遥测): scaled(2) + QDS(1) + CP24Time2a(3) = 6
+                if len(data) >= 3:
+                    signed_val = self._to_signed(data[0] + (data[1] << 8), 16)
+                    elem.value = signed_val
+                    elem.value_desc = f"标度化={signed_val} | DEC={signed_val} HEX=0x{signed_val & 0xFFFF:04X}"
+                    elem.quality = QualityDescriptor(data[2])
+                    consumed = 3
+                    if len(data) >= 6:
+                        elem.timestamp = parse_cp24time2a(data[3:6])
+                        consumed = 6
+
+            elif type_id == 14:  # M_ME_TC_1 带时标的短浮点数 (遥测): float(4) + QDS(1) + CP24Time2a(3) = 8
+                if len(data) >= 5:
+                    raw = struct.unpack('<f', data[0:4])[0]
+                    raw_int = struct.unpack('<I', data[0:4])[0]
+                    elem.value = round(raw, 4)
+                    elem.value_desc = f"浮点={elem.value} | DEC={raw_int} HEX=0x{raw_int:08X}"
+                    elem.quality = QualityDescriptor(data[4])
+                    consumed = 5
+                    if len(data) >= 8:
+                        elem.timestamp = parse_cp24time2a(data[5:8])
+                        consumed = 8
+
+            elif type_id == 16:  # M_IT_TA_1 带时标的累计量 (遥脉): counter(4) + QDS(1) + CP24Time2a(3) = 8
+                if len(data) >= 5:
+                    elem.value = struct.unpack('<i', data[0:4])[0]
+                    elem.value_desc = f"累计量={elem.value} | DEC={elem.value} HEX=0x{elem.value & 0xFFFFFFFF:08X}"
+                    elem.quality = QualityDescriptor(data[4])
+                    consumed = 5
+                    if len(data) >= 8:
+                        elem.timestamp = parse_cp24time2a(data[5:8])
+                        consumed = 8
+
+            elif type_id in (108, 109, 110):  # P_ME 参数命令
+                consumed = self._parse_parameter_command(type_id, data, elem)
+
+            elif type_id in (120, 121, 122, 123, 124, 125, 126, 127):  # F_* 文件传输
+                consumed = self._parse_file_transfer(type_id, data, elem)
+
             else:
                 remaining = len(data)
                 if remaining > 0:
@@ -1587,6 +1686,60 @@ class IEC104Parser:
         if len(data) >= consumed + 7:
             elem.timestamp = parse_cp56time2a(data[consumed:consumed + 7])
             consumed += 7
+        return consumed
+
+    def _parse_parameter_command(self, type_id: int, data: bytes, elem: InfoElement) -> int:
+        """解析参数命令 (type_id 108-110)"""
+        if len(data) < 1:
+            return 0
+
+        # QPM 字节 (参数类型 + KPA)
+        qpm = data[0]
+        param_type = (qpm >> 6) & 0x03
+        kpa = qpm & 0x3F
+        param_type_map = {0: "不带", 1: "归一化", 2: "标度化", 3: "短浮点"}
+        elem.value = qpm
+        elem.value_desc = f"QPM=0x{qpm:02X} | 参数类型={param_type_map.get(param_type, '?')} KPA={kpa}"
+        consumed = 1
+
+        if type_id == 108 and len(data) >= 3:  # 归一化值
+            raw_val = data[1] + (data[2] << 8)
+            normalized = raw_val / 32767.0
+            elem.value_desc += f" | 归一化={normalized:.6f} DEC={raw_val}"
+            consumed = 3
+        elif type_id == 109 and len(data) >= 3:  # 标度化值
+            signed_val = self._to_signed(data[1] + (data[2] << 8), 16)
+            elem.value_desc += f" | 标度化={signed_val} DEC={signed_val}"
+            consumed = 3
+        elif type_id == 110 and len(data) >= 5:  # 短浮点
+            raw_float = struct.unpack('<f', data[1:5])[0]
+            elem.value_desc += f" | 浮点={raw_float:.4f}"
+            consumed = 5
+
+        return consumed
+
+    def _parse_file_transfer(self, type_id: int, data: bytes, elem: InfoElement) -> int:
+        """解析文件传输命令 (type_id 120-127)"""
+        if len(data) < 1:
+            return 0
+
+        type_names = {
+            120: "文件 ready",
+            121: "文件 select",
+            122: "文件 call/abort",
+            123: "文件 last section",
+            124: "文件确认",
+            125: "文件 segment",
+            126: "文件目录",
+            127: "文件 call/abort (带名称)",
+        }
+
+        name = type_names.get(type_id, f"文件传输 TypeID={type_id}")
+        raw_hex = data.hex().upper()
+        elem.value = raw_hex
+        elem.value_desc = f"{name} | 原始数据: {raw_hex[:40]}{'...' if len(raw_hex) > 40 else ''}"
+        consumed = min(len(data), 8)
+
         return consumed
 
     def _parse_control_system(self, type_id: int, data: bytes,
