@@ -595,6 +595,8 @@ class MainWindow(QMainWindow):
         view_menu.addAction("统计图表(&T)...", self._on_show_stats, "Ctrl+T")
 
         tools_menu = menubar.addMenu("工具(&T)")
+        tools_menu.addAction("帧生成器(&G)...", self._open_generator, "Ctrl+G")
+        tools_menu.addSeparator()
         tools_menu.addAction("序号检查(&S)...", self._on_check_sequence, "Ctrl+Shift+S")
         tools_menu.addAction("协议合规检查(&C)...", self._on_check_compliance)
         tools_menu.addAction("报文配对分析(&P)...", self._on_find_pairs)
@@ -612,6 +614,8 @@ class MainWindow(QMainWindow):
 
         toolbar.addAction("解析", self._on_parse)
         toolbar.addAction("导入", self._on_import_file)
+        toolbar.addSeparator()
+        toolbar.addAction("生成报文", self._open_generator)
         toolbar.addSeparator()
         toolbar.addAction("CSV", self._on_export_csv)
         toolbar.addAction("JSON", self._on_export_json)
@@ -1776,8 +1780,10 @@ class MainWindow(QMainWindow):
         if event.mimeData().hasUrls():
             for url in event.mimeData().urls():
                 if url.isLocalFile():
-                    event.acceptProposedAction()
-                    return
+                    file_path = url.toLocalFile()
+                    if file_path.lower().endswith(('.txt', '.log', '.hex', '.dat', '.bin', '.pcap')):
+                        event.acceptProposedAction()
+                        return
         event.ignore()
 
     def dropEvent(self, event):
@@ -1788,6 +1794,21 @@ class MainWindow(QMainWindow):
 
         file_path = urls[0].toLocalFile()
         if not file_path:
+            return
+
+        if file_path.lower().endswith('.pcap'):
+            try:
+                from pcap_importer import pcap_to_hex_text
+                hex_text = pcap_to_hex_text(file_path)
+                if hex_text:
+                    self.hex_input.setPlainText(hex_text)
+                    self.statusBar().showMessage(f"已导入 PCAP: {os.path.basename(file_path)}")
+                else:
+                    QMessageBox.warning(self, "导入失败", "PCAP 文件中未找到 IEC104 报文")
+            except ImportError:
+                QMessageBox.warning(self, "导入失败", "PCAP 导入模块未找到")
+            except Exception as e:
+                QMessageBox.warning(self, "导入失败", f"导入 PCAP 失败: {e}")
             return
 
         try:
@@ -1900,7 +1921,7 @@ class MainWindow(QMainWindow):
         """导入文件（支持多选）"""
         paths, _ = QFileDialog.getOpenFileNames(
             self, "导入报文文件", "",
-            "报文文件 (*.txt *.log *.hex *.dat);;二进制文件 (*.bin);;所有文件 (*.*)"
+            "报文文件 (*.txt *.log *.hex *.dat *.bin *.pcap);;所有文件 (*.*)"
         )
         if not paths:
             return
@@ -1913,6 +1934,15 @@ class MainWindow(QMainWindow):
             all_content = []
             for path in paths:
                 try:
+                    if path.lower().endswith('.pcap'):
+                        from pcap_importer import pcap_to_hex_text
+                        content = pcap_to_hex_text(path)
+                        if content:
+                            all_content.append(f"# === 文件: {os.path.basename(path)} ===")
+                            all_content.append(content)
+                        else:
+                            all_content.append(f"# 读取失败: {os.path.basename(path)} - 未找到 IEC104 报文")
+                        continue
                     with open(path, "r", encoding="utf-8", errors="ignore") as f:
                         content = f.read()
                     all_content.append(f"# === 文件: {os.path.basename(path)} ===")
@@ -1935,6 +1965,21 @@ class MainWindow(QMainWindow):
 
     def _load_single_file(self, path: str):
         """加载单个文件"""
+        if path.lower().endswith('.pcap'):
+            try:
+                from pcap_importer import pcap_to_hex_text
+                hex_text = pcap_to_hex_text(path)
+                if hex_text:
+                    self.hex_input.setPlainText(hex_text)
+                    self.statusbar.showMessage(f"已导入 PCAP: {os.path.basename(path)}", 3000)
+                else:
+                    QMessageBox.warning(self, "导入失败", "PCAP 文件中未找到 IEC104 报文")
+            except ImportError:
+                QMessageBox.warning(self, "导入失败", "PCAP 导入模块未找到")
+            except Exception as e:
+                QMessageBox.warning(self, "导入失败", f"导入 PCAP 失败: {e}")
+            return
+
         try:
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 content = f.read()
@@ -2050,6 +2095,13 @@ class MainWindow(QMainWindow):
             self._populate_table()
             if self._current_frame_idx < len(self.all_frames):
                 self._populate_tree(self._current_frame_idx)
+
+    def _open_generator(self):
+        """打开帧生成器对话框"""
+        from gui.generator_dialog import GeneratorDialog
+        dialog = GeneratorDialog(self)
+        if dialog.exec_() == QDialog.Accepted:
+            pass
 
     def closeEvent(self, event):
         """关闭窗口时安全停止后台线程"""
