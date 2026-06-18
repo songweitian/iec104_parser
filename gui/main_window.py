@@ -701,14 +701,17 @@ class MainWindow(QMainWindow):
         stats = self.parser.get_statistics()
         total = stats["total"]
         valid = stats["valid"]
+        yx_count = sum(1 for f in self.all_frames if f.signal_type == SignalType.YX)
+        yc_count = sum(1 for f in self.all_frames if f.signal_type == SignalType.YC)
         yk_count = sum(1 for f in self.all_frames if f.signal_type == SignalType.YK)
         yt_count = sum(1 for f in self.all_frames if f.signal_type == SignalType.YT)
+        ym_count = sum(1 for f in self.all_frames if f.signal_type == SignalType.YM)
 
         self.lbl_stats.setText(
             f"总报文: {total}  |  有效: {valid}  |  无效: {total - valid}  |  "
             f"I帧: {stats['i_frames']}  S帧: {stats['s_frames']}  U帧: {stats['u_frames']}  |  "
-            f"主站→子站: {stats['master_send']}  |  子站→主站: {stats['slave_send']}  |  "
-            f"遥控: {yk_count}  遥调: {yt_count}"
+            f"主→从: {stats['master_send']}  从→主: {stats['slave_send']}  |  "
+            f"遥信: {yx_count}  遥测: {yc_count}  遥控: {yk_count}  遥调: {yt_count}  遥脉: {ym_count}"
         )
         self.lbl_count.setText(f"报文: {total}")
 
@@ -1269,6 +1272,7 @@ class MainWindow(QMainWindow):
             # 序号
             idx_item = QTableWidgetItem(str(frame.index))
             idx_item.setBackground(row_color)
+            idx_item.setData(Qt.UserRole + 1, frame.index)
             self.table_widget.setItem(row, 0, idx_item)
 
             # 原始时间
@@ -1315,7 +1319,8 @@ class MainWindow(QMainWindow):
 
             # 对象数
             obj_text = str(frame.asdu.number_of_objects) if frame.asdu else "-"
-            self._set_table_item(row, 7, obj_text, row_color)
+            obj_count = frame.asdu.number_of_objects if frame.asdu else 0
+            self._set_table_item(row, 7, obj_text, row_color, sort_key=obj_count)
 
             # 值 (汇总)
             if frame.asdu and frame.asdu.information_elements:
@@ -1337,9 +1342,11 @@ class MainWindow(QMainWindow):
             if fidx < len(line_map) and line_map[fidx]:
                 src_lines = line_map[fidx]
                 line_text = ", ".join(str(n + 1) for n in src_lines)
+                line_sort = src_lines[0] if src_lines else 0
             else:
                 line_text = "-"
-            self._set_table_item(row, 10, line_text, row_color)
+                line_sort = 0
+            self._set_table_item(row, 10, line_text, row_color, sort_key=line_sort)
 
         # 恢复排序和更新
         self.table_widget.setSortingEnabled(True)
@@ -1359,10 +1366,14 @@ class MainWindow(QMainWindow):
             self.table_widget.selectRow(0)
             self._populate_tree(0)
 
-    def _set_table_item(self, row: int, col: int, text: str, bg: QColor = None):
+    def _set_table_item(self, row: int, col: int, text: str, bg: QColor = None,
+                         sort_key=None):
         item = QTableWidgetItem(text)
         if bg:
             item.setBackground(bg)
+        # 设置自定义排序键（数值列用数值排序）
+        if sort_key is not None:
+            item.setData(Qt.UserRole + 1, sort_key)
         self.table_widget.setItem(row, col, item)
 
     def _populate_tree(self, frame_index: int):
@@ -1666,6 +1677,12 @@ class MainWindow(QMainWindow):
 
         menu.addSeparator()
 
+        # 复制全部解析结果
+        act_copy_all = menu.addAction("📋 复制全部解析结果")
+        act_copy_all.triggered.connect(lambda: self._copy_all_results())
+
+        menu.addSeparator()
+
         # 定位原始报文
         act_locate = menu.addAction("📍 定位原始报文")
         act_locate.triggered.connect(lambda: self._locate_original_message(row))
@@ -1700,6 +1717,26 @@ class MainWindow(QMainWindow):
         if ioas:
             QApplication.clipboard().setText("\n".join(ioas))
             self.statusbar.showMessage(f"已复制 {len(ioas)} 个 IOA 地址", 2000)
+
+    def _copy_all_results(self):
+        """复制全部解析结果到剪贴板"""
+        if not self.all_frames:
+            return
+        lines = []
+        for frame in self.all_frames:
+            line = f"#{frame.index} {frame.direction} {frame.signal_label or ''}"
+            if frame.asdu:
+                line += f" TID={frame.asdu.type_id}"
+                if frame.asdu.information_elements:
+                    for elem in frame.asdu.information_elements:
+                        alias = get_alias(elem.ioa)
+                        prefix = f"[{alias}] " if alias else ""
+                        line += f" IOA=0x{elem.ioa:06X} {prefix}{elem.value_desc}"
+            elif frame.error:
+                line += f" ERROR={frame.error}"
+            lines.append(line)
+        QApplication.clipboard().setText("\n".join(lines))
+        self.statusbar.showMessage(f"已复制 {len(self.all_frames)} 条解析结果", 2000)
 
     def _show_detail(self, row: int):
         """显示指定行的解析详情"""
