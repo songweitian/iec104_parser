@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView
 )
 from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QFont
+from PyQt5.QtGui import QFont, QColor
 
 import sys
 import os
@@ -100,9 +100,9 @@ class LicenseDialog(QDialog):
             item_before = QTableWidgetItem(before)
             item_after = QTableWidgetItem(after)
             if "❌" in before:
-                item_before.setStyleSheet("color: #F44336;")
+                item_before.setForeground(QColor("#F44336"))
             if "✅" in after:
-                item_after.setStyleSheet("color: #4CAF50;")
+                item_after.setForeground(QColor("#4CAF50"))
             perm_table.setItem(i, 1, item_before)
             perm_table.setItem(i, 2, item_after)
 
