@@ -116,7 +116,7 @@ class ParseWorker(QThread):
                 worker_parser._frame_input_lines = line_map
             else:
                 # XN3000/XN8000模式
-                blocks = self._extract_xn_blocks(self.raw_text, self.parse_mode)
+                blocks, block_line_map = self._extract_xn_blocks(self.raw_text, self.parse_mode)
                 total = len(blocks)
 
                 if total == 0:
@@ -125,12 +125,14 @@ class ParseWorker(QThread):
 
                 worker_parser.frames = []
                 worker_parser.last_master_send = worker_parser.master_send_first
+                xn_line_map = []
 
                 for i, (hex_text, timestamp, direction) in enumerate(blocks):
                     if self._is_cancelled:
                         self.parse_finished.emit(frames)
                         return
 
+                    src_lines = block_line_map[i] if i < len(block_line_map) else []
                     split_frames = split_concatenated_frames(hex_text)
                     for frame_hex in split_frames:
                         if self._is_cancelled:
@@ -139,9 +141,13 @@ class ParseWorker(QThread):
                             worker_parser, frame_hex, timestamp, direction, len(frames) + 1
                         )
                         frames.append(frame)
+                        xn_line_map.append(list(src_lines))
 
                     if (i + 1) % 100 == 0 or i + 1 == total:
                         self.progress_updated.emit(i + 1, total)
+
+                # 保存输入行映射
+                worker_parser._frame_input_lines = xn_line_map
 
             self.parse_finished.emit(frames)
 
@@ -207,14 +213,16 @@ class ParseWorker(QThread):
         return frames
 
     def _extract_xn_blocks(self, text: str, parse_mode: ParseMode):
-        """提取XN格式的数据块"""
+        """提取XN格式的数据块，返回 (blocks, line_map)"""
         lines = text.strip().split('\n')
         blocks = []
+        line_map = []
         current_timestamp = ""
         current_direction = ""
         current_hex_parts = []
+        current_line_nums = []
 
-        for line in lines:
+        for line_idx, line in enumerate(lines):
             line = line.strip()
 
             if parse_mode == ParseMode.XN3000:
@@ -225,7 +233,9 @@ class ParseWorker(QThread):
             if ts_match:
                 if current_hex_parts:
                     blocks.append((''.join(current_hex_parts), current_timestamp, current_direction))
+                    line_map.append(list(current_line_nums))
                     current_hex_parts = []
+                    current_line_nums = []
                 current_timestamp = ts_match.group(1)
                 current_direction = ts_match.group(2)
                 continue
@@ -234,11 +244,13 @@ class ParseWorker(QThread):
                 cleaned = line.replace('.', '').strip()
                 if cleaned:
                     current_hex_parts.append(cleaned)
+                    current_line_nums.append(line_idx)
 
         if current_hex_parts:
             blocks.append((''.join(current_hex_parts), current_timestamp, current_direction))
+            line_map.append(list(current_line_nums))
 
-        return blocks
+        return blocks, line_map
 
     def _parse_single_frame(self, parser, hex_string: str, index: int):
         """解析单个帧"""
