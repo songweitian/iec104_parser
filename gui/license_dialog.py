@@ -14,7 +14,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from license import get_hardware_fingerprint, get_license_info, activate
+from license import get_hardware_fingerprint, get_license_info, activate, remove_license
 
 
 class LicenseDialog(QDialog):
@@ -110,7 +110,7 @@ class LicenseDialog(QDialog):
         layout.addWidget(perm_table)
 
         # 提示
-        hint = QLabel("请将硬件指纹发送给开发者获取激活码")
+        hint = QLabel("请将硬件指纹发送给开发者获取激活码\n联系邮箱: 3028905947@qq.com")
         hint.setStyleSheet("color: #666; font-size: 9pt;")
         hint.setAlignment(Qt.AlignCenter)
         layout.addWidget(hint)

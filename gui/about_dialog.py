@@ -14,6 +14,7 @@ from PyQt5.QtGui import QFont
 
 BUILD_DATE = datetime.now().strftime("%Y-%m-%d")
 AUTHOR = "宋伟田"
+EMAIL = "3028905947@qq.com"
 VERSION = "1.1.0"
 
 
@@ -54,6 +55,7 @@ class AboutDialog(QDialog):
         self._add_info(info_layout, "版本", f"v{self.version}")
         self._add_info(info_layout, "编辑日期", BUILD_DATE)
         self._add_info(info_layout, "作者", AUTHOR)
+        self._add_info(info_layout, "邮箱", EMAIL)
         self._add_info(info_layout, "协议标准", "IEC 60870-5-104 (2002版)")
         self._add_info(info_layout, "开发语言", "Python + PyQt5")
         self._add_info(info_layout, "协议支持",
