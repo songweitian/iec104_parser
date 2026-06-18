@@ -20,7 +20,7 @@ from PyQt5.QtWidgets import (
     QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView,
     QCheckBox, QSpinBox, QProgressBar, QMenu, QMenuBar,
     QDialog, QListWidget, QListWidgetItem, QFrame, QPlainTextEdit,
-    QDialogButtonBox, QFormLayout
+    QDialogButtonBox, QFormLayout, QInputDialog
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QThread, QTimer
 from PyQt5.QtGui import QFont, QColor, QTextCursor, QIcon, QPalette, QPainter, QBrush, QPen, QPixmap
@@ -343,6 +343,8 @@ class MainWindow(QMainWindow):
         self._current_frame_idx = 0
         self.capture_worker: Optional[CaptureWorker] = None
         self.parse_mode: ParseMode = ParseMode.NORMAL
+        self._dark_theme = False
+        self._current_theme = "light"
 
         # 后台解析相关
         self._parse_worker: Optional[ParseWorker] = None
@@ -387,15 +389,15 @@ class MainWindow(QMainWindow):
         # 十六进制输入
         hex_group = QGroupBox("原始报文输入 (十六进制)")
         hex_layout = QVBoxLayout(hex_group)
-        self.hex_input = QPlainTextEdit()
-        self.hex_input.setPlaceholderText("粘贴十六进制报文...")
-        self.hex_input.setFont(QFont("Consolas", 11))
-        self.hex_input.setLineWrapMode(QPlainTextEdit.NoWrap)
-        self.hex_input.setAcceptDrops(False)  # 由主窗口处理拖放
-        self.hex_input.textChanged.connect(self._on_input_changed)
-        self.hex_input.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.hex_input.customContextMenuRequested.connect(self._on_input_context_menu)
-        hex_layout.addWidget(self.hex_input)
+        # 多标签页输入
+        self.input_tabs = QTabWidget()
+        self.input_tabs.setTabsClosable(True)
+        self.input_tabs.tabCloseRequested.connect(self._close_input_tab)
+        hex_layout.addWidget(self.input_tabs)
+
+        # 创建第一个输入标签页
+        self._input_tab_list = []  # [(tab_widget, hex_input), ...]
+        self._add_input_tab()
 
         # 输入操作按钮
         btn_layout = QHBoxLayout()
@@ -582,6 +584,7 @@ class MainWindow(QMainWindow):
 
         file_menu = menubar.addMenu("文件(&F)")
         file_menu.addAction("导入文件(&I)...", self._on_import_file, "Ctrl+I")
+        file_menu.addAction("新建标签页(&N)", self._add_input_tab, "Ctrl+N")
         file_menu.addAction("导出CSV(&C)...", self._on_export_csv, "Ctrl+Shift+C")
         file_menu.addAction("导出JSON(&J)...", self._on_export_json, "Ctrl+Shift+J")
         file_menu.addAction("导出TXT(&T)...", self._on_export_txt, "Ctrl+Shift+T")
@@ -591,14 +594,21 @@ class MainWindow(QMainWindow):
         view_menu = menubar.addMenu("查看(&V)")
         view_menu.addAction("解析报文(&P)", self._on_parse, "F5")
         view_menu.addAction("清空(&L)", self._on_clear, "Ctrl+L")
+        view_menu.addAction("定位原始报文(&L)", lambda: self._locate_original_message(self.table_widget.currentRow()), "F2")
+        view_menu.addAction("切换主题(&D)", self._toggle_theme, "Ctrl+Shift+D")
         view_menu.addSeparator()
         view_menu.addAction("折叠/展开输入面板(&B)", self._toggle_input_panel, "Ctrl+B")
         view_menu.addSeparator()
         view_menu.addAction("查找(&F)...", self._on_focus_search, "Ctrl+F")
         view_menu.addAction("统计图表(&T)...", self._on_show_stats, "Ctrl+T")
+        view_menu.addSeparator()
+        view_menu.addAction("解析详情", lambda: self.result_tabs.setCurrentIndex(0), "Ctrl+1")
+        view_menu.addAction("报文列表", lambda: self.result_tabs.setCurrentIndex(1), "Ctrl+2")
+        view_menu.addAction("原始十六进制", lambda: self.result_tabs.setCurrentIndex(2), "Ctrl+3")
 
         tools_menu = menubar.addMenu("工具(&T)")
         tools_menu.addAction("帧生成器(&G)...", self._open_generator, "Ctrl+G")
+        tools_menu.addAction("历史报文管理(&H)...", self._open_history_manager, "Ctrl+Shift+R")
         tools_menu.addSeparator()
         tools_menu.addAction("序号检查(&S)...", self._on_check_sequence, "Ctrl+Shift+S")
         tools_menu.addAction("协议合规检查(&C)...", self._on_check_compliance)
@@ -941,6 +951,103 @@ class MainWindow(QMainWindow):
         self.parse_mode = self.mode_combo.currentData()
         mode_name = self.mode_combo.currentText()
         self.statusbar.showMessage(f"已切换到 {mode_name}", 2000)
+
+    # ==================================================================
+    # 主题切换
+    # ==================================================================
+
+    def _toggle_theme(self):
+        """切换深色/浅色主题"""
+        self._dark_theme = not self._dark_theme
+        if self._dark_theme:
+            self._apply_dark_theme()
+            self.statusbar.showMessage("已切换到深色主题", 2000)
+        else:
+            self._apply_light_theme()
+            self.statusbar.showMessage("已切换到浅色主题", 2000)
+
+    def _apply_dark_theme(self):
+        """应用深色主题"""
+        dark_style = """
+            QMainWindow, QWidget { background-color: #2b2b2b; color: #e0e0e0; }
+            QGroupBox { border: 1px solid #555; border-radius: 4px; margin-top: 8px; padding-top: 16px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
+            QPlainTextEdit, QTextEdit, QLineEdit { background-color: #1e1e1e; color: #d4d4d4; border: 1px solid #555; border-radius: 3px; }
+            QTableWidget { background-color: #1e1e1e; color: #d4d4d4; gridline-color: #404040; }
+            QTableWidget::item:selected { background-color: #264f78; }
+            QHeaderView::section { background-color: #333; color: #ccc; border: 1px solid #555; padding: 4px; }
+            QComboBox { background-color: #3c3c3c; color: #d4d4d4; border: 1px solid #555; border-radius: 3px; padding: 3px; }
+            QComboBox QAbstractItemView { background-color: #3c3c3c; color: #d4d4d4; selection-background-color: #264f78; }
+            QPushButton { background-color: #3c3c3c; color: #d4d4d4; border: 1px solid #555; border-radius: 4px; padding: 4px 12px; }
+            QPushButton:hover { background-color: #4a4a4a; }
+            QToolBar { background-color: #333; border-bottom: 1px solid #555; }
+            QTabWidget::pane { border: 1px solid #555; }
+            QTabBar::tab { background-color: #333; color: #ccc; padding: 6px 16px; border: 1px solid #555; border-bottom: none; }
+            QTabBar::tab:selected { background-color: #2b2b2b; color: #fff; }
+            QTreeWidget { background-color: #1e1e1e; color: #d4d4d4; }
+            QProgressBar { border: 1px solid #555; border-radius: 3px; text-align: center; }
+            QProgressBar::chunk { background-color: #2196F3; }
+            QMenuBar { background-color: #333; color: #e0e0e0; }
+            QMenuBar::item:selected { background-color: #4a4a4a; }
+            QMenu { background-color: #333; color: #e0e0e0; }
+            QMenu::item:selected { background-color: #264f78; }
+        """
+        self.setStyleSheet(dark_style)
+
+    def _apply_light_theme(self):
+        """应用浅色主题（恢复默认）"""
+        self.setStyleSheet("")
+
+    # ==================================================================
+    # 多标签页输入
+    # ==================================================================
+
+    def _add_input_tab(self, title=None, content=None):
+        """添加新的输入标签页"""
+        tab_widget = QWidget()
+        tab_layout = QVBoxLayout(tab_widget)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+
+        hex_input = QPlainTextEdit()
+        hex_input.setPlaceholderText("粘贴十六进制报文...")
+        hex_input.setFont(QFont("Consolas", 11))
+        hex_input.setLineWrapMode(QPlainTextEdit.NoWrap)
+        hex_input.setAcceptDrops(False)
+        hex_input.textChanged.connect(self._on_input_changed)
+        hex_input.setContextMenuPolicy(Qt.CustomContextMenu)
+        hex_input.customContextMenuRequested.connect(self._on_input_context_menu)
+        tab_layout.addWidget(hex_input)
+
+        if content:
+            hex_input.setPlainText(content)
+
+        count = len(self._input_tab_list) + 1
+        tab_title = title or f"报文 {count}"
+        self.input_tabs.addTab(tab_widget, tab_title)
+        self._input_tab_list.append((tab_widget, hex_input))
+        self.input_tabs.setCurrentIndex(len(self._input_tab_list) - 1)
+
+        # 更新当前 hex_input 引用
+        self.hex_input = hex_input
+        return hex_input
+
+    def _close_input_tab(self, index: int):
+        """关闭输入标签页"""
+        if len(self._input_tab_list) <= 1:
+            return  # 至少保留一个标签页
+        self.input_tabs.removeTab(index)
+        self._input_tab_list.pop(index)
+        if self._input_tab_list:
+            idx = min(index, len(self._input_tab_list) - 1)
+            self.hex_input = self._input_tab_list[idx][1]
+            self.input_tabs.setCurrentIndex(idx)
+
+    def _get_current_hex_input(self):
+        """获取当前活动的输入框"""
+        idx = self.input_tabs.currentIndex()
+        if 0 <= idx < len(self._input_tab_list):
+            return self._input_tab_list[idx][1]
+        return self.hex_input
 
     # ==================================================================
     # 导入/导出
@@ -2169,6 +2276,22 @@ class MainWindow(QMainWindow):
     def _on_about(self):
         """关于对话框"""
         AboutDialog(self.APP_TITLE, self.APP_VERSION).exec_()
+
+    def _open_history_manager(self):
+        """打开历史报文管理"""
+        from gui.history_dialog import HistoryDialog
+        dialog = HistoryDialog(self)
+        if dialog.exec_() == QDialog.Accepted and dialog.selected_session:
+            session = dialog.selected_session
+            self.hex_input.setPlainText(session.get('input_text', ''))
+            mode_str = session.get('parse_mode', 'normal')
+            from iec104_parser import ParseMode
+            mode_map = {'normal': ParseMode.NORMAL, 'xn3000': ParseMode.XN3000, 'xn8000': ParseMode.XN8000}
+            self.parse_mode = mode_map.get(mode_str, ParseMode.NORMAL)
+            idx = self.mode_combo.findData(self.parse_mode)
+            if idx >= 0:
+                self.mode_combo.setCurrentIndex(idx)
+            self._on_parse()
 
     def _on_filter(self):
         """应用过滤"""
