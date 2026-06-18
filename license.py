@@ -9,10 +9,16 @@ import hmac
 import uuid
 import json
 import platform
+import base64
 from pathlib import Path
 
-# 激活密钥（可更换密钥发行不同批次）
-_SECRET_KEY = b"IEC104-PARSER-2026-SWT"
+# 激活密钥（混淆存储，不可明文）
+_key_parts = [
+    b'SVVD',      # part1
+    b'QzEwNC1Q',  # part2
+    b'QVJTRVI=',  # part3
+]
+_secret_key = b''.join(base64.b64decode(p) for p in _key_parts)
 
 # 授权文件路径
 LICENSE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "license.dat")
@@ -31,7 +37,7 @@ def get_hardware_fingerprint() -> str:
 def generate_license_code(fingerprint: str, expiry_days: int = 0) -> str:
     """生成激活码（供开发者使用）"""
     data = f"{fingerprint}:{expiry_days}"
-    code = hmac.new(_SECRET_KEY, data.encode(), hashlib.sha256).hexdigest()[:32].upper()
+    code = hmac.new(_secret_key, data.encode(), hashlib.sha256).hexdigest()[:32].upper()
     return f"{code[:8]}-{code[8:16]}-{code[16:24]}-{code[24:32]}"
 
 
@@ -45,7 +51,7 @@ def verify_license_code(fingerprint: str, code: str) -> bool:
     # 尝试验证（ expiry_days=0 表示永久）
     for days in [0, 365, 730, 1095]:
         data = f"{fingerprint}:{days}"
-        expected = hmac.new(_SECRET_KEY, data.encode(), hashlib.sha256).hexdigest()[:32].upper()
+        expected = hmac.new(_secret_key, data.encode(), hashlib.sha256).hexdigest()[:32].upper()
         if code_clean == expected:
             return True
 
@@ -86,6 +92,16 @@ def load_license() -> dict | None:
         return data
     except Exception:
         return None
+
+
+def remove_license() -> bool:
+    """删除授权文件，取消激活"""
+    try:
+        if os.path.exists(LICENSE_FILE):
+            os.remove(LICENSE_FILE)
+        return True
+    except Exception:
+        return False
 
 
 def is_activated() -> bool:
