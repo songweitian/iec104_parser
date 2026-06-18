@@ -597,7 +597,11 @@ class MainWindow(QMainWindow):
         right_layout.addLayout(export_layout)
 
         self.splitter.addWidget(right_panel)
-        self.splitter.setSizes([500, 750])
+        self.splitter.setSizes([400, 900])
+        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(1, 2)
+        self.splitter.setHandleWidth(6)
+        self.left_panel.setMinimumWidth(250)
         main_layout.addWidget(self.splitter)
 
     def _setup_menu(self):
@@ -2012,7 +2016,7 @@ class MainWindow(QMainWindow):
         """折叠/展开原始报文输入面板"""
         self._left_panel_visible = not self._left_panel_visible
         if self._left_panel_visible:
-            self.splitter.setSizes([500, 750])
+            self.splitter.setSizes([400, 900])
             self._toggle_input_action.setText("◀ 隐藏输入")
         else:
             self.splitter.setSizes([0, self.splitter.width()])
