@@ -113,7 +113,7 @@ class ParseWorker(QThread):
                         self.progress_updated.emit(i + 1, total)
 
                 # 保存输入行映射
-                worker_parser._frame_input_lines = line_map
+                self._frame_input_lines = line_map
             else:
                 # XN3000/XN8000模式
                 blocks, block_line_map = self._extract_xn_blocks(self.raw_text, self.parse_mode)
@@ -147,7 +147,7 @@ class ParseWorker(QThread):
                         self.progress_updated.emit(i + 1, total)
 
                 # 保存输入行映射
-                worker_parser._frame_input_lines = xn_line_map
+                self._frame_input_lines = xn_line_map
 
             self.parse_finished.emit(frames)
 
@@ -406,6 +406,7 @@ class MainWindow(QMainWindow):
         self.input_tabs = QTabWidget()
         self.input_tabs.setTabsClosable(True)
         self.input_tabs.tabCloseRequested.connect(self._close_input_tab)
+        self.input_tabs.currentChanged.connect(self._on_tab_changed)
         hex_layout.addWidget(self.input_tabs)
 
         # 创建第一个输入标签页
@@ -918,6 +919,7 @@ class MainWindow(QMainWindow):
         self._byte_position_map = []
         self._frame_byte_offset = []
         self._frame_input_lines = []
+        self._bookmarks.clear()
         self.tree_widget.clear()
         self.table_widget.setRowCount(0)
         self.hex_view.clear()
@@ -1078,10 +1080,30 @@ class MainWindow(QMainWindow):
             QMenu::item:selected { background-color: #264f78; }
         """
         self.setStyleSheet(dark_style)
+        # 重新应用特殊按钮样式
+        self.btn_parse.setStyleSheet(
+            "QPushButton { background-color: #1976D2; color: white; "
+            "font-weight: bold; padding: 6px 16px; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #1565C0; }"
+        )
+        self.btn_cancel_parse.setStyleSheet(
+            "QPushButton { background-color: #c62828; color: white; padding: 2px 8px; border-radius: 3px; }"
+            "QPushButton:hover { background-color: #b71c1c; }"
+        )
 
     def _apply_light_theme(self):
         """应用浅色主题（恢复默认）"""
         self.setStyleSheet("")
+        # 重新应用特殊按钮样式
+        self.btn_parse.setStyleSheet(
+            "QPushButton { background-color: #2196F3; color: white; "
+            "font-weight: bold; padding: 6px 16px; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #1976D2; }"
+        )
+        self.btn_cancel_parse.setStyleSheet(
+            "QPushButton { background-color: #f44336; color: white; padding: 2px 8px; border-radius: 3px; }"
+            "QPushButton:hover { background-color: #d32f2f; }"
+        )
 
     # ==================================================================
     # 多标签页输入
@@ -1126,6 +1148,11 @@ class MainWindow(QMainWindow):
             idx = min(index, len(self._input_tab_list) - 1)
             self.hex_input = self._input_tab_list[idx][1]
             self.input_tabs.setCurrentIndex(idx)
+
+    def _on_tab_changed(self, index: int):
+        """标签页切换时更新当前 hex_input 引用"""
+        if 0 <= index < len(self._input_tab_list):
+            self.hex_input = self._input_tab_list[index][1]
 
     def _get_current_hex_input(self):
         """获取当前活动的输入框"""
@@ -1864,7 +1891,7 @@ class MainWindow(QMainWindow):
         """表头右键菜单 - 列显示控制"""
         menu = QMenu(self)
         headers = ["序号", "原始时间", "方向", "信号类型", "类型标识",
-                   "传送原因", "公共地址", "对象数", "值", "描述", "输入行"]
+                   "传送原因", "公共地址", "对象数", "值", "描述", "输入行", "间隔"]
 
         for i, header in enumerate(headers):
             if i >= self.table_widget.columnCount():
@@ -1973,13 +2000,11 @@ class MainWindow(QMainWindow):
         """折叠/展开原始报文输入面板"""
         self._left_panel_visible = not self._left_panel_visible
         if self._left_panel_visible:
-            self.left_panel.show()
-            self._toggle_input_action.setText("◀ 隐藏输入")
             self.splitter.setSizes([500, 750])
+            self._toggle_input_action.setText("◀ 隐藏输入")
         else:
-            self.left_panel.hide()
+            self.splitter.setSizes([0, self.splitter.width()])
             self._toggle_input_action.setText("▶ 显示输入")
-        self._left_panel_visible_saved = self._left_panel_visible
 
     def _on_tree_select(self):
         """树节点选择时在十六进制视图中高亮对应字节范围"""
