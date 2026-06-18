@@ -493,6 +493,7 @@ class MainWindow(QMainWindow):
         self.filter_addr = QLineEdit()
         self.filter_addr.setPlaceholderText("公共地址")
         self.filter_addr.setMaximumWidth(80)
+        self.filter_addr.setToolTip("输入公共地址(ASDU地址)过滤，十进制数字")
         filter_layout.addWidget(self.filter_addr)
 
         # IOA 范围过滤
@@ -500,11 +501,13 @@ class MainWindow(QMainWindow):
         self.ioa_from_input = QLineEdit()
         self.ioa_from_input.setPlaceholderText("起始")
         self.ioa_from_input.setMaximumWidth(80)
+        self.ioa_from_input.setToolTip("IOA起始地址，支持十进制或0x前缀十六进制")
         filter_layout.addWidget(self.ioa_from_input)
         filter_layout.addWidget(QLabel("~"))
         self.ioa_to_input = QLineEdit()
         self.ioa_to_input.setPlaceholderText("结束")
         self.ioa_to_input.setMaximumWidth(80)
+        self.ioa_to_input.setToolTip("IOA结束地址，支持十进制或0x前缀十六进制")
         filter_layout.addWidget(self.ioa_to_input)
 
         self.filter_btn = QPushButton("筛选")
@@ -533,6 +536,11 @@ class MainWindow(QMainWindow):
         self.tree_widget.setColumnWidth(1, 350)
         self.tree_widget.setColumnWidth(2, 400)
         self.tree_widget.itemSelectionChanged.connect(self._on_tree_select)
+        # 空状态提示
+        placeholder = QTreeWidgetItem(self.tree_widget)
+        placeholder.setText(0, "请在左侧粘贴报文后点击「解析报文」或拖放文件到窗口")
+        placeholder.setFlags(Qt.NoItemFlags)
+        placeholder.setForeground(0, QColor("#999"))
         self.result_tabs.addTab(self.tree_widget, "解析详情")
 
         # 标签页2: 报文列表 (带搜索栏)
@@ -636,7 +644,7 @@ class MainWindow(QMainWindow):
         view_menu.addAction("上一个书签", self._goto_prev_bookmark, "Ctrl+Up")
 
         tools_menu = menubar.addMenu("工具(&T)")
-        tools_menu.addAction("报文对比(&C)...", self._open_compare, "Ctrl+Shift+C")
+        tools_menu.addAction("报文对比(&C)...", self._open_compare, "Ctrl+Shift+M")
         tools_menu.addAction("帧生成器(&G)...", self._open_generator, "Ctrl+G")
         tools_menu.addAction("历史报文管理(&H)...", self._open_history_manager, "Ctrl+Shift+R")
         tools_menu.addSeparator()
@@ -2573,6 +2581,7 @@ class MainWindow(QMainWindow):
     def _goto_next_bookmark(self):
         """跳转到下一个书签"""
         if not self._bookmarks:
+            self.statusbar.showMessage("没有书签，按 Space 添加", 2000)
             return
         current = self.table_widget.currentRow()
         sorted_bm = sorted(self._bookmarks)
@@ -2588,6 +2597,7 @@ class MainWindow(QMainWindow):
     def _goto_prev_bookmark(self):
         """跳转到上一个书签"""
         if not self._bookmarks:
+            self.statusbar.showMessage("没有书签，按 Space 添加", 2000)
             return
         current = self.table_widget.currentRow()
         sorted_bm = sorted(self._bookmarks, reverse=True)
