@@ -475,6 +475,18 @@ class MainWindow(QMainWindow):
         self.filter_addr.setMaximumWidth(80)
         filter_layout.addWidget(self.filter_addr)
 
+        # IOA 范围过滤
+        filter_layout.addWidget(QLabel("IOA 范围:"))
+        self.ioa_from_input = QLineEdit()
+        self.ioa_from_input.setPlaceholderText("起始")
+        self.ioa_from_input.setMaximumWidth(80)
+        filter_layout.addWidget(self.ioa_from_input)
+        filter_layout.addWidget(QLabel("~"))
+        self.ioa_to_input = QLineEdit()
+        self.ioa_to_input.setPlaceholderText("结束")
+        self.ioa_to_input.setMaximumWidth(80)
+        filter_layout.addWidget(self.ioa_to_input)
+
         self.filter_btn = QPushButton("筛选")
         self.filter_btn.clicked.connect(self._on_filter)
         filter_layout.addWidget(self.filter_btn)
@@ -1522,6 +1534,11 @@ class MainWindow(QMainWindow):
             )
             act_copy_vals.triggered.connect(lambda: self._copy_to_clipboard(vals))
 
+        # 复制 IOA 地址
+        if frame.asdu and frame.asdu.information_elements:
+            copy_ioa_action = menu.addAction("📋 复制 IOA 地址")
+            copy_ioa_action.triggered.connect(lambda: self._copy_ioa_to_clipboard())
+
         menu.addSeparator()
 
         # 跳转详情
@@ -1538,6 +1555,22 @@ class MainWindow(QMainWindow):
         """复制文本到剪贴板"""
         QApplication.clipboard().setText(text)
         self.statusbar.showMessage("已复制到剪贴板", 2000)
+
+    def _copy_ioa_to_clipboard(self):
+        """复制选中行的IOA地址到剪贴板"""
+        rows = set(idx.row() for idx in self.table_widget.selectedIndexes())
+        if not rows:
+            return
+        ioas = []
+        for row in rows:
+            if row < len(self.all_frames):
+                frame = self.all_frames[row]
+                if frame.asdu:
+                    for elem in frame.asdu.information_elements:
+                        ioas.append(f"0x{elem.ioa:06X}")
+        if ioas:
+            QApplication.clipboard().setText("\n".join(ioas))
+            self.statusbar.showMessage(f"已复制 {len(ioas)} 个 IOA 地址", 2000)
 
     def _show_detail(self, row: int):
         """显示指定行的解析详情"""
@@ -2053,6 +2086,26 @@ class MainWindow(QMainWindow):
             except ValueError:
                 pass
 
+        # IOA 范围过滤
+        try:
+            ioa_from = int(self.ioa_from_input.text(), 0) if self.ioa_from_input.text() else None
+            ioa_to = int(self.ioa_to_input.text(), 0) if self.ioa_to_input.text() else None
+        except ValueError:
+            ioa_from = ioa_to = None
+
+        if ioa_from is not None or ioa_to is not None:
+            def ioa_in_range(elem):
+                if ioa_from is not None and ioa_to is not None:
+                    return ioa_from <= elem.ioa <= ioa_to
+                elif ioa_from is not None:
+                    return elem.ioa >= ioa_from
+                elif ioa_to is not None:
+                    return elem.ioa <= ioa_to
+                return True
+            filtered = [f for f in filtered
+                        if f.asdu and f.asdu.information_elements
+                        and any(ioa_in_range(e) for e in f.asdu.information_elements)]
+
         total_count = len(self.all_frames)
         saved = self.all_frames
         self.all_frames = filtered
@@ -2067,5 +2120,7 @@ class MainWindow(QMainWindow):
         self.filter_type.setCurrentIndex(0)
         self.filter_cot.setCurrentIndex(0)
         self.filter_addr.clear()
+        self.ioa_from_input.clear()
+        self.ioa_to_input.clear()
         self._populate_table()
         self.statusbar.showMessage("过滤已重置", 2000)
