@@ -351,6 +351,7 @@ class MainWindow(QMainWindow):
         self.all_frames: List[IEC104Frame] = []
         self._byte_position_map = []
         self._frame_byte_offset = []
+        self._frame_input_lines = []
         self._current_frame_idx = 0
         self.capture_worker: Optional[CaptureWorker] = None
         self.parse_mode: ParseMode = ParseMode.NORMAL
@@ -2009,9 +2010,9 @@ class MainWindow(QMainWindow):
         self.hex_input.setStyleSheet(
             "QPlainTextEdit { selection-background-color: #FFEB3B; selection-color: #000; }"
         )
-        # 1.5秒后恢复正常样式
+        # 3秒后恢复正常样式
         from PyQt5.QtCore import QTimer
-        QTimer.singleShot(1500, lambda: self.hex_input.setStyleSheet(""))
+        QTimer.singleShot(3000, lambda: self.hex_input.setStyleSheet(""))
 
         self.statusbar.showMessage(f"已定位到输入区第 {target_line + 1} 行", 2000)
 
