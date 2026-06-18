@@ -345,6 +345,7 @@ class MainWindow(QMainWindow):
         self.parse_mode: ParseMode = ParseMode.NORMAL
         self._dark_theme = False
         self._current_theme = "light"
+        self._auto_detect = True
 
         # 后台解析相关
         self._parse_worker: Optional[ParseWorker] = None
@@ -397,6 +398,7 @@ class MainWindow(QMainWindow):
 
         # 创建第一个输入标签页
         self._input_tab_list = []  # [(tab_widget, hex_input), ...]
+        self._bookmarks = set()  # Set of frame indices
         self._add_input_tab()
 
         # 输入操作按钮
@@ -430,13 +432,14 @@ class MainWindow(QMainWindow):
         mode_layout = QHBoxLayout(mode_group)
         mode_layout.addWidget(QLabel("模式:"))
         self.mode_combo = QComboBox()
+        self.mode_combo.addItem("自动检测", ParseMode.NORMAL)
         self.mode_combo.addItem("普通模式", ParseMode.NORMAL)
         self.mode_combo.addItem("XN3000 模式", ParseMode.XN3000)
         self.mode_combo.addItem("XN8000 模式", ParseMode.XN8000)
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         mode_layout.addWidget(self.mode_combo)
         mode_layout.addStretch()
-        mode_desc = QLabel("普通: 标准格式 | XN3000: 带时间戳RX/TX格式 | XN8000: 带时间戳send/recv格式")
+        mode_desc = QLabel("自动: 自动识别格式 | 普通: 标准格式 | XN3000: 带时间戳RX/TX格式 | XN8000: 带时间戳send/recv格式")
         mode_desc.setStyleSheet("color: #666; font-size: 9pt;")
         mode_layout.addWidget(mode_desc)
         left_layout.addWidget(mode_group)
@@ -527,7 +530,7 @@ class MainWindow(QMainWindow):
         search_layout = QHBoxLayout()
         search_layout.addWidget(QLabel("🔍 搜索:"))
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("输入关键字搜索 IOA / 值 / 描述...")
+        self.search_input.setPlaceholderText("输入关键字或正则搜索...")
         self.search_input.textChanged.connect(self._on_search)
         self.search_input.setClearButtonEnabled(True)
         search_layout.addWidget(self.search_input)
@@ -537,9 +540,9 @@ class MainWindow(QMainWindow):
         table_layout.addLayout(search_layout)
 
         self.table_widget = QTableWidget()
-        self.table_widget.setColumnCount(11)
+        self.table_widget.setColumnCount(12)
         self.table_widget.setHorizontalHeaderLabels(
-            ["序号", "原始时间", "方向", "信号类型", "类型标识", "传送原因", "公共地址", "对象数", "值", "描述", "输入行"]
+            ["序号", "原始时间", "方向", "信号类型", "类型标识", "传送原因", "公共地址", "对象数", "值", "描述", "输入行", "时间间隔"]
         )
         self.table_widget.setAlternatingRowColors(True)
         self.table_widget.setSelectionBehavior(QTableWidget.SelectRows)
@@ -549,6 +552,11 @@ class MainWindow(QMainWindow):
         self.table_widget.cellDoubleClicked.connect(self._on_table_double_click)
         self.table_widget.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table_widget.customContextMenuRequested.connect(self._on_table_context_menu)
+        self.table_widget.horizontalHeader().setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table_widget.horizontalHeader().customContextMenuRequested.connect(
+            self._on_header_context_menu)
+        # 键盘导航
+        self.table_widget.keyPressEvent = self._table_key_press
         table_layout.addWidget(self.table_widget)
 
         self.result_tabs.addTab(table_container, "报文列表")
@@ -605,8 +613,12 @@ class MainWindow(QMainWindow):
         view_menu.addAction("解析详情", lambda: self.result_tabs.setCurrentIndex(0), "Ctrl+1")
         view_menu.addAction("报文列表", lambda: self.result_tabs.setCurrentIndex(1), "Ctrl+2")
         view_menu.addAction("原始十六进制", lambda: self.result_tabs.setCurrentIndex(2), "Ctrl+3")
+        view_menu.addSeparator()
+        view_menu.addAction("下一个书签", self._goto_next_bookmark, "Ctrl+Down")
+        view_menu.addAction("上一个书签", self._goto_prev_bookmark, "Ctrl+Up")
 
         tools_menu = menubar.addMenu("工具(&T)")
+        tools_menu.addAction("报文对比(&C)...", self._open_compare, "Ctrl+Shift+C")
         tools_menu.addAction("帧生成器(&G)...", self._open_generator, "Ctrl+G")
         tools_menu.addAction("历史报文管理(&H)...", self._open_history_manager, "Ctrl+Shift+R")
         tools_menu.addSeparator()
@@ -860,6 +872,16 @@ class MainWindow(QMainWindow):
         if self.parse_mode == ParseMode.NORMAL:
             self._apply_input_line_colors()
 
+        # 自动检测模式
+        if self._auto_detect:
+            detected = self._auto_detect_mode(raw_text)
+            if detected != ParseMode.NORMAL:
+                self.parse_mode = detected
+                idx = self.mode_combo.findData(detected)
+                if idx >= 0:
+                    self.mode_combo.setCurrentIndex(idx)
+                self.statusbar.showMessage(f"自动检测到 {detected.value.upper()} 模式", 2000)
+
         # 启动后台解析
         self._is_parsing = True
         self._parse_worker = ParseWorker(self.parser, raw_text, self.parse_mode)
@@ -925,6 +947,8 @@ class MainWindow(QMainWindow):
             self._frame_input_lines = [[] for _ in self.all_frames]
 
         # 更新UI
+        self._last_send_seq = -1
+        self._analyze_time_intervals()
         self._populate_table()
         self._update_status_stats()
 
@@ -946,6 +970,35 @@ class MainWindow(QMainWindow):
         self.statusbar.showMessage(f"解析失败: {error_msg}", 5000)
         QMessageBox.critical(self, "解析错误", f"解析过程中发生错误:\n\n{error_msg}")
 
+    def _analyze_time_intervals(self):
+        """分析帧间时间间隔"""
+        self._frame_intervals = []
+        for i, frame in enumerate(self.all_frames):
+            if i == 0:
+                self._frame_intervals.append(0)
+                continue
+            ts_current = frame.original_timestamp
+            ts_previous = self.all_frames[i-1].original_timestamp
+            if ts_current and ts_previous:
+                try:
+                    def parse_ts(ts):
+                        parts = ts.replace(',', '.').split(':')
+                        if len(parts) == 3:
+                            h, m, s = int(parts[0]), int(parts[1]), float(parts[2])
+                            return h * 3600 + m * 60 + s
+                        return None
+                    curr = parse_ts(ts_current)
+                    prev = parse_ts(ts_previous)
+                    if curr is not None and prev is not None:
+                        interval = curr - prev
+                        if interval < 0:
+                            interval += 86400
+                        self._frame_intervals.append(round(interval * 1000, 1))
+                        continue
+                except Exception:
+                    pass
+            self._frame_intervals.append(None)
+
     def _on_cancel_parse(self):
         """取消解析"""
         if self._parse_worker and self._parse_worker.isRunning():
@@ -958,8 +1011,19 @@ class MainWindow(QMainWindow):
     def _on_mode_changed(self, index: int):
         """解析模式变更"""
         self.parse_mode = self.mode_combo.currentData()
+        self._auto_detect = (index == 0)
         mode_name = self.mode_combo.currentText()
         self.statusbar.showMessage(f"已切换到 {mode_name}", 2000)
+
+    def _auto_detect_mode(self, text: str) -> ParseMode:
+        """自动检测输入格式"""
+        if re.search(r'\d{2}:\d{2}:\d{2}\.\d{3}\s+(RX|TX):', text):
+            return ParseMode.XN3000
+        if re.search(r'\d+-\s*\d{2}:\d{2}:\d{2}\.\d{3}\s+(send|recv):', text):
+            return ParseMode.XN8000
+        if re.search(r'\b[0-9A-Fa-f]{2}\s+\.', text):
+            return ParseMode.XN3000
+        return ParseMode.NORMAL
 
     # ==================================================================
     # 主题切换
@@ -1065,12 +1129,22 @@ class MainWindow(QMainWindow):
     # _on_import_file 已移至下方"多文件批量导入"区域
 
     def _on_export_csv(self):
-        """导出CSV"""
+        """导出CSV - 支持筛选后导出"""
         if not self.all_frames:
             QMessageBox.information(self, "提示", "没有可导出的数据")
             return
+
+        visible_rows = []
+        for i in range(self.table_widget.rowCount()):
+            if not self.table_widget.isRowHidden(i):
+                visible_rows.append(i)
+
+        if not visible_rows:
+            QMessageBox.information(self, "提示", "没有可见的数据")
+            return
+
         path, _ = QFileDialog.getSaveFileName(self, "导出CSV", "iec104_parsed.csv",
-                                                "CSV文件 (*.csv)")
+                                                "CSV文件 (*.csv);;所有文件 (*)")
         if not path:
             return
         try:
@@ -1079,148 +1153,183 @@ class MainWindow(QMainWindow):
                 writer.writerow(["序号", "方向", "信号类型", "帧类型", "类型标识", "类型描述",
                                  "传送原因", "传送原因描述", "公共地址", "对象数",
                                  "信息对象地址", "值", "时标", "错误"])
-                for frame in self.all_frames:
-                    if frame.asdu and frame.asdu.information_elements:
-                        for elem in frame.asdu.information_elements:
-                            ts = elem.timestamp.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] \
-                                if elem.timestamp else ""
+                for row_idx in visible_rows:
+                    if row_idx < len(self.all_frames):
+                        frame = self.all_frames[row_idx]
+                        if frame.asdu and frame.asdu.information_elements:
+                            for elem in frame.asdu.information_elements:
+                                ts = elem.timestamp.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] \
+                                    if elem.timestamp else ""
+                                writer.writerow([
+                                    frame.index, frame.direction,
+                                    frame.signal_label,
+                                    frame.apci.frame_type if frame.apci else "",
+                                    frame.asdu.type_id,
+                                    TypeID.get_description(frame.asdu.type_id),
+                                    frame.asdu.cot_cause,
+                                    COT.get_description(frame.asdu.cot),
+                                    frame.asdu.common_address,
+                                    len(frame.asdu.information_elements),
+                                    f"0x{elem.ioa:06X}",
+                                    elem.value_desc, ts, frame.error
+                                ])
+                        else:
                             writer.writerow([
-                                frame.index, frame.direction,
-                                frame.signal_label,
-                                frame.apci.frame_type if frame.apci else "",
-                                frame.asdu.type_id,
-                                TypeID.get_description(frame.asdu.type_id),
-                                frame.asdu.cot_cause,
-                                COT.get_description(frame.asdu.cot),
-                                frame.asdu.common_address,
-                                len(frame.asdu.information_elements),
-                                f"0x{elem.ioa:06X}",
-                                elem.value_desc, ts, frame.error
+                                frame.index, frame.direction if frame.direction else "",
+                                "", frame.apci.frame_type if frame.apci else "",
+                                "", "", "", "", "", "",
+                                "", frame.description if frame.description else "",
+                                "", frame.error
                             ])
-                    else:
-                        writer.writerow([
-                            frame.index, frame.direction if frame.direction else "",
-                            "", frame.apci.frame_type if frame.apci else "",
-                            "", "", "", "", "", "",
-                            "", frame.description if frame.description else "",
-                            "", frame.error
-                        ])
-            self.statusbar.showMessage(f"已导出CSV: {os.path.basename(path)}", 3000)
+            export_count = len(visible_rows)
+            total_count = len(self.all_frames)
+            msg = f"已导出 {export_count}/{total_count} 条记录" if export_count < total_count else f"已导出 {export_count} 条记录"
+            self.statusbar.showMessage(f"{msg}: {os.path.basename(path)}", 3000)
         except Exception as e:
             QMessageBox.critical(self, "导出失败", str(e))
 
     def _on_export_json(self):
-        """导出JSON"""
+        """导出JSON - 支持筛选后导出"""
         if not self.all_frames:
             QMessageBox.information(self, "提示", "没有可导出的数据")
             return
+
+        visible_rows = []
+        for i in range(self.table_widget.rowCount()):
+            if not self.table_widget.isRowHidden(i):
+                visible_rows.append(i)
+
+        if not visible_rows:
+            QMessageBox.information(self, "提示", "没有可见的数据")
+            return
+
         path, _ = QFileDialog.getSaveFileName(self, "导出JSON", "iec104_parsed.json",
-                                                "JSON文件 (*.json)")
+                                                "JSON文件 (*.json);;所有文件 (*)")
         if not path:
             return
         try:
             data = []
-            for frame in self.all_frames:
-                entry = {
-                    "index": frame.index,
-                    "raw_hex": frame.raw_hex,
-                    "direction": frame.direction,
-                    "send_role": frame.send_role,
-                    "recv_role": frame.recv_role,
-                    "signal_type": frame.signal_label,
-                    "description": frame.description,
-                    "error": frame.error,
-                    "apci": None,
-                    "asdu": None,
-                }
-                if frame.apci:
-                    entry["apci"] = {
-                        "frame_type": frame.apci.frame_type,
-                        "send_seq": frame.apci.send_seq,
-                        "recv_seq": frame.apci.recv_seq,
-                        "apdu_length": frame.apci.apdu_length,
+            for row_idx in visible_rows:
+                if row_idx < len(self.all_frames):
+                    frame = self.all_frames[row_idx]
+                    entry = {
+                        "index": frame.index,
+                        "raw_hex": frame.raw_hex,
+                        "direction": frame.direction,
+                        "send_role": frame.send_role,
+                        "recv_role": frame.recv_role,
+                        "signal_type": frame.signal_label,
+                        "description": frame.description,
+                        "error": frame.error,
+                        "apci": None,
+                        "asdu": None,
                     }
-                if frame.asdu:
-                    entry["asdu"] = {
-                        "type_id": frame.asdu.type_id,
-                        "type_name": TypeID.get_name(frame.asdu.type_id),
-                        "type_desc": TypeID.get_description(frame.asdu.type_id),
-                        "signal_type": frame.asdu.signal_type.label,
-                        "vsq": frame.asdu.vsq,
-                        "object_count": frame.asdu.number_of_objects,
-                        "is_sequence": frame.asdu.is_sequence,
-                        "cot": frame.asdu.cot,
-                        "cot_cause": frame.asdu.cot_cause,
-                        "cot_desc": COT.get_description(frame.asdu.cot),
-                        "cot_test": frame.asdu.cot_test,
-                        "cot_pn": frame.asdu.cot_pn,
-                        "org": frame.asdu.org,
-                        "common_address": frame.asdu.common_address,
-                        "elements": []
-                    }
-                    for elem in frame.asdu.information_elements:
-                        entry["asdu"]["elements"].append({
-                            "ioa": f"0x{elem.ioa:06X}",
-                            "signal_type": elem.signal_type.label,
-                            "value": str(elem.value),
-                            "value_desc": elem.value_desc,
-                            "quality": str(elem.quality) if elem.quality else None,
-                            "timestamp": elem.timestamp.isoformat() if elem.timestamp else None,
-                        })
-                data.append(entry)
+                    if frame.apci:
+                        entry["apci"] = {
+                            "frame_type": frame.apci.frame_type,
+                            "send_seq": frame.apci.send_seq,
+                            "recv_seq": frame.apci.recv_seq,
+                            "apdu_length": frame.apci.apdu_length,
+                        }
+                    if frame.asdu:
+                        entry["asdu"] = {
+                            "type_id": frame.asdu.type_id,
+                            "type_name": TypeID.get_name(frame.asdu.type_id),
+                            "type_desc": TypeID.get_description(frame.asdu.type_id),
+                            "signal_type": frame.asdu.signal_type.label,
+                            "vsq": frame.asdu.vsq,
+                            "object_count": frame.asdu.number_of_objects,
+                            "is_sequence": frame.asdu.is_sequence,
+                            "cot": frame.asdu.cot,
+                            "cot_cause": frame.asdu.cot_cause,
+                            "cot_desc": COT.get_description(frame.asdu.cot),
+                            "cot_test": frame.asdu.cot_test,
+                            "cot_pn": frame.asdu.cot_pn,
+                            "org": frame.asdu.org,
+                            "common_address": frame.asdu.common_address,
+                            "elements": []
+                        }
+                        for elem in frame.asdu.information_elements:
+                            entry["asdu"]["elements"].append({
+                                "ioa": f"0x{elem.ioa:06X}",
+                                "signal_type": elem.signal_type.label,
+                                "value": str(elem.value),
+                                "value_desc": elem.value_desc,
+                                "quality": str(elem.quality) if elem.quality else None,
+                                "timestamp": elem.timestamp.isoformat() if elem.timestamp else None,
+                            })
+                    data.append(entry)
 
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            self.statusbar.showMessage(f"已导出JSON: {os.path.basename(path)}", 3000)
+            export_count = len(visible_rows)
+            total_count = len(self.all_frames)
+            msg = f"已导出 {export_count}/{total_count} 条记录" if export_count < total_count else f"已导出 {export_count} 条记录"
+            self.statusbar.showMessage(f"{msg}: {os.path.basename(path)}", 3000)
         except Exception as e:
             QMessageBox.critical(self, "导出失败", str(e))
 
     def _on_export_txt(self):
-        """导出TXT"""
+        """导出TXT - 支持筛选后导出"""
         if not self.all_frames:
             QMessageBox.information(self, "提示", "没有可导出的数据")
             return
+
+        visible_rows = []
+        for i in range(self.table_widget.rowCount()):
+            if not self.table_widget.isRowHidden(i):
+                visible_rows.append(i)
+
+        if not visible_rows:
+            QMessageBox.information(self, "提示", "没有可见的数据")
+            return
+
         path, _ = QFileDialog.getSaveFileName(self, "导出TXT", "iec104_parsed.txt",
-                                                "文本文件 (*.txt)")
+                                                "文本文件 (*.txt);;所有文件 (*)")
         if not path:
             return
         try:
+            export_count = len(visible_rows)
+            total_count = len(self.all_frames)
             with open(path, "w", encoding="utf-8") as f:
                 f.write("=" * 80 + "\n")
                 f.write("IEC60870-5-104 报文解析报告\n")
                 f.write(f"解析时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"报文总数: {len(self.all_frames)}\n")
+                f.write(f"报文总数: {export_count}/{total_count}\n")
                 f.write("=" * 80 + "\n\n")
 
-                for frame in self.all_frames:
-                    f.write(f"--- 报文 #{frame.index} ---\n")
-                    f.write(f"方向: {frame.direction}\n")
-                    if frame.signal_label:
-                        f.write(f"信号类型: {frame.signal_label}\n")
-                    f.write(f"原始数据: {frame.raw_hex}\n")
-                    if frame.error:
-                        f.write(f"错误: {frame.error}\n")
-                    elif frame.description:
-                        f.write(f"描述: {frame.description}\n")
-                    if frame.apci:
-                        f.write(f"帧类型: {frame.apci.frame_type}\n")
-                        f.write(f"发送序号SN: {frame.apci.send_seq}\n")
-                        f.write(f"接收序号RN: {frame.apci.recv_seq}\n")
-                    if frame.asdu:
-                        f.write(f"类型标识: {frame.asdu.type_id} "
-                                f"({TypeID.get_description(frame.asdu.type_id)})\n")
-                        f.write(f"传送原因: {COT.get_description(frame.asdu.cot)}\n")
-                        f.write(f"公共地址: {frame.asdu.common_address}\n")
-                        f.write(f"信息对象数: {frame.asdu.number_of_objects}\n")
-                        for elem in frame.asdu.information_elements:
-                            f.write(f"  IOA=0x{elem.ioa:06X} [{elem.signal_type.label}]: "
-                                    f"{elem.value_desc}\n")
-                            if elem.quality:
-                                f.write(f"    品质: {elem.quality}\n")
-                            if elem.timestamp:
-                                f.write(f"    时标: {elem.timestamp}\n")
-                    f.write("\n")
-            self.statusbar.showMessage(f"已导出TXT: {os.path.basename(path)}", 3000)
+                for row_idx in visible_rows:
+                    if row_idx < len(self.all_frames):
+                        frame = self.all_frames[row_idx]
+                        f.write(f"--- 报文 #{frame.index} ---\n")
+                        f.write(f"方向: {frame.direction}\n")
+                        if frame.signal_label:
+                            f.write(f"信号类型: {frame.signal_label}\n")
+                        f.write(f"原始数据: {frame.raw_hex}\n")
+                        if frame.error:
+                            f.write(f"错误: {frame.error}\n")
+                        elif frame.description:
+                            f.write(f"描述: {frame.description}\n")
+                        if frame.apci:
+                            f.write(f"帧类型: {frame.apci.frame_type}\n")
+                            f.write(f"发送序号SN: {frame.apci.send_seq}\n")
+                            f.write(f"接收序号RN: {frame.apci.recv_seq}\n")
+                        if frame.asdu:
+                            f.write(f"类型标识: {frame.asdu.type_id} "
+                                    f"({TypeID.get_description(frame.asdu.type_id)})\n")
+                            f.write(f"传送原因: {COT.get_description(frame.asdu.cot)}\n")
+                            f.write(f"公共地址: {frame.asdu.common_address}\n")
+                            f.write(f"信息对象数: {frame.asdu.number_of_objects}\n")
+                            for elem in frame.asdu.information_elements:
+                                f.write(f"  IOA=0x{elem.ioa:06X} [{elem.signal_type.label}]: "
+                                        f"{elem.value_desc}\n")
+                                if elem.quality:
+                                    f.write(f"    品质: {elem.quality}\n")
+                                if elem.timestamp:
+                                    f.write(f"    时标: {elem.timestamp}\n")
+                        f.write("\n")
+            msg = f"已导出 {export_count}/{total_count} 条记录" if export_count < total_count else f"已导出 {export_count} 条记录"
+            self.statusbar.showMessage(f"{msg}: {os.path.basename(path)}", 3000)
         except Exception as e:
             QMessageBox.critical(self, "导出失败", str(e))
 
@@ -1348,6 +1457,23 @@ class MainWindow(QMainWindow):
                 line_sort = 0
             self._set_table_item(row, 10, line_text, row_color, sort_key=line_sort)
 
+            # 时间间隔 (ms)
+            if hasattr(self, '_frame_intervals') and i < len(self._frame_intervals):
+                interval = self._frame_intervals[i]
+                if interval is not None:
+                    interval_text = f"{interval:.0f}ms" if interval > 0 else "-"
+                    interval_item = QTableWidgetItem(interval_text)
+                    if interval > 1000:
+                        interval_item.setForeground(QColor("#F44336"))
+                    elif interval > 500:
+                        interval_item.setForeground(QColor("#FF9800"))
+                    interval_item.setData(Qt.UserRole + 1, interval if interval > 0 else -1)
+                    self.table_widget.setItem(row, 11, interval_item)
+                else:
+                    self._set_table_item(row, 11, "-", row_color)
+            else:
+                self._set_table_item(row, 11, "-", row_color)
+
         # 恢复排序和更新
         self.table_widget.setSortingEnabled(True)
         self.table_widget.setUpdatesEnabled(True)
@@ -1359,6 +1485,7 @@ class MainWindow(QMainWindow):
         self.table_widget.setColumnWidth(3, 60)
         self.table_widget.setColumnWidth(8, 300)
         self.table_widget.setColumnWidth(10, 60)
+        self.table_widget.setColumnWidth(11, 80)
 
         # 自动选中第一条报文
         if self.all_frames and self.table_widget.rowCount() > 0:
@@ -1433,6 +1560,15 @@ class MainWindow(QMainWindow):
                                 "Send Sequence Number")
             self._add_tree_item(apci_root, "接收序号RN", str(apci.recv_seq),
                                 "Receive Sequence Number")
+
+            if apci.frame_type == "I-format":
+                if hasattr(self, '_last_send_seq') and self._last_send_seq >= 0:
+                    expected = (self._last_send_seq + 1) % 32768
+                    if apci.send_seq != expected:
+                        self._add_tree_item(apci_root,
+                            f"⚠ 序列号跳跃: 期望 {expected}, 实际 {apci.send_seq}",
+                            "", "序列号不连续")
+                self._last_send_seq = apci.send_seq
 
         # ASDU (字节6+)
         if frame.asdu:
@@ -1675,6 +1811,21 @@ class MainWindow(QMainWindow):
             copy_ioa_action = menu.addAction("📋 复制 IOA 地址")
             copy_ioa_action.triggered.connect(lambda: self._copy_ioa_to_clipboard())
 
+            # 快捷添加别名
+            for elem in frame.asdu.information_elements:
+                alias = get_alias(elem.ioa)
+                if not alias:
+                    act_add_alias = menu.addAction(f"✏️ 添加别名 IOA=0x{elem.ioa:06X}")
+                    act_add_alias.triggered.connect(lambda checked, ioa=elem.ioa: self._quick_add_alias(ioa))
+                    break  # Only show for first unaliased IOA
+
+        menu.addSeparator()
+
+        # 书签标记
+        is_bookmarked = row in self._bookmarks
+        act_bookmark = menu.addAction("取消书签" if is_bookmarked else "📌 添加书签")
+        act_bookmark.triggered.connect(lambda: self._toggle_bookmark(row))
+
         menu.addSeparator()
 
         # 复制全部解析结果
@@ -1696,6 +1847,26 @@ class MainWindow(QMainWindow):
         act_hex_view.triggered.connect(lambda: self._show_hex_view(row))
 
         menu.exec_(self.table_widget.viewport().mapToGlobal(pos))
+
+    def _on_header_context_menu(self, pos):
+        """表头右键菜单 - 列显示控制"""
+        menu = QMenu(self)
+        headers = ["序号", "原始时间", "方向", "信号类型", "类型标识",
+                   "传送原因", "公共地址", "对象数", "值", "描述", "输入行"]
+
+        for i, header in enumerate(headers):
+            if i >= self.table_widget.columnCount():
+                break
+            action = menu.addAction(header)
+            action.setCheckable(True)
+            action.setChecked(not self.table_widget.isColumnHidden(i))
+            action.triggered.connect(lambda checked, col=i: self._toggle_column(col, checked))
+
+        menu.exec_(self.table_widget.horizontalHeader().mapToGlobal(pos))
+
+    def _toggle_column(self, col: int, visible: bool):
+        """切换列显示"""
+        self.table_widget.setColumnHidden(col, not visible)
 
     def _copy_to_clipboard(self, text: str):
         """复制文本到剪贴板"""
@@ -2066,28 +2237,32 @@ class MainWindow(QMainWindow):
     # ==================================================================
 
     def _on_search(self, text: str):
-        """在表格中搜索关键字"""
-        keyword = text.strip().lower()
-        if not keyword:
-            # 显示所有行
-            for row in range(self.table_widget.rowCount()):
-                self.table_widget.setRowHidden(row, False)
+        """搜索表格内容 - 支持正则"""
+        if not text:
+            for i in range(self.table_widget.rowCount()):
+                self.table_widget.setRowHidden(i, False)
             self.lbl_search_count.setText("")
             return
 
+        import re
+        try:
+            pattern = re.compile(text, re.IGNORECASE)
+        except re.error:
+            pattern = re.compile(re.escape(text), re.IGNORECASE)
+
         match_count = 0
-        for row in range(self.table_widget.rowCount()):
-            match = False
-            for col in range(self.table_widget.columnCount()):
-                item = self.table_widget.item(row, col)
-                if item and keyword in item.text().lower():
-                    match = True
+        for i in range(self.table_widget.rowCount()):
+            row_match = False
+            for j in range(self.table_widget.columnCount()):
+                item = self.table_widget.item(i, j)
+                if item and pattern.search(item.text()):
+                    row_match = True
                     break
-            self.table_widget.setRowHidden(row, not match)
-            if match:
+            self.table_widget.setRowHidden(i, not row_match)
+            if row_match:
                 match_count += 1
 
-        self.lbl_search_count.setText(f"{match_count} 条匹配")
+        self.lbl_search_count.setText(f"找到 {match_count} 条")
 
     # ==================================================================
     # 序号连续性检查
@@ -2307,6 +2482,105 @@ class MainWindow(QMainWindow):
         dialog = GeneratorDialog(self)
         if dialog.exec_() == QDialog.Accepted:
             pass
+
+    def _open_compare(self):
+        """打开报文对比"""
+        from gui.compare_dialog import CompareDialog
+        dialog = CompareDialog(self)
+        dialog.exec_()
+
+    # ==================================================================
+    # 书签功能
+    # ==================================================================
+
+    def _toggle_bookmark(self, row: int):
+        """切换书签状态"""
+        if row in self._bookmarks:
+            self._bookmarks.discard(row)
+            self.statusbar.showMessage(f"已取消报文 #{row+1} 的书签", 2000)
+        else:
+            self._bookmarks.add(row)
+            self.statusbar.showMessage(f"已添加报文 #{row+1} 的书签", 2000)
+        self._update_bookmark_visual(row)
+
+    def _update_bookmark_visual(self, row: int):
+        """更新书签行的视觉效果"""
+        item = self.table_widget.item(row, 0)
+        if item:
+            if row in self._bookmarks:
+                item.setText(f"📌 {row+1}")
+            else:
+                item.setText(str(row+1))
+
+    def _goto_next_bookmark(self):
+        """跳转到下一个书签"""
+        if not self._bookmarks:
+            return
+        current = self.table_widget.currentRow()
+        sorted_bm = sorted(self._bookmarks)
+        for bm in sorted_bm:
+            if bm > current:
+                self.table_widget.selectRow(bm)
+                self._on_table_click(bm, 0)
+                return
+        # Wrap around
+        self.table_widget.selectRow(sorted_bm[0])
+        self._on_table_click(sorted_bm[0], 0)
+
+    def _goto_prev_bookmark(self):
+        """跳转到上一个书签"""
+        if not self._bookmarks:
+            return
+        current = self.table_widget.currentRow()
+        sorted_bm = sorted(self._bookmarks, reverse=True)
+        for bm in sorted_bm:
+            if bm < current:
+                self.table_widget.selectRow(bm)
+                self._on_table_click(bm, 0)
+                return
+        # Wrap around
+        self.table_widget.selectRow(sorted_bm[0])
+        self._on_table_click(sorted_bm[0], 0)
+
+    # ==================================================================
+    # 快捷添加IOA别名
+    # ==================================================================
+
+    def _quick_add_alias(self, ioa: int):
+        """快捷添加IOA别名"""
+        from gui.ioa_alias_dialog import save_aliases, load_aliases, invalidate_alias_cache
+        alias, ok = QInputDialog.getText(self, "添加别名",
+                                          f"为 IOA=0x{ioa:06X} 设置别名:")
+        if ok and alias:
+            aliases = load_aliases()
+            aliases[f"0x{ioa:06X}"] = alias
+            save_aliases(aliases)
+            self.statusbar.showMessage(f"已设置别名: 0x{ioa:06X} -> {alias}", 2000)
+            # Refresh table to show new alias
+            self._populate_table()
+
+    # ==================================================================
+    # 键盘导航
+    # ==================================================================
+
+    def _table_key_press(self, event):
+        """表格键盘导航"""
+        current_row = self.table_widget.currentRow()
+
+        if event.key() == Qt.Key_Return or event.key() == Qt.Key_Enter:
+            # Enter: 显示解析详情
+            if 0 <= current_row < len(self.all_frames):
+                self._show_detail(current_row)
+        elif event.key() == Qt.Key_F2:
+            # F2: 定位原始报文
+            if 0 <= current_row < len(self.all_frames):
+                self._locate_original_message(current_row)
+        elif event.key() == Qt.Key_Space:
+            # Space: 切换书签
+            if 0 <= current_row < len(self.all_frames):
+                self._toggle_bookmark(current_row)
+        else:
+            QTableWidget.keyPressEvent(self.table_widget, event)
 
     def closeEvent(self, event):
         """关闭窗口时安全停止后台线程"""
