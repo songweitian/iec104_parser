@@ -1,12 +1,13 @@
 """
-关于页面 - 显示版本信息和作者
+关于页面 - 显示版本信息、作者和IOA说明
 """
 
 from datetime import datetime
 
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QTextEdit, QFrame
+    QTextEdit, QFrame, QTabWidget, QTableWidget, QTableWidgetItem,
+    QHeaderView
 )
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont
@@ -28,7 +29,7 @@ class AboutDialog(QDialog):
         self.version = version
 
         self.setWindowTitle("关于")
-        self.setFixedSize(420, 320)
+        self.setFixedSize(520, 480)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
 
         self._setup_ui()
@@ -45,13 +46,14 @@ class AboutDialog(QDialog):
         title_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(title_label)
 
-        # 分隔线
-        line = QFrame()
-        line.setFrameShape(QFrame.HLine)
-        line.setStyleSheet("background-color: #ddd;")
-        layout.addWidget(line)
+        # 标签页
+        tabs = QTabWidget()
 
-        # 信息
+        # 标签页1: 关于信息
+        about_widget = QWidget()
+        about_layout = QVBoxLayout(about_widget)
+        about_layout.setContentsMargins(12, 12, 12, 12)
+
         info_layout = QVBoxLayout()
         info_layout.setSpacing(8)
 
@@ -65,8 +67,55 @@ class AboutDialog(QDialog):
                        "支持CP56Time2a时标、品质描述词\n"
                        "支持文件导入/导出CSV/JSON/TXT")
 
-        layout.addLayout(info_layout)
-        layout.addStretch()
+        about_layout.addLayout(info_layout)
+        about_layout.addStretch()
+        tabs.addTab(about_widget, "关于")
+
+        # 标签页2: IOA 地址说明
+        ioa_widget = QWidget()
+        ioa_layout = QVBoxLayout(ioa_widget)
+        ioa_layout.setContentsMargins(12, 12, 12, 12)
+
+        ioa_label = QLabel("信息对象地址 (IOA) 按区间划分信号类型：")
+        ioa_label.setStyleSheet("font-weight: bold; margin-bottom: 8px;")
+        ioa_layout.addWidget(ioa_label)
+
+        ioa_table = QTableWidget()
+        ioa_table.setColumnCount(4)
+        ioa_table.setHorizontalHeaderLabels(["IOA 范围", "信号类型", "说明", "示例"])
+        ioa_table.horizontalHeader().setStretchLastSection(True)
+        ioa_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        ioa_table.setSelectionBehavior(QTableWidget.SelectRows)
+        ioa_table.setAlternatingRowColors(True)
+
+        ioa_data = [
+            ("0x0001 ~ 0x4000", "遥信 (YX)", "单点/双点信息状态", "开关位置、保护动作信号"),
+            ("0x4001 ~ 0x5000", "遥测 (YC)", "模拟量测量值", "电压、电流、功率、温度"),
+            ("0x6001 ~ 0x6100", "遥控 (YK)", "单点/双点控制命令", "开关分合闸命令"),
+            ("0x6201 ~ 0x6400", "遥调 (YT)", "设定值调节命令", "有功/无功功率给定"),
+            ("0x6401 ~ 0x6600", "遥脉 (YM)", "电度/累计量", "正向有功电度、无功电度"),
+        ]
+
+        ioa_table.setRowCount(len(ioa_data))
+        for i, (range_str, signal_type, desc, example) in enumerate(ioa_data):
+            ioa_table.setItem(i, 0, QTableWidgetItem(range_str))
+            ioa_table.setItem(i, 1, QTableWidgetItem(signal_type))
+            ioa_table.setItem(i, 2, QTableWidgetItem(desc))
+            ioa_table.setItem(i, 3, QTableWidgetItem(example))
+
+        ioa_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        ioa_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        ioa_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+
+        ioa_layout.addWidget(ioa_table)
+
+        note_label = QLabel("注：IOA 地址在项目中可自定义分配，以上为典型分段约定。")
+        note_label.setStyleSheet("color: #666; font-size: 9pt; margin-top: 8px;")
+        ioa_layout.addWidget(note_label)
+
+        tabs.addTab(ioa_widget, "IOA 地址说明")
+
+        layout.addWidget(tabs)
 
         # 关闭按钮
         btn_layout = QHBoxLayout()

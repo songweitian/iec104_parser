@@ -1553,6 +1553,10 @@ class MainWindow(QMainWindow):
 
         menu.addSeparator()
 
+        # 定位原始报文
+        act_locate = menu.addAction("📍 定位原始报文")
+        act_locate.triggered.connect(lambda: self._locate_original_message(row))
+
         # 跳转详情
         act_detail = menu.addAction("🔍 查看解析详情")
         act_detail.triggered.connect(lambda: self._show_detail(row))
@@ -1595,6 +1599,37 @@ class MainWindow(QMainWindow):
         self._current_frame_idx = row
         self._update_hex_view(row)
         self.result_tabs.setCurrentIndex(2)
+
+    def _locate_original_message(self, row: int):
+        """定位原始报文 - 滚动到输入区对应位置并高亮"""
+        line_map = getattr(self, '_frame_input_lines', [])
+        if row >= len(line_map) or not line_map[row]:
+            self.statusbar.showMessage("未找到对应的原始报文位置", 2000)
+            return
+
+        # 获取该帧对应的输入行号（取第一个行号）
+        line_numbers = line_map[row]
+        target_line = line_numbers[0] if line_numbers else 0
+
+        # 滚动到目标行并选中
+        cursor = self.hex_input.textCursor()
+        cursor.movePosition(cursor.Start)
+        for _ in range(target_line):
+            cursor.movePosition(cursor.Down)
+        cursor.select(cursor.LineUnderCursor)
+        self.hex_input.setTextCursor(cursor)
+        self.hex_input.centerCursor()
+        self.hex_input.setFocus()
+
+        # 高亮选中的行（通过设置选区样式）
+        self.hex_input.setStyleSheet(
+            "QPlainTextEdit { selection-background-color: #FFEB3B; selection-color: #000; }"
+        )
+        # 1.5秒后恢复正常样式
+        from PyQt5.QtCore import QTimer
+        QTimer.singleShot(1500, lambda: self.hex_input.setStyleSheet(""))
+
+        self.statusbar.showMessage(f"已定位到输入区第 {target_line + 1} 行", 2000)
 
     def _on_focus_search(self):
         """Ctrl+F 聚焦到地址过滤框"""
