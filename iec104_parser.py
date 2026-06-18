@@ -11,11 +11,19 @@ IEC60870-5-104 (2002) 协议报文解析器
 """
 
 import struct
+import calendar
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
-from enum import IntEnum
+from enum import IntEnum, Enum
 from typing import List, Optional, Tuple, Dict, Any
+
+
+# 解析模式
+class ParseMode(Enum):
+    NORMAL = "normal"          # 普通模式
+    XN3000 = "xn3000"          # XN3000模式
+    XN8000 = "xn8000"          # XN8000模式
 
 logger = logging.getLogger(__name__)
 
@@ -437,6 +445,8 @@ class IEC104Frame:
     signal_type: SignalType = SignalType.OTHER  # 信号类型
     signal_label: str = ""                    # 信号类型标签 (遥信/遥测/...)
     control_desc: str = ""                    # 遥控/遥调的详细说明
+    original_timestamp: str = ""              # 原始时间戳（从报文文件中提取）
+    original_direction: str = ""              # 原始方向标记（RX/TX/send/recv）
 
 
 # ============================================================================
@@ -462,21 +472,27 @@ def parse_cp56time2a(data: bytes) -> datetime:
     year = (data[6] & 0x7F) + 2000
 
     month = max(1, min(12, month))
-    day = max(1, min(28, day))
+    day = max(1, min(31, day))
     hour = min(23, hour)
     minute = min(59, minute)
 
     try:
         return datetime(year, month, day, hour, minute, 0, ms * 1000)
     except ValueError:
-        return datetime(2000, 1, 1)
+        # 日期无效（如2月30日）时，回退到该月最后一天
+        max_day = calendar.monthrange(year, month)[1]
+        day = min(day, max_day)
+        try:
+            return datetime(year, month, day, hour, minute, 0, ms * 1000)
+        except ValueError:
+            return datetime(2000, 1, 1)
 
 
-def parse_cp24time2a(data: bytes) -> datetime:
-    """解析CP24Time2a格式时标 (3字节) - 用于 type_id=2/4
+def parse_cp24time2a(data: bytes, hour: int = 0) -> datetime:
+    """解析CP24Time2a格式时标 (3字节) - 用于 type_id=2/4/6/8/10/12/14/16
     Byte 0-1: 毫秒 (0-59999)
     Byte 2: 分钟 (bit0-5)
-    注意: CP24Time2a 不含日期信息，需要外部提供基准日期
+    注意: CP24Time2a 不含日期和小时信息，需要外部提供
     """
     if len(data) < 3:
         return datetime(2000, 1, 1)
@@ -485,12 +501,111 @@ def parse_cp24time2a(data: bytes) -> datetime:
     minute = data[2] & 0x3F
 
     minute = min(59, minute)
+    hour = max(0, min(23, hour))
 
-    # 无日期信息，使用基准日期 + 时分
     try:
-        return datetime(2000, 1, 1, 0, minute, 0, ms * 1000)
+        return datetime(2000, 1, 1, hour, minute, 0, ms * 1000)
     except ValueError:
         return datetime(2000, 1, 1)
+
+
+# ============================================================================
+# 公共工具函数
+# ============================================================================
+
+def hex_to_bytes(hex_string: str) -> bytes:
+    """十六进制字符串 → 字节，支持空格/点/换行/0x前缀等格式"""
+    cleaned = hex_string.replace(" ", "").replace("\n", "").replace("\r", "")
+    cleaned = cleaned.replace("0x", "").replace("0X", "")
+    cleaned = cleaned.replace(",", "").replace("[", "").replace("]", "")
+    cleaned = cleaned.replace(".", "")
+    cleaned = ''.join(c for c in cleaned if c in '0123456789ABCDEFabcdef')
+    if len(cleaned) % 2 != 0:
+        raise ValueError("十六进制字符串长度为奇数")
+    return bytes.fromhex(cleaned)
+
+
+def is_log_format(text: str) -> bool:
+    """检测是否为通信日志格式（含时间戳和RX/TX标记或点分隔符）"""
+    import re
+    return bool(re.search(r'\d{2}:\d{2}:\d{2}\.\d{3}\s+(RX|TX):', text)) or \
+           bool(re.search(r'\b[0-9A-Fa-f]{2}\s+\.', text))
+
+
+def split_concatenated_frames(hex_block: str) -> list:
+    """将包含多个拼接IEC104帧的十六进制字符串拆分为单帧列表"""
+    cleaned = hex_block.replace(" ", "").replace(".", "")
+    cleaned = ''.join(c for c in cleaned if c in '0123456789ABCDEFabcdef')
+    if len(cleaned) < 12:
+        return [hex_block] if cleaned else []
+
+    frames = []
+    i = 0
+    while i < len(cleaned) - 1:
+        if cleaned[i:i+2].lower() == '68':
+            if i + 4 > len(cleaned):
+                break
+            try:
+                apdu_len = int(cleaned[i+2:i+4], 16)
+            except ValueError:
+                i += 2
+                continue
+            frame_len = apdu_len + 2
+            hex_len = frame_len * 2
+            if i + hex_len <= len(cleaned):
+                frames.append(cleaned[i:i+hex_len])
+                i += hex_len
+            else:
+                frames.append(cleaned[i:])
+                break
+        else:
+            i += 2
+    return frames
+
+
+def parse_log_format_blocks(text: str) -> tuple:
+    """解析通信日志格式，返回 (frames_list, line_map_list)"""
+    import re
+    lines = text.strip().split('\n')
+    blocks = []
+    current_hex = []
+    current_line_nums = []
+
+    for i, line in enumerate(lines):
+        line = line.strip()
+        if not line:
+            continue
+
+        m = re.match(r'[\d:.\s]+(RX|TX):\s*$', line)
+        if m:
+            if current_hex:
+                blocks.append((' '.join(current_hex), list(current_line_nums)))
+                current_hex = []
+                current_line_nums = []
+            continue
+
+        m = re.match(r'^(RX|TX):\s*$', line)
+        if m:
+            if current_hex:
+                blocks.append((' '.join(current_hex), list(current_line_nums)))
+                current_hex = []
+                current_line_nums = []
+            continue
+
+        if re.search(r'[0-9A-Fa-f]{2}', line):
+            current_hex.append(line)
+            current_line_nums.append(i)
+
+    if current_hex:
+        blocks.append((' '.join(current_hex), list(current_line_nums)))
+
+    result_frames = []
+    result_lines = []
+    for block, src_lines in blocks:
+        frames = split_concatenated_frames(block)
+        result_frames.extend(frames)
+        result_lines.extend([src_lines] * len(frames))
+    return result_frames, result_lines
 
 
 # ============================================================================
@@ -505,15 +620,21 @@ _MONITOR_TYPE_IDS = set(range(1, 41)) | {70}
 class IEC104Parser:
     """IEC60870-5-104 协议报文解析器"""
 
-    START_SEND_FROM_MASTER = True
+    DEFAULT_MASTER_FIRST = True
 
-    def __init__(self):
+    def __init__(self, mode: ParseMode = ParseMode.NORMAL):
         self.frames: List[IEC104Frame] = []
-        self.last_master_send = IEC104Parser.START_SEND_FROM_MASTER
+        self.master_send_first: bool = IEC104Parser.DEFAULT_MASTER_FIRST
+        self.last_master_send: bool = self.master_send_first
+        self.mode: ParseMode = mode
+
+    def set_mode(self, mode: ParseMode):
+        """设置解析模式"""
+        self.mode = mode
 
     def set_master_send_first(self, master_first: bool):
         """设置第一个报文是否由主站发出"""
-        self.START_SEND_FROM_MASTER = master_first
+        self.master_send_first = master_first
         self.last_master_send = master_first
 
     def parse_hex(self, hex_string: str, source: str = "") -> IEC104Frame:
@@ -595,7 +716,7 @@ class IEC104Parser:
     def parse_multiple(self, hex_strings: List[str], source: str = "") -> List[IEC104Frame]:
         """批量解析多条报文"""
         frames = []
-        self.last_master_send = self.START_SEND_FROM_MASTER
+        self.last_master_send = self.master_send_first
 
         for hs in hex_strings:
             hs = hs.strip()
@@ -724,20 +845,241 @@ class IEC104Parser:
             "slave_send": slave_to_master,
         }
 
-    # ------------------------------------------------------------------
-    # 内部辅助方法
-    # ------------------------------------------------------------------
+    def check_sequence(self) -> List[Dict[str, Any]]:
+        """检查I帧发送/接收序号连续性，返回异常列表"""
+        issues = []
+        i_frames = [(i, f) for i, f in enumerate(self.frames)
+                     if f.apci and f.apci.frame_type == "I-format" and not f.error]
+
+        if len(i_frames) < 2:
+            return issues
+
+        # 按方向分组检查
+        for direction_label in ("主站→子站", "子站→主站"):
+            dir_frames = [(i, f) for i, f in i_frames if f.direction == direction_label]
+            if len(dir_frames) < 2:
+                continue
+
+            for j in range(1, len(dir_frames)):
+                prev_idx, prev_f = dir_frames[j - 1]
+                curr_idx, curr_f = dir_frames[j]
+                prev_sn = prev_f.apci.send_seq
+                curr_sn = curr_f.apci.send_seq
+
+                expected_sn = (prev_sn + 1) % 32768
+                if curr_sn != expected_sn:
+                    gap = (curr_sn - prev_sn) % 32768
+                    issues.append({
+                        "frame_index": curr_f.index,
+                        "direction": direction_label,
+                        "type": "SN跳变",
+                        "expected": expected_sn,
+                        "actual": curr_sn,
+                        "gap": gap,
+                        "detail": f"报文#{curr_f.index}: SN从{prev_sn}跳到{curr_sn}"
+                                   f" (期望{expected_sn}, 跳变{gap})"
+                    })
+
+        return issues
+
+    def check_compliance(self) -> List[Dict[str, Any]]:
+        """检查协议合规性，返回问题列表"""
+        issues = []
+
+        for frame in self.frames:
+            if frame.error:
+                continue
+            if not frame.apci:
+                continue
+
+            apci = frame.apci
+
+            # 1. APDU长度校验
+            if apci.apdu_length > 253:
+                issues.append({
+                    "frame_index": frame.index,
+                    "type": "APDU超长",
+                    "severity": "error",
+                    "detail": f"报文#{frame.index}: APDU长度={apci.apdu_length}，超过最大253字节"
+                })
+
+            # 2. I帧最小长度
+            if apci.frame_type == "I-format":
+                if apci.apdu_length < 4:
+                    issues.append({
+                        "frame_index": frame.index,
+                        "type": "I帧过短",
+                        "severity": "error",
+                        "detail": f"报文#{frame.index}: I帧APDU长度仅{apci.apdu_length}字节，最少需要4"
+                    })
+
+            # 3. S帧长度应为4
+            if apci.frame_type == "S-format" and apci.apdu_length != 4:
+                issues.append({
+                    "frame_index": frame.index,
+                    "type": "S帧长度异常",
+                    "severity": "warning",
+                    "detail": f"报文#{frame.index}: S帧APDU长度={apci.apdu_length}，应为4"
+                })
+
+            # 4. U帧长度应为4
+            if apci.frame_type == "U-format" and apci.apdu_length != 4:
+                issues.append({
+                    "frame_index": frame.index,
+                    "type": "U帧长度异常",
+                    "severity": "warning",
+                    "detail": f"报文#{frame.index}: U帧APDU长度={apci.apdu_length}，应为4"
+                })
+
+            # 5. ASDU相关检查
+            if frame.asdu:
+                asdu = frame.asdu
+
+                # 未知类型标识
+                try:
+                    TypeID(asdu.type_id)
+                except ValueError:
+                    issues.append({
+                        "frame_index": frame.index,
+                        "type": "未知类型标识",
+                        "severity": "warning",
+                        "detail": f"报文#{frame.index}: 未知类型标识 TID={asdu.type_id}"
+                    })
+
+                # 公共地址为0
+                if asdu.common_address == 0:
+                    issues.append({
+                        "frame_index": frame.index,
+                        "type": "公共地址为0",
+                        "severity": "warning",
+                        "detail": f"报文#{frame.index}: 公共地址=0，通常应大于0"
+                    })
+
+                # 信息对象地址为0（非系统命令）
+                if asdu.type_id not in (100, 101, 102, 103, 104, 105, 106, 107, 70):
+                    for elem in asdu.information_elements:
+                        if elem.ioa == 0:
+                            issues.append({
+                                "frame_index": frame.index,
+                                "type": "IOA为0",
+                                "severity": "info",
+                                "detail": f"报文#{frame.index}: 信息对象地址IOA=0"
+                            })
+                            break
+
+                # VSQ与实际对象数不匹配
+                if asdu.number_of_objects != len(asdu.information_elements):
+                    issues.append({
+                        "frame_index": frame.index,
+                        "type": "对象数不匹配",
+                        "severity": "warning",
+                        "detail": f"报文#{frame.index}: VSQ声明{asdu.number_of_objects}个对象，"
+                                   f"实际解析到{len(asdu.information_elements)}个"
+                    })
+
+                # 品质描述词无效
+                for elem in asdu.information_elements:
+                    if elem.quality and elem.quality.invalid:
+                        issues.append({
+                            "frame_index": frame.index,
+                            "type": "品质无效",
+                            "severity": "info",
+                            "detail": f"报文#{frame.index}: IOA=0x{elem.ioa:06X} 品质描述词标记为无效"
+                        })
+
+        return issues
+
+    def find_pairs(self) -> List[Dict[str, Any]]:
+        """查找报文配对关系（总召、遥控、时钟同步等）"""
+        pairs = []
+        pending = {}  # key: (type_id, common_address) -> frame
+
+        for frame in self.frames:
+            if frame.error or not frame.asdu:
+                continue
+
+            asdu = frame.asdu
+            tid = asdu.type_id
+            cot = asdu.cot_cause
+            ca = asdu.common_address
+            key = (tid, ca)
+
+            if tid == 100:  # 总召唤
+                if cot == 6:  # 激活
+                    pending[key] = frame
+                elif cot == 7:  # 激活确认
+                    if key in pending:
+                        pairs.append({
+                            "type": "总召唤",
+                            "request": pending.pop(key),
+                            "response": frame,
+                            "status": "确认"
+                        })
+                    else:
+                        pairs.append({
+                            "type": "总召唤",
+                            "request": None,
+                            "response": frame,
+                            "status": "无请求匹配"
+                        })
+                elif cot == 10:  # 激活终止
+                    if key in pending:
+                        req = pending.pop(key)
+                        pairs.append({
+                            "type": "总召唤",
+                            "request": req,
+                            "response": frame,
+                            "status": "完成"
+                        })
+
+            elif tid == 103:  # 时钟同步
+                if cot == 6:  # 激活 (主站发出)
+                    pending[key] = frame
+                elif cot == 7:  # 激活确认 (从站回复)
+                    if key in pending:
+                        pairs.append({
+                            "type": "时钟同步",
+                            "request": pending.pop(key),
+                            "response": frame,
+                            "status": "完成"
+                        })
+
+            elif tid in (45, 46, 47, 48, 49, 50, 51):  # 遥控/遥调命令
+                if cot == 6:  # 选择/执行
+                    pending[key] = frame
+                elif cot == 7:  # 确认
+                    if key in pending:
+                        pairs.append({
+                            "type": "控制命令",
+                            "request": pending.pop(key),
+                            "response": frame,
+                            "status": "确认"
+                        })
+                elif cot == 10:  # 激活终止
+                    if key in pending:
+                        pairs.append({
+                            "type": "控制命令",
+                            "request": pending.pop(key),
+                            "response": frame,
+                            "status": "终止"
+                        })
+
+        # 未匹配的请求
+        for key, frame in pending.items():
+            tid = key[0]
+            pair_type = {100: "总召唤", 103: "时钟同步"}.get(tid, "控制命令")
+            pairs.append({
+                "type": pair_type,
+                "request": frame,
+                "response": None,
+                "status": "无响应"
+            })
+
+        return pairs
 
     def _hex_to_bytes(self, hex_string: str) -> bytes:
         """十六进制字符串 → 字节"""
-        cleaned = hex_string.replace(" ", "").replace("\n", "").replace("\r", "")
-        cleaned = cleaned.replace("0x", "").replace("0X", "")
-        cleaned = cleaned.replace(",", "").replace("[", "").replace("]", "")
-        cleaned = cleaned.replace(".", "")  # 日志格式中的分隔符
-        cleaned = ''.join(c for c in cleaned if c in '0123456789ABCDEFabcdef')
-        if len(cleaned) % 2 != 0:
-            raise ValueError("十六进制字符串长度为奇数")
-        return bytes.fromhex(cleaned)
+        return hex_to_bytes(hex_string)
 
     def _parse_apci(self, raw: bytes) -> Optional[APCIHeader]:
         """解析APCI控制头"""
@@ -1008,29 +1350,49 @@ class IEC104Parser:
         return consumed
 
     def _parse_with_timestamp(self, type_id: int, data: bytes, elem: InfoElement) -> int:
-        """解析带CP56Time2a时标的基本信息"""
-        if len(data) < 11:
-            return len(data)
-
-        elem.quality = QualityDescriptor(data[0])
-        if type_id == 30:  # 单点 (遥信)
+        """解析带CP56Time2a时标的基本信息 (type_id 30-33)"""
+        if type_id == 30:  # M_SP_TB_1 单点 (遥信): SIQ(1) + CP56Time2a(7) = 8
+            if len(data) < 8:
+                return len(data)
+            elem.siq = data[0]
+            elem.quality = QualityDescriptor(data[0], is_siq_diq=True)
             elem.value = bool(data[0] & 0x01)
             val_dec = "合" if elem.value else "分"
             elem.value_desc = f"SPI={val_dec} | DEC={int(elem.value)} HEX=0x{data[0]:02X}"
-        elif type_id == 31:  # 双点 (遥信)
+            elem.timestamp = parse_cp56time2a(data[1:8])
+            return 8
+
+        elif type_id == 31:  # M_DP_TB_1 双点 (遥信): DIQ(1) + CP56Time2a(7) = 8
+            if len(data) < 8:
+                return len(data)
+            elem.diq = data[0]
+            elem.quality = QualityDescriptor(data[0], is_siq_diq=True)
             dpi = (data[0] >> 2) & 0x03
-            elem.value = dpi
             dpi_map = {0: "不确定", 1: "分", 2: "合", 3: "中间态"}
+            elem.value = dpi
             elem.value_desc = f"DPI={dpi_map.get(dpi, f'{dpi}')} | DEC={dpi} HEX=0x{data[0]:02X}"
-        elif type_id == 32:  # 步位置 (遥测)
+            elem.timestamp = parse_cp56time2a(data[1:8])
+            return 8
+
+        elif type_id == 32:  # M_ST_TB_1 步位置 (遥测): step(1) + QDS(1) + CP56Time2a(7) = 9
+            if len(data) < 9:
+                return len(data)
             elem.value = data[0]
             elem.value_desc = f"步位置={data[0]} | DEC={data[0]} HEX=0x{data[0]:02X}"
-        elif type_id == 33:  # 32比特串 (遥测)
+            elem.quality = QualityDescriptor(data[1])
+            elem.timestamp = parse_cp56time2a(data[2:9])
+            return 9
+
+        elif type_id == 33:  # M_BO_TB_1 32比特串 (遥测): bitstring(4) + QDS(1) + CP56Time2a(7) = 12
+            if len(data) < 12:
+                return len(data)
             elem.value = struct.unpack('<I', data[0:4])[0]
             elem.value_desc = f"32比特串={elem.value} | DEC={elem.value} HEX=0x{elem.value:08X}"
+            elem.quality = QualityDescriptor(data[4])
+            elem.timestamp = parse_cp56time2a(data[5:12])
+            return 12
 
-        elem.timestamp = parse_cp56time2a(data[4:11])
-        return 11
+        return 0
 
     def _parse_measured_with_timestamp(self, type_id: int, data: bytes,
                                         elem: InfoElement) -> int:
@@ -1065,10 +1427,38 @@ class IEC104Parser:
                     offset = 5
             elif type_id == 37:  # 累计量 (遥脉)
                 if len(data) >= 5:
-                    elem.value = struct.unpack('<I', data[0:4])[0]
-                    elem.value_desc = f"累计量={elem.value} | DEC={elem.value} HEX=0x{elem.value:08X}"
+                    elem.value = struct.unpack('<i', data[0:4])[0]
+                    elem.value_desc = f"累计量={elem.value} | DEC={elem.value} HEX=0x{elem.value & 0xFFFFFFFF:08X}"
                     elem.quality = QualityDescriptor(data[4])
                     offset = 5
+
+            elif type_id == 38:  # M_EP_TD_1 继电保护事件 (遥信)
+                if len(data) >= 12:
+                    elem.value = data[0]
+                    elem.value_desc = f"保护事件=0x{data[0]:02X} | DEC={data[0]} HEX=0x{data[0]:02X}"
+                    elem.quality = QualityDescriptor(data[1])
+                    offset = 5  # skip 1+4 timetag bytes
+                    if len(data) >= 12:
+                        elem.timestamp = parse_cp56time2a(data[5:12])
+                        offset = 12
+
+            elif type_id == 39:  # M_EP_TE_1 继电保护成组启动事件 (遥测)
+                if len(data) >= 24:
+                    elem.value = data[0]
+                    elem.value_desc = f"启动事件=0x{data[0]:02X} | DEC={data[0]} HEX=0x{data[0]:02X}"
+                    offset = 17  # skip 1+4+12 bytes (event + timetag + additional)
+                    if len(data) >= 24:
+                        elem.timestamp = parse_cp56time2a(data[17:24])
+                        offset = 24
+
+            elif type_id == 40:  # M_EP_TF_1 继电保护成组输出电路信息 (遥测)
+                if len(data) >= 24:
+                    elem.value = data[0]
+                    elem.value_desc = f"输出电路=0x{data[0]:02X} | DEC={data[0]} HEX=0x{data[0]:02X}"
+                    offset = 17  # skip 1+4+12 bytes (event + timetag + additional)
+                    if len(data) >= 24:
+                        elem.timestamp = parse_cp56time2a(data[17:24])
+                        offset = 24
 
             # CP56Time2a (7字节)
             if len(data) >= offset + 7:
@@ -1217,7 +1607,12 @@ class IEC104Parser:
             elem.value = data[0] if len(data) >= 1 else 0
             elem.value_desc = f"命令参数=0x{elem.value:02X} | DEC={elem.value} HEX=0x{elem.value:02X}"
             return 1 if len(data) >= 1 else 0
-        return len(data)
+        # 未知系统命令类型，仅消耗1字节避免吞掉后续数据
+        if len(data) >= 1:
+            elem.value = data[0]
+            elem.value_desc = f"未知系统命令=0x{data[0]:02X} | DEC={data[0]} HEX=0x{data[0]:02X}"
+            return 1
+        return 0
 
     def _build_description(self, frame: IEC104Frame):
         """构建报文描述"""
@@ -1240,3 +1635,287 @@ class IEC104Parser:
         if val & (1 << (bits - 1)):
             return val - (1 << bits)
         return val
+
+    def parse_from_text(self, text: str) -> List[IEC104Frame]:
+        """
+        根据当前模式从文本中解析报文
+
+        Args:
+            text: 原始文本内容
+
+        Returns:
+            解析后的报文列表
+        """
+        if self.mode == ParseMode.XN3000:
+            return self._parse_xn3000_format(text)
+        elif self.mode == ParseMode.XN8000:
+            return self._parse_xn8000_format(text)
+        else:
+            # 普通模式 - 使用原有逻辑
+            from io import StringIO
+            hex_lines, _ = self._hex_to_lines_with_mapping_old(text)
+            return self.parse_multiple(hex_lines)
+
+    def _parse_xn3000_format(self, text: str) -> List[IEC104Frame]:
+        """
+        解析 XN3000 格式报文
+
+        XN3000 格式:
+            17:01:02.612 RX:
+            68 19 64 00 04 00 24 01 . 03 00 01 00 13 40 00 E6 ...
+        """
+        import re
+        self.frames = []
+        self.last_master_send = self.master_send_first
+
+        lines = text.split('\n')
+        frames = []
+
+        current_timestamp = ""
+        current_direction = ""
+        current_hex_parts = []
+        i = 0
+
+        while i < len(lines):
+            line = lines[i].strip()
+
+            # 匹配时间戳+方向行: "17:01:02.612 RX:" 或 "17:01:02.725 TX:"
+            ts_match = re.match(r'^(\d{2}:\d{2}:\d{2}\.\d+)\s+(RX|TX):\s*$', line)
+            if ts_match:
+                # 如果已有缓冲的hex数据，先解析
+                if current_hex_parts:
+                    self._process_xn_hex_block(
+                        ''.join(current_hex_parts),
+                        current_timestamp,
+                        current_direction,
+                        frames
+                    )
+                    current_hex_parts = []
+
+                current_timestamp = ts_match.group(1)
+                current_direction = ts_match.group(2)
+                i += 1
+                continue
+
+            # 如果有时间戳，收集十六进制数据
+            if current_timestamp:
+                # 移除点分隔符，只保留十六进制字符和空格
+                cleaned = line.replace('.', '').strip()
+                if cleaned:
+                    current_hex_parts.append(cleaned)
+
+            i += 1
+
+        # 处理最后一个块
+        if current_hex_parts:
+            self._process_xn_hex_block(
+                ''.join(current_hex_parts),
+                current_timestamp,
+                current_direction,
+                frames
+            )
+
+        self.frames = frames
+        return frames
+
+    def _parse_xn8000_format(self, text: str) -> List[IEC104Frame]:
+        """
+        解析 XN8000 格式报文
+
+        XN8000 格式:
+            17- 9:24:59.947 send:
+            68 82 6c 4f 4c 30 0d 0f 03 00 01 00 2d 40 00 00 00 2c ...
+        """
+        import re
+        self.frames = []
+        self.last_master_send = self.master_send_first
+
+        lines = text.split('\n')
+        frames = []
+
+        current_timestamp = ""
+        current_direction = ""
+        current_hex_parts = []
+        i = 0
+
+        while i < len(lines):
+            line = lines[i].strip()
+
+            # 匹配时间戳+方向行: "17- 9:24:59.947 send:" 或 "17- 9:24:59.947 recv:"
+            ts_match = re.match(r'^([\d\- :\.]+)\s+(send|recv):\s*$', line)
+            if ts_match:
+                # 如果已有缓冲的hex数据，先解析
+                if current_hex_parts:
+                    self._process_xn_hex_block(
+                        ''.join(current_hex_parts),
+                        current_timestamp,
+                        current_direction,
+                        frames
+                    )
+                    current_hex_parts = []
+
+                current_timestamp = ts_match.group(1).strip()
+                current_direction = ts_match.group(2)
+                i += 1
+                continue
+
+            # 如果有时间戳，收集十六进制数据
+            if current_timestamp:
+                # XN8000格式可能包含额外字节，需要智能分割
+                cleaned = line.strip()
+                if cleaned:
+                    current_hex_parts.append(cleaned)
+
+            i += 1
+
+        # 处理最后一个块
+        if current_hex_parts:
+            self._process_xn_hex_block(
+                ''.join(current_hex_parts),
+                current_timestamp,
+                current_direction,
+                frames
+            )
+
+        self.frames = frames
+        return frames
+
+    def _process_xn_hex_block(self, hex_text: str, timestamp: str, direction: str, frames: List[IEC104Frame]):
+        """
+        处理一个十六进制数据块，可能包含多个拼接的报文
+
+        Args:
+            hex_text: 十六进制文本
+            timestamp: 原始时间戳
+            direction: 原始方向标记
+            frames: 输出帧列表
+        """
+        # 先清理，只保留十六进制字符
+        cleaned = ''.join(c for c in hex_text if c in '0123456789ABCDEFabcdef')
+
+        # 分割成多个报文
+        offset = 0
+        while offset < len(cleaned):
+            # 查找下一个68起始位置
+            start = cleaned.find('68', offset)
+            if start == -1:
+                break
+
+            # 确保字节对齐
+            if start % 2 != 0:
+                start += 1
+                if start >= len(cleaned):
+                    break
+
+            # 读取长度
+            if start + 4 >= len(cleaned):  # 需要至少能读取长度(2字节)
+                break
+
+            try:
+                apdu_len = int(cleaned[start+2:start+4], 16)
+            except ValueError:
+                offset = start + 2
+                continue
+
+            # 验证APDU长度是否在合理范围（1-253字节）
+            if apdu_len < 1 or apdu_len > 253:
+                offset = start + 2
+                continue
+
+            total_frame_len = (apdu_len + 2) * 2  # 转为十六进制字符数
+
+            # 检查是否有足够数据
+            if start + total_frame_len > len(cleaned):
+                # 尝试使用剩余的所有数据，但先验证最小长度
+                remaining = len(cleaned) - start
+                if remaining < 12:  # 至少需要6字节(12字符)
+                    offset = start + 2
+                    continue
+                frame_hex = cleaned[start:]
+            else:
+                frame_hex = cleaned[start:start+total_frame_len]
+
+            # 解析这个帧
+            frame = self._parse_single_frame_with_metadata(frame_hex, timestamp, direction)
+            frame.index = len(frames) + 1
+            frames.append(frame)
+
+            offset = start + total_frame_len
+
+    def _parse_single_frame_with_metadata(self, hex_string: str, timestamp: str, direction: str) -> IEC104Frame:
+        """
+        解析单个帧并附加元数据
+        """
+        frame = IEC104Frame()
+        frame.raw_hex = hex_string.strip()
+        frame.original_timestamp = timestamp
+        frame.original_direction = direction
+
+        # 先按原始方向判断发送角色
+        if direction.upper() in ('TX', 'SEND'):
+            frame.send_role = "主站"
+            frame.recv_role = "子站"
+            frame.direction = "主站→子站"
+            self.last_master_send = True
+        elif direction.upper() in ('RX', 'RECV'):
+            frame.send_role = "子站"
+            frame.recv_role = "主站"
+            frame.direction = "子站→主站"
+            self.last_master_send = False
+
+        try:
+            raw_bytes = self._hex_to_bytes(frame.raw_hex)
+        except ValueError as e:
+            frame.error = f"十六进制解析错误: {e}"
+            return frame
+
+        if len(raw_bytes) < 6:
+            frame.error = "报文太短 (最少6字节)"
+            return frame
+
+        frame.apci = self._parse_apci(raw_bytes)
+        if frame.apci is None:
+            frame.error = "APCI解析失败"
+            return frame
+
+        apci = frame.apci
+
+        if len(raw_bytes) < apci.total_length:
+            # 尝试用现有数据解析，可能是截断的
+            pass
+        else:
+            raw_bytes = raw_bytes[:apci.total_length]
+
+        # 如果是I帧，解析ASDU
+        if apci.frame_type == "I-format" and len(raw_bytes) >= 7:
+            try:
+                frame.asdu = self._parse_asdu(raw_bytes[6:], apci)
+                self._build_description(frame)
+
+                # 根据ASDU内容修正方向
+                tid = frame.asdu.type_id
+                if tid in _CONTROL_TYPE_IDS:
+                    frame.direction = "主站→子站"
+                    frame.send_role = "主站"
+                    frame.recv_role = "子站"
+                    self.last_master_send = True
+                elif tid in _MONITOR_TYPE_IDS:
+                    frame.direction = "子站→主站"
+                    frame.send_role = "子站"
+                    frame.recv_role = "主站"
+                    self.last_master_send = False
+
+                frame.signal_type = frame.asdu.signal_type
+                frame.signal_label = frame.asdu.signal_type.label
+
+            except Exception as e:
+                frame.error = f"ASDU解析异常: {e}"
+                logger.warning("ASDU解析异常: %s", e, exc_info=True)
+        elif apci.frame_type == "S-format":
+            frame.description = f"S帧 (确认帧, 接收序号RN={apci.recv_seq})"
+        elif apci.frame_type == "U-format":
+            frame.description = self._describe_u_frame(raw_bytes[2:6])
+
+        return frame
+
+

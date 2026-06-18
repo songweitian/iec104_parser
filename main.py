@@ -25,7 +25,7 @@ def main():
 
     # 设置应用程序元数据
     app.setApplicationName("IEC104 Parser")
-    app.setApplicationVersion("1.0.0")
+    app.setApplicationVersion("1.1.0")
     app.setOrganizationName("SWT")
 
     # 启动主窗口

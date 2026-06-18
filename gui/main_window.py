@@ -30,10 +30,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from iec104_parser import (
     IEC104Parser, IEC104Frame, SignalType, TypeID, COT,
-    APCIHeader, ASDU, InfoElement
+    APCIHeader, ASDU, InfoElement, ParseMode,
+    hex_to_bytes, is_log_format, split_concatenated_frames, parse_log_format_blocks
 )
 from gui.about_dialog import AboutDialog
-from gui.hex_view import HexHighlighter
+from gui.stats_dialog import StatsDialog
+from gui.ioa_alias_dialog import IOAAliasDialog, get_alias
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +58,276 @@ class CaptureWorker(QThread):
         self.running = False
 
 
+class ParseWorker(QThread):
+    """后台解析工作线程 - 避免UI阻塞"""
+    progress_updated = pyqtSignal(int, int)  # 当前进度, 总数
+    parse_finished = pyqtSignal(list)         # 解析完成的帧列表
+    parse_error = pyqtSignal(str)             # 错误信息
+
+    def __init__(self, parser: IEC104Parser, raw_text: str, parse_mode: ParseMode):
+        super().__init__()
+        self.parser = parser
+        self.raw_text = raw_text
+        self.parse_mode = parse_mode
+        self._is_cancelled = False
+
+    def cancel(self):
+        """请求取消解析"""
+        self._is_cancelled = True
+
+    def run(self):
+        """在后台线程中执行解析"""
+        try:
+            from copy import copy
+            # 创建独立的解析器副本，避免线程间干扰
+            worker_parser = IEC104Parser(self.parse_mode)
+            worker_parser.set_master_send_first(IEC104Parser.DEFAULT_MASTER_FIRST)
+
+            frames = []
+            if self.parse_mode == ParseMode.NORMAL:
+                # 普通模式：按行解析
+                hex_lines, line_map = self._extract_hex_lines(self.raw_text)
+                total = len(hex_lines)
+
+                if total == 0:
+                    self.parse_finished.emit([])
+                    return
+
+                worker_parser.frames = []
+                worker_parser.last_master_send = worker_parser.master_send_first
+
+                for i, hex_line in enumerate(hex_lines):
+                    if self._is_cancelled:
+                        self.parse_finished.emit(frames)
+                        return
+
+                    hex_line = hex_line.strip()
+                    if not hex_line:
+                        continue
+
+                    frame = self._parse_single_frame(worker_parser, hex_line, len(frames) + 1)
+                    frames.append(frame)
+
+                    # 每解析100帧更新一次进度
+                    if (i + 1) % 100 == 0 or i + 1 == total:
+                        self.progress_updated.emit(i + 1, total)
+
+                # 保存输入行映射
+                worker_parser._frame_input_lines = line_map
+            else:
+                # XN3000/XN8000模式
+                blocks = self._extract_xn_blocks(self.raw_text, self.parse_mode)
+                total = len(blocks)
+
+                if total == 0:
+                    self.parse_finished.emit([])
+                    return
+
+                worker_parser.frames = []
+                worker_parser.last_master_send = worker_parser.master_send_first
+
+                for i, (hex_text, timestamp, direction) in enumerate(blocks):
+                    if self._is_cancelled:
+                        self.parse_finished.emit(frames)
+                        return
+
+                    split_frames = split_concatenated_frames(hex_text)
+                    for frame_hex in split_frames:
+                        if self._is_cancelled:
+                            break
+                        frame = self._parse_frame_with_metadata(
+                            worker_parser, frame_hex, timestamp, direction, len(frames) + 1
+                        )
+                        frames.append(frame)
+
+                    if (i + 1) % 100 == 0 or i + 1 == total:
+                        self.progress_updated.emit(i + 1, total)
+
+            self.parse_finished.emit(frames)
+
+        except Exception as e:
+            import traceback
+            self.parse_error.emit(f"解析异常: {str(e)}\n{traceback.format_exc()}")
+
+    def _extract_hex_lines(self, raw_text: str):
+        """提取十六进制行（简化版）"""
+        if is_log_format(raw_text):
+            return parse_log_format_blocks(raw_text)
+
+        cleaned = ''.join(c for c in raw_text if c in '0123456789ABCDEFabcdef')
+        if cleaned and len(cleaned) % 2 == 0 and cleaned[:2].lower() == '68':
+            try:
+                raw_bytes = bytes.fromhex(cleaned)
+                if len(raw_bytes) >= 6 and raw_bytes[0] == 0x68:
+                    apdu_len = raw_bytes[1]
+                    if apdu_len + 2 == len(raw_bytes):
+                        all_lines = list(range(len(raw_text.strip().split('\n'))))
+                        return [cleaned], [all_lines]
+            except ValueError:
+                pass
+
+        all_lines = raw_text.strip().split('\n')
+        hex_lines = []
+        line_map = []
+        for i, line in enumerate(all_lines):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            hex_lines.append(line)
+            line_map.append([i])
+        return hex_lines, line_map
+
+    def _split_concatenated_frames(self, hex_block: str) -> list:
+        cleaned = hex_block.replace(" ", "").replace(".", "")
+        cleaned = ''.join(c for c in cleaned if c in '0123456789ABCDEFabcdef')
+        if len(cleaned) < 12:
+            return [hex_block] if cleaned else []
+
+        frames = []
+        i = 0
+        while i < len(cleaned) - 1:
+            if cleaned[i:i+2].lower() == '68':
+                if i + 4 > len(cleaned):
+                    break
+                try:
+                    apdu_len = int(cleaned[i+2:i+4], 16)
+                except ValueError:
+                    i += 2
+                    continue
+                frame_len = apdu_len + 2
+                hex_len = frame_len * 2
+                if i + hex_len <= len(cleaned):
+                    frames.append(cleaned[i:i+hex_len])
+                    i += hex_len
+                else:
+                    frames.append(cleaned[i:])
+                    break
+            else:
+                i += 2
+        return frames
+
+    def _extract_xn_blocks(self, text: str, parse_mode: ParseMode):
+        """提取XN格式的数据块"""
+        lines = text.strip().split('\n')
+        blocks = []
+        current_timestamp = ""
+        current_direction = ""
+        current_hex_parts = []
+
+        for line in lines:
+            line = line.strip()
+
+            if parse_mode == ParseMode.XN3000:
+                ts_match = re.match(r'^(\d{2}:\d{2}:\d{2}\.\d+)\s+(RX|TX):\s*$', line)
+            else:
+                ts_match = re.match(r'^([\d\- :\.]+)\s+(send|recv):\s*$', line)
+
+            if ts_match:
+                if current_hex_parts:
+                    blocks.append((''.join(current_hex_parts), current_timestamp, current_direction))
+                    current_hex_parts = []
+                current_timestamp = ts_match.group(1)
+                current_direction = ts_match.group(2)
+                continue
+
+            if current_timestamp:
+                cleaned = line.replace('.', '').strip()
+                if cleaned:
+                    current_hex_parts.append(cleaned)
+
+        if current_hex_parts:
+            blocks.append((''.join(current_hex_parts), current_timestamp, current_direction))
+
+        return blocks
+
+    def _parse_single_frame(self, parser, hex_string: str, index: int):
+        """解析单个帧"""
+        from iec104_parser import IEC104Frame, _CONTROL_TYPE_IDS, _MONITOR_TYPE_IDS
+        frame = IEC104Frame()
+        frame.index = index
+        frame.raw_hex = hex_string.strip()
+
+        try:
+            raw_bytes = hex_to_bytes(frame.raw_hex)
+        except ValueError as e:
+            frame.error = f"十六进制解析错误: {e}"
+            return frame
+
+        if len(raw_bytes) < 6:
+            frame.error = "报文太短 (最少6字节)"
+            return frame
+
+        frame.apci = parser._parse_apci(raw_bytes)
+        if frame.apci is None:
+            frame.error = "APCI解析失败"
+            return frame
+
+        apci = frame.apci
+
+        if len(raw_bytes) < apci.total_length:
+            frame.error = f"报文不完整 (需要{apci.total_length}字节, 实际{len(raw_bytes)}字节)"
+        else:
+            raw_bytes = raw_bytes[:apci.total_length]
+
+        if parser.last_master_send:
+            frame.send_role = "子站"
+            frame.recv_role = "主站"
+            frame.direction = "子站→主站"
+        else:
+            frame.send_role = "主站"
+            frame.recv_role = "子站"
+            frame.direction = "主站→子站"
+        parser.last_master_send = not parser.last_master_send
+
+        if apci.frame_type == "I-format" and len(raw_bytes) >= 7:
+            try:
+                frame.asdu = parser._parse_asdu(raw_bytes[6:], apci)
+                parser._build_description(frame)
+
+                tid = frame.asdu.type_id
+                if tid in _CONTROL_TYPE_IDS:
+                    frame.direction = "主站→子站"
+                    frame.send_role = "主站"
+                    frame.recv_role = "子站"
+                    parser.last_master_send = True
+                elif tid in _MONITOR_TYPE_IDS:
+                    frame.direction = "子站→主站"
+                    frame.send_role = "子站"
+                    frame.recv_role = "主站"
+                    parser.last_master_send = False
+
+                frame.signal_type = frame.asdu.signal_type
+                frame.signal_label = frame.asdu.signal_type.label
+
+            except Exception as e:
+                frame.error = f"ASDU解析异常: {e}"
+        elif apci.frame_type == "S-format":
+            frame.description = f"S帧 (确认帧, RN={apci.recv_seq})"
+        elif apci.frame_type == "U-format":
+            frame.description = parser._describe_u_frame(raw_bytes[2:6])
+
+        return frame
+
+    def _parse_frame_with_metadata(self, parser, hex_string: str, timestamp: str, direction: str, index: int):
+        """解析帧并附加元数据"""
+        frame = self._parse_single_frame(parser, hex_string, index)
+        frame.original_timestamp = timestamp
+        frame.original_direction = direction
+
+        if direction.upper() in ('TX', 'SEND'):
+            frame.send_role = "主站"
+            frame.recv_role = "子站"
+            frame.direction = "主站→子站"
+            parser.last_master_send = True
+        elif direction.upper() in ('RX', 'RECV'):
+            frame.send_role = "子站"
+            frame.recv_role = "主站"
+            frame.direction = "子站→主站"
+            parser.last_master_send = False
+
+        return frame
+
+
 class MainWindow(QMainWindow):
     """主窗口"""
 
@@ -70,12 +342,18 @@ class MainWindow(QMainWindow):
         self._frame_byte_offset = []
         self._current_frame_idx = 0
         self.capture_worker: Optional[CaptureWorker] = None
+        self.parse_mode: ParseMode = ParseMode.NORMAL
+
+        # 后台解析相关
+        self._parse_worker: Optional[ParseWorker] = None
+        self._is_parsing: bool = False
 
         self.setWindowTitle(self.APP_TITLE)
         self.resize(1320, 840)
         self.setMinimumSize(900, 640)
 
         self._setup_icon()
+        self.setAcceptDrops(True)
 
         self._setup_ui()
         self._setup_menu()
@@ -112,6 +390,10 @@ class MainWindow(QMainWindow):
         self.hex_input.setPlaceholderText("粘贴十六进制报文...")
         self.hex_input.setFont(QFont("Consolas", 11))
         self.hex_input.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.hex_input.setAcceptDrops(False)  # 由主窗口处理拖放
+        self.hex_input.textChanged.connect(self._on_input_changed)
+        self.hex_input.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.hex_input.customContextMenuRequested.connect(self._on_input_context_menu)
         hex_layout.addWidget(self.hex_input)
 
         # 输入操作按钮
@@ -132,10 +414,29 @@ class MainWindow(QMainWindow):
         btn_layout.addWidget(self.btn_clear)
         btn_layout.addWidget(self.btn_import_file)
         btn_layout.addStretch()
+        self.lbl_input_status = QLabel("")
+        self.lbl_input_status.setStyleSheet("color: #888; font-size: 9pt;")
+        btn_layout.addWidget(self.lbl_input_status)
         self.lbl_line_count = QLabel("0 行")
         btn_layout.addWidget(self.lbl_line_count)
         hex_layout.addLayout(btn_layout)
         left_layout.addWidget(hex_group)
+
+        # 解析模式选择
+        mode_group = QGroupBox("解析模式")
+        mode_layout = QHBoxLayout(mode_group)
+        mode_layout.addWidget(QLabel("模式:"))
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("普通模式", ParseMode.NORMAL)
+        self.mode_combo.addItem("XN3000 模式", ParseMode.XN3000)
+        self.mode_combo.addItem("XN8000 模式", ParseMode.XN8000)
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        mode_layout.addWidget(self.mode_combo)
+        mode_layout.addStretch()
+        mode_desc = QLabel("普通: 标准格式 | XN3000: 带时间戳RX/TX格式 | XN8000: 带时间戳send/recv格式")
+        mode_desc.setStyleSheet("color: #666; font-size: 9pt;")
+        mode_layout.addWidget(mode_desc)
+        left_layout.addWidget(mode_group)
 
         # 过滤选项
         filter_group = QGroupBox("过滤条件")
@@ -153,15 +454,18 @@ class MainWindow(QMainWindow):
 
         filter_layout.addWidget(QLabel("类型:"))
         self.filter_type = QComboBox()
+        self.filter_type.setMinimumWidth(260)
         self.filter_type.addItem("全部", -1)
         for tid in sorted(TypeID):
-            self.filter_type.addItem(f"{tid.value}: {tid.name}", tid.value)
+            desc = TypeID.get_description(tid.value)
+            self.filter_type.addItem(f"{tid.value}: {tid.name} ({desc})", tid.value)
         filter_layout.addWidget(self.filter_type)
 
         filter_layout.addWidget(QLabel("传送原因:"))
         self.filter_cot = QComboBox()
+        self.filter_cot.setMinimumWidth(200)
         self.filter_cot.addItem("全部", -1)
-        for cot in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 37]:
+        for cot in range(1, 42):
             self.filter_cot.addItem(f"{cot}: {COT.get_description(cot)}", cot)
         filter_layout.addWidget(self.filter_cot)
 
@@ -199,18 +503,40 @@ class MainWindow(QMainWindow):
         self.tree_widget.itemSelectionChanged.connect(self._on_tree_select)
         self.result_tabs.addTab(self.tree_widget, "解析详情")
 
-        # 标签页2: 报文列表
+        # 标签页2: 报文列表 (带搜索栏)
+        table_container = QWidget()
+        table_layout = QVBoxLayout(table_container)
+        table_layout.setContentsMargins(0, 0, 0, 0)
+        table_layout.setSpacing(2)
+
+        search_layout = QHBoxLayout()
+        search_layout.addWidget(QLabel("🔍 搜索:"))
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("输入关键字搜索 IOA / 值 / 描述...")
+        self.search_input.textChanged.connect(self._on_search)
+        self.search_input.setClearButtonEnabled(True)
+        search_layout.addWidget(self.search_input)
+        self.lbl_search_count = QLabel("")
+        self.lbl_search_count.setStyleSheet("color: #888; font-size: 9pt;")
+        search_layout.addWidget(self.lbl_search_count)
+        table_layout.addLayout(search_layout)
+
         self.table_widget = QTableWidget()
-        self.table_widget.setColumnCount(9)
+        self.table_widget.setColumnCount(11)
         self.table_widget.setHorizontalHeaderLabels(
-            ["序号", "方向", "信号类型", "类型标识", "传送原因", "公共地址", "对象数", "值", "描述"]
+            ["序号", "原始时间", "方向", "信号类型", "类型标识", "传送原因", "公共地址", "对象数", "值", "描述", "输入行"]
         )
         self.table_widget.setAlternatingRowColors(True)
         self.table_widget.setSelectionBehavior(QTableWidget.SelectRows)
         self.table_widget.horizontalHeader().setStretchLastSection(True)
         self.table_widget.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table_widget.cellClicked.connect(self._on_table_click)
-        self.result_tabs.addTab(self.table_widget, "报文列表")
+        self.table_widget.cellDoubleClicked.connect(self._on_table_double_click)
+        self.table_widget.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table_widget.customContextMenuRequested.connect(self._on_table_context_menu)
+        table_layout.addWidget(self.table_widget)
+
+        self.result_tabs.addTab(table_container, "报文列表")
 
         # 标签页3: 十六进制对照
         self.hex_view = QTextEdit()
@@ -252,6 +578,16 @@ class MainWindow(QMainWindow):
         view_menu = menubar.addMenu("查看(&V)")
         view_menu.addAction("解析报文(&P)", self._on_parse, "F5")
         view_menu.addAction("清空(&L)", self._on_clear, "Ctrl+L")
+        view_menu.addSeparator()
+        view_menu.addAction("查找(&F)...", self._on_focus_search, "Ctrl+F")
+        view_menu.addAction("统计图表(&T)...", self._on_show_stats, "Ctrl+T")
+
+        tools_menu = menubar.addMenu("工具(&T)")
+        tools_menu.addAction("序号检查(&S)...", self._on_check_sequence, "Ctrl+Shift+S")
+        tools_menu.addAction("协议合规检查(&C)...", self._on_check_compliance)
+        tools_menu.addAction("报文配对分析(&P)...", self._on_find_pairs)
+        tools_menu.addSeparator()
+        tools_menu.addAction("IOA地址别名(&I)...", self._on_manage_aliases, "Ctrl+Shift+I")
 
         help_menu = menubar.addMenu("帮助(&H)")
         help_menu.addAction("关于(&A)...", self._on_about)
@@ -294,6 +630,24 @@ class MainWindow(QMainWindow):
         self.lbl_stats = QLabel("就绪")
         self.statusbar.addWidget(self.lbl_stats, 1)
 
+        # 进度条（解析时显示）
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMaximumWidth(200)
+        self.progress_bar.setMaximumHeight(16)
+        self.progress_bar.setVisible(False)
+        self.statusbar.addWidget(self.progress_bar)
+
+        # 取消按钮（解析时显示）
+        self.btn_cancel_parse = QPushButton("取消解析")
+        self.btn_cancel_parse.setMaximumHeight(20)
+        self.btn_cancel_parse.setStyleSheet(
+            "QPushButton { background-color: #f44336; color: white; padding: 2px 8px; border-radius: 3px; }"
+            "QPushButton:hover { background-color: #d32f2f; }"
+        )
+        self.btn_cancel_parse.clicked.connect(self._on_cancel_parse)
+        self.btn_cancel_parse.setVisible(False)
+        self.statusbar.addWidget(self.btn_cancel_parse)
+
         self.lbl_count = QLabel("报文: 0")
         self.lbl_count.setStyleSheet("color: #666; padding: 0 8px;")
         self.statusbar.addPermanentWidget(self.lbl_count)
@@ -322,15 +676,10 @@ class MainWindow(QMainWindow):
     # 解析
     # ==================================================================
 
-    def _is_log_format(self, text: str) -> bool:
-        """检测是否为通信日志格式 (时间戳 + RX/TX + 可能含 . 分隔符)"""
-        return bool(re.search(r'\d{2}:\d{2}:\d{2}\.\d{3}\s+(RX|TX):', text)) or \
-               bool(re.search(r'\b[0-9A-Fa-f]{2}\s+\.', text))
-
     def _hex_to_lines(self, raw_text: str):
         """智能拆分报文：支持日志格式、换行合并、批量解析"""
         # 检测日志格式
-        if self._is_log_format(raw_text):
+        if is_log_format(raw_text):
             return self._parse_log_format(raw_text)
 
         # 去除空白字符，提取纯十六进制
@@ -357,8 +706,48 @@ class MainWindow(QMainWindow):
             hex_lines.append(line)
         return hex_lines
 
+    def _hex_to_lines_with_mapping(self, raw_text: str):
+        """拆分报文并返回每个报文对应的输入行号列表
+
+        Returns:
+            hex_lines: list[str]  - 每条报文的十六进制字符串
+            line_map: list[list[int]] - 每条报文对应的输入行号(0-based)
+        """
+        if is_log_format(raw_text):
+            return self._parse_log_format_with_mapping(raw_text)
+
+        cleaned = ''.join(c for c in raw_text if c in '0123456789ABCDEFabcdef')
+
+        # 单条合并报文
+        if cleaned and len(cleaned) % 2 == 0 and cleaned[:2].lower() == '68':
+            try:
+                raw_bytes = bytes.fromhex(cleaned)
+                if len(raw_bytes) >= 6 and raw_bytes[0] == 0x68:
+                    apdu_len = raw_bytes[1]
+                    if apdu_len + 2 == len(raw_bytes):
+                        all_lines = list(range(len(raw_text.strip().split("\n"))))
+                        return [cleaned], [all_lines]
+            except ValueError:
+                pass
+
+        # 按行拆分
+        all_lines = raw_text.strip().split("\n")
+        hex_lines = []
+        line_map = []
+        for i, line in enumerate(all_lines):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            hex_lines.append(line)
+            line_map.append([i])
+        return hex_lines, line_map
+
+    def _parse_log_format_with_mapping(self, text: str):
+        """解析日志格式并返回行号映射（自动拆分拼接帧）"""
+        return parse_log_format_blocks(text)
+
     def _parse_log_format(self, text: str) -> list:
-        """解析通信日志格式，返回十六进制报文列表"""
+        """解析通信日志格式，返回十六进制报文列表（自动拆分拼接帧）"""
         lines = text.strip().split('\n')
         blocks = []      # 报文块列表
         current_hex = [] # 当前块的十六进制行
@@ -392,38 +781,57 @@ class MainWindow(QMainWindow):
         if current_hex:
             blocks.append(' '.join(current_hex))
 
-        return blocks
+        # 拆分每个块中的拼接帧
+        result = []
+        for block in blocks:
+            frames = split_concatenated_frames(block)
+            result.extend(frames)
+        return result
 
     def _on_parse(self):
-        """解析报文"""
+        """解析报文 - 使用后台线程避免UI阻塞"""
         raw_text = self.hex_input.toPlainText()
-        hex_lines = self._hex_to_lines(raw_text)
 
-        if not hex_lines:
+        if not raw_text.strip() or raw_text.strip().startswith("# 在此粘贴"):
             QMessageBox.information(self, "提示", "请输入十六进制报文数据")
             return
 
-        # Build byte-to-text-position map for highlighting
-        self._byte_position_map = self._build_byte_position_map(raw_text)
-        self._frame_byte_offset = []
-        byte_offset = 0
-        for hl in hex_lines:
-            self._frame_byte_offset.append(byte_offset)
-            cleaned = ''.join(c for c in hl if c in '0123456789ABCDEFabcdef')
-            byte_offset += len(cleaned) // 2
+        # 如果正在解析，先取消
+        if self._is_parsing:
+            if self._parse_worker and self._parse_worker.isRunning():
+                self._parse_worker.cancel()
+                self._parse_worker.wait(1000)
+            self._is_parsing = False
 
-        self.lbl_line_count.setText(f"{len(hex_lines)} 行")
+        # 清除旧数据
         self.parser.clear()
-        self.all_frames = self.parser.parse_multiple(hex_lines)
+        self.all_frames.clear()
+        self._byte_position_map = []
+        self._frame_byte_offset = []
+        self._frame_input_lines = []
+        self.tree_widget.clear()
+        self.table_widget.setRowCount(0)
+        self.hex_view.clear()
 
-        self._populate_table()
-        self._update_status_stats()
+        # 预处理输入区颜色（仅普通模式）
+        if self.parse_mode == ParseMode.NORMAL:
+            self._apply_input_line_colors()
 
-        self.result_tabs.setCurrentIndex(1)
+        # 启动后台解析
+        self._is_parsing = True
+        self._parse_worker = ParseWorker(self.parser, raw_text, self.parse_mode)
 
-        error_count = sum(1 for f in self.all_frames if f.error)
-        self.statusbar.showMessage(
-            f"解析完成: {len(hex_lines)} 条报文, {error_count} 条失败", 5000)
+        # 连接信号
+        self._parse_worker.progress_updated.connect(self._on_parse_progress)
+        self._parse_worker.parse_finished.connect(self._on_parse_finished)
+        self._parse_worker.parse_error.connect(self._on_parse_error)
+
+        # 更新UI状态
+        self._set_parsing_state(True)
+        self.statusbar.showMessage("正在解析报文...", 0)
+
+        # 启动后台线程
+        self._parse_worker.start()
 
     def _on_clear(self):
         """清空"""
@@ -432,43 +840,89 @@ class MainWindow(QMainWindow):
         self.all_frames.clear()
         self._byte_position_map = []
         self._frame_byte_offset = []
+        self._frame_input_lines = []
         self.tree_widget.clear()
         self.table_widget.setRowCount(0)
         self.hex_view.clear()
         self.lbl_line_count.setText("0 行")
         self._update_status_stats()
 
+    def _set_parsing_state(self, parsing: bool):
+        """切换解析状态的UI"""
+        self._is_parsing = parsing
+        self.progress_bar.setVisible(parsing)
+        self.btn_cancel_parse.setVisible(parsing)
+
+        # 禁用/启用相关按钮
+        self.btn_parse.setEnabled(not parsing)
+        self.btn_import_file.setEnabled(not parsing)
+        self.btn_clear.setEnabled(not parsing)
+
+        if parsing:
+            self.progress_bar.setValue(0)
+            self.btn_parse.setText("⏳ 解析中...")
+        else:
+            self.btn_parse.setText("▶ 解析报文")
+
+    def _on_parse_progress(self, current: int, total: int):
+        """更新解析进度"""
+        self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(current)
+        self.statusbar.showMessage(f"正在解析报文... {current}/{total}")
+
+    def _on_parse_finished(self, frames: list):
+        """解析完成处理"""
+        self._is_parsing = False
+        self.all_frames = frames
+
+        # 存储输入行映射
+        if hasattr(self._parse_worker, '_frame_input_lines'):
+            self._frame_input_lines = self._parse_worker._frame_input_lines
+        else:
+            self._frame_input_lines = [[] for _ in self.all_frames]
+
+        # 更新UI
+        self._populate_table()
+        self._update_status_stats()
+
+        # 恢复按钮状态
+        self._set_parsing_state(False)
+
+        # 统计信息
+        error_count = sum(1 for f in self.all_frames if f.error)
+        self.statusbar.showMessage(
+            f"解析完成: {len(self.all_frames)} 条报文, {error_count} 条失败", 5000)
+
+        # 自动切换到报文列表标签
+        self.result_tabs.setCurrentIndex(1)
+
+    def _on_parse_error(self, error_msg: str):
+        """解析错误处理"""
+        self._is_parsing = False
+        self._set_parsing_state(False)
+        self.statusbar.showMessage(f"解析失败: {error_msg}", 5000)
+        QMessageBox.critical(self, "解析错误", f"解析过程中发生错误:\n\n{error_msg}")
+
+    def _on_cancel_parse(self):
+        """取消解析"""
+        if self._parse_worker and self._parse_worker.isRunning():
+            self._parse_worker.cancel()
+            self.statusbar.showMessage("正在取消解析...", 0)
+            # 等待线程结束
+            if not self._parse_worker.wait(2000):
+                self._parse_worker.terminate()
+
+    def _on_mode_changed(self, index: int):
+        """解析模式变更"""
+        self.parse_mode = self.mode_combo.currentData()
+        mode_name = self.mode_combo.currentText()
+        self.statusbar.showMessage(f"已切换到 {mode_name}", 2000)
+
     # ==================================================================
     # 导入/导出
     # ==================================================================
 
-    def _on_import_file(self):
-        """导入文件"""
-        path, _ = QFileDialog.getOpenFileName(
-            self, "导入报文文件", "",
-            "报文文件 (*.txt *.log *.hex *.dat);;二进制文件 (*.bin);;所有文件 (*.*)"
-        )
-        if not path:
-            return
-
-        try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read()
-            self.hex_input.setPlainText(content)
-            self.statusbar.showMessage(f"已导入: {os.path.basename(path)}", 3000)
-        except Exception:
-            try:
-                with open(path, "rb") as f:
-                    raw = f.read()
-                hex_lines = []
-                for i in range(0, len(raw), 16):
-                    chunk = raw[i:i+16]
-                    hex_lines.append(chunk.hex(" ").upper())
-                self.hex_input.setPlainText("\n".join(hex_lines))
-                self.statusbar.showMessage(
-                    f"已导入二进制文件: {os.path.basename(path)}", 3000)
-            except Exception as e2:
-                QMessageBox.critical(self, "导入失败", f"无法读取文件:\n{e2}")
+    # _on_import_file 已移至下方"多文件批量导入"区域
 
     def _on_export_csv(self):
         """导出CSV"""
@@ -652,11 +1106,25 @@ class MainWindow(QMainWindow):
         return QColor("#FFFFFF")
 
     def _populate_table(self):
-        """填充报文列表表格"""
+        """填充报文列表表格 - 优化大量数据性能"""
         self.table_widget.setRowCount(0)
-        for frame in self.all_frames:
-            row = self.table_widget.rowCount()
-            self.table_widget.insertRow(row)
+
+        if not self.all_frames:
+            return
+
+        line_map = getattr(self, '_frame_input_lines', [])
+
+        # 预分配行数（性能优化）
+        total_frames = len(self.all_frames)
+        self.table_widget.setRowCount(total_frames)
+
+        # 禁用排序和更新以提高性能
+        self.table_widget.setSortingEnabled(False)
+        self.table_widget.setUpdatesEnabled(False)
+
+        # 填充所有行
+        for i, frame in enumerate(self.all_frames):
+            row = i
 
             # 行背景色
             row_color = self._row_color_for_frame(frame)
@@ -666,14 +1134,21 @@ class MainWindow(QMainWindow):
             idx_item.setBackground(row_color)
             self.table_widget.setItem(row, 0, idx_item)
 
+            # 原始时间
+            ts_text = frame.original_timestamp if frame.original_timestamp else "-"
+            self._set_table_item(row, 1, ts_text, row_color)
+
             # 方向
-            dir_item = QTableWidgetItem(frame.direction)
-            if "主站→子站" in frame.direction:
+            dir_text = frame.direction
+            if not dir_text and frame.original_direction:
+                dir_text = frame.original_direction.upper()
+            dir_item = QTableWidgetItem(dir_text)
+            if "主站→子站" in dir_text or "TX" in dir_text or "SEND" in dir_text:
                 dir_item.setForeground(QColor("#E91E63"))
-            elif "子站→主站" in frame.direction:
+            elif "子站→主站" in dir_text or "RX" in dir_text or "RECV" in dir_text:
                 dir_item.setForeground(QColor("#2196F3"))
             dir_item.setBackground(row_color)
-            self.table_widget.setItem(row, 1, dir_item)
+            self.table_widget.setItem(row, 2, dir_item)
 
             # 信号类型
             sig_item = QTableWidgetItem(frame.signal_label if frame.signal_label else "-")
@@ -681,46 +1156,65 @@ class MainWindow(QMainWindow):
                 sig_item.setForeground(QColor(frame.signal_type.color_hex))
                 sig_item.setFont(QFont(self.font().family(), self.font().pointSize(), QFont.Bold))
             sig_item.setBackground(row_color)
-            self.table_widget.setItem(row, 2, sig_item)
+            self.table_widget.setItem(row, 3, sig_item)
 
             # 类型标识
             if frame.asdu:
                 tid_text = f"{frame.asdu.type_id}: {TypeID.get_description(frame.asdu.type_id)}"
             else:
                 tid_text = frame.apci.frame_type if frame.apci else "-"
-            self._set_table_item(row, 3, tid_text, row_color)
+            self._set_table_item(row, 4, tid_text, row_color)
 
             # 传送原因
             if frame.asdu:
                 cot_text = f"({frame.asdu.cot_cause}) {COT.get_description(frame.asdu.cot)}"
             else:
                 cot_text = "-"
-            self._set_table_item(row, 4, cot_text, row_color)
+            self._set_table_item(row, 5, cot_text, row_color)
 
             # 公共地址
             ca_text = f"0x{frame.asdu.common_address:04X}" if frame.asdu else "-"
-            self._set_table_item(row, 5, ca_text, row_color)
+            self._set_table_item(row, 6, ca_text, row_color)
 
             # 对象数
             obj_text = str(frame.asdu.number_of_objects) if frame.asdu else "-"
-            self._set_table_item(row, 6, obj_text, row_color)
+            self._set_table_item(row, 7, obj_text, row_color)
 
             # 值 (汇总)
             if frame.asdu and frame.asdu.information_elements:
                 vals = []
                 for elem in frame.asdu.information_elements:
-                    vals.append(elem.value_desc)
-                self._set_table_item(row, 7, " | ".join(vals), row_color)
+                    alias = get_alias(elem.ioa)
+                    prefix = f"[{alias}] " if alias else ""
+                    vals.append(f"{prefix}{elem.value_desc}")
+                self._set_table_item(row, 8, " | ".join(vals), row_color)
             else:
-                self._set_table_item(row, 7, "-", row_color)
+                self._set_table_item(row, 8, "-", row_color)
 
             # 描述
             desc = frame.description if frame.description else (frame.error if frame.error else "")
-            self._set_table_item(row, 8, desc, row_color)
+            self._set_table_item(row, 9, desc, row_color)
 
+            # 输入行号
+            fidx = frame.index - 1
+            if fidx < len(line_map) and line_map[fidx]:
+                src_lines = line_map[fidx]
+                line_text = ", ".join(str(n + 1) for n in src_lines)
+            else:
+                line_text = "-"
+            self._set_table_item(row, 10, line_text, row_color)
+
+        # 恢复排序和更新
+        self.table_widget.setSortingEnabled(True)
+        self.table_widget.setUpdatesEnabled(True)
+
+        # 调整列宽
         self.table_widget.resizeColumnsToContents()
-        self.table_widget.setColumnWidth(2, 60)
-        self.table_widget.setColumnWidth(7, 300)
+        self.table_widget.setColumnWidth(0, 50)
+        self.table_widget.setColumnWidth(1, 130)
+        self.table_widget.setColumnWidth(3, 60)
+        self.table_widget.setColumnWidth(8, 300)
+        self.table_widget.setColumnWidth(10, 60)
 
         # 自动选中第一条报文
         if self.all_frames and self.table_widget.rowCount() > 0:
@@ -749,6 +1243,11 @@ class MainWindow(QMainWindow):
 
         # 基本信息
         info_root = self._add_tree_item(None, "基本信息", "", "")
+
+        if frame.original_timestamp:
+            self._add_tree_item(info_root, "原始时间戳", frame.original_timestamp, "")
+        if frame.original_direction:
+            self._add_tree_item(info_root, "原始方向标记", frame.original_direction, "")
 
         if frame.direction:
             self._add_tree_item(info_root, "发送方向", frame.direction, "")
@@ -827,9 +1326,11 @@ class MainWindow(QMainWindow):
             # 信息元素
             for i, elem in enumerate(asdu.information_elements):
                 elem_sig = elem.signal_type.label
+                alias = get_alias(elem.ioa)
+                alias_str = f" ({alias})" if alias else ""
                 elem_root = self._add_tree_item(
                     asdu_root, f"信息元素 #{i+1}",
-                    f"IOA=0x{elem.ioa:06X} [{elem_sig}]",
+                    f"IOA=0x{elem.ioa:06X}{alias_str} [{elem_sig}]",
                     f"信息对象地址")
                 if elem.value_desc:
                     self._add_tree_item(elem_root, "值", elem.value_desc, "")
@@ -947,12 +1448,119 @@ class MainWindow(QMainWindow):
         self._populate_tree(row)
         self.result_tabs.setCurrentIndex(0)
 
+    def _on_table_double_click(self, row: int, col: int):
+        """表格行双击 -> 切换到解析详情标签页"""
+        self._current_frame_idx = row
+        self._populate_tree(row)
+        self.result_tabs.setCurrentIndex(0)
+
+    def _on_input_context_menu(self, pos):
+        """输入区右键菜单"""
+        menu = QMenu(self)
+
+        # 根据光标位置定位所在行对应的报文
+        cursor = self.hex_input.cursorForPosition(pos)
+        cursor_line = cursor.blockNumber()
+
+        line_map = getattr(self, '_frame_input_lines', [])
+        found_frame_idx = -1
+        for fidx, src_lines in enumerate(line_map):
+            if cursor_line in src_lines:
+                found_frame_idx = fidx
+                break
+
+        if found_frame_idx >= 0 and found_frame_idx < len(self.all_frames):
+            frame = self.all_frames[found_frame_idx]
+            act_jump = menu.addAction(f"🔍 跳转到报文 #{frame.index} 的解析结果")
+            act_jump.triggered.connect(lambda: self._jump_to_frame(found_frame_idx))
+            menu.addSeparator()
+
+        act_parse = menu.addAction("▶ 解析报文 (F5)")
+        act_parse.triggered.connect(self._on_parse)
+
+        act_clear = menu.addAction("🗑 清空")
+        act_clear.triggered.connect(self._on_clear)
+
+        menu.exec_(self.hex_input.mapToGlobal(pos))
+
+    def _jump_to_frame(self, frame_index: int):
+        """跳转到指定报文的解析结果"""
+        if frame_index < 0 or frame_index >= len(self.all_frames):
+            return
+        self._current_frame_idx = frame_index
+        self._populate_tree(frame_index)
+        self.table_widget.selectRow(frame_index)
+        self.result_tabs.setCurrentIndex(0)
+
+    def _on_table_context_menu(self, pos):
+        """表格右键菜单"""
+        row = self.table_widget.rowAt(pos.y())
+        if row < 0 or row >= len(self.all_frames):
+            return
+
+        self.table_widget.selectRow(row)
+        frame = self.all_frames[row]
+
+        menu = QMenu(self)
+
+        # 复制原始报文
+        act_copy_hex = menu.addAction("📋 复制原始报文")
+        act_copy_hex.triggered.connect(lambda: self._copy_to_clipboard(frame.raw_hex))
+
+        # 复制描述
+        desc = frame.description if frame.description else frame.error
+        if desc:
+            act_copy_desc = menu.addAction("📋 复制描述")
+            act_copy_desc.triggered.connect(lambda: self._copy_to_clipboard(desc))
+
+        # 复制所有值
+        if frame.asdu and frame.asdu.information_elements:
+            act_copy_vals = menu.addAction("📋 复制所有值")
+            vals = "\n".join(
+                f"IOA=0x{e.ioa:06X}: {e.value_desc}"
+                for e in frame.asdu.information_elements
+            )
+            act_copy_vals.triggered.connect(lambda: self._copy_to_clipboard(vals))
+
+        menu.addSeparator()
+
+        # 跳转详情
+        act_detail = menu.addAction("🔍 查看解析详情")
+        act_detail.triggered.connect(lambda: self._show_detail(row))
+
+        # 跳转十六进制视图
+        act_hex_view = menu.addAction("🔢 查看十六进制")
+        act_hex_view.triggered.connect(lambda: self._show_hex_view(row))
+
+        menu.exec_(self.table_widget.viewport().mapToGlobal(pos))
+
+    def _copy_to_clipboard(self, text: str):
+        """复制文本到剪贴板"""
+        QApplication.clipboard().setText(text)
+        self.statusbar.showMessage("已复制到剪贴板", 2000)
+
+    def _show_detail(self, row: int):
+        """显示指定行的解析详情"""
+        self._current_frame_idx = row
+        self._populate_tree(row)
+        self.result_tabs.setCurrentIndex(0)
+
+    def _show_hex_view(self, row: int):
+        """显示指定行的十六进制视图"""
+        self._current_frame_idx = row
+        self._update_hex_view(row)
+        self.result_tabs.setCurrentIndex(2)
+
+    def _on_focus_search(self):
+        """Ctrl+F 聚焦到地址过滤框"""
+        self.filter_addr.setFocus()
+        self.filter_addr.selectAll()
+
     def _on_tree_select(self):
-        """树节点选择时高亮对应原始报文位置（输入区和十六进制视图）"""
+        """树节点选择时在十六进制视图中高亮对应字节范围"""
         items = self.tree_widget.selectedItems()
         if not items:
             self._update_hex_view(self._current_frame_idx)
-            self._clear_input_highlight()
             return
 
         item = items[0]
@@ -961,14 +1569,80 @@ class MainWindow(QMainWindow):
             self._update_hex_view(self._current_frame_idx,
                                   highlight_start=byte_range[0],
                                   highlight_end=byte_range[1])
-            self._highlight_input_bytes(byte_range[0], byte_range[1], self._current_frame_idx)
         else:
             self._update_hex_view(self._current_frame_idx)
-            self._clear_input_highlight()
 
     def _clear_input_highlight(self):
         """清除输入区高亮"""
         self.hex_input.setExtraSelections([])
+
+    def _highlight_input_line_for_frame(self, frame_index: int):
+        """高亮输入区中对应报文的源行"""
+        line_map = getattr(self, '_frame_input_lines', [])
+        if frame_index >= len(line_map) or not line_map[frame_index]:
+            self._clear_input_highlight()
+            return
+
+        source_lines = line_map[frame_index]
+        all_text = self.hex_input.toPlainText()
+        all_lines = all_text.split("\n")
+
+        selections = []
+        for line_num in source_lines:
+            if line_num >= len(all_lines):
+                continue
+            # 计算该行在文本中的起止位置
+            pos_start = sum(len(all_lines[i]) + 1 for i in range(line_num))
+            pos_end = pos_start + len(all_lines[line_num])
+
+            sel = QTextEdit.ExtraSelection()
+            sel.format.setBackground(QColor("#BBDEFB"))
+            sel.format.setForeground(QColor("#000000"))
+            cursor = self.hex_input.textCursor()
+            cursor.setPosition(pos_start)
+            cursor.setPosition(pos_end, QTextCursor.KeepAnchor)
+            sel.cursor = cursor
+            selections.append(sel)
+
+        self.hex_input.setExtraSelections(selections)
+
+        # 滚动到第一个高亮行
+        if selections:
+            self.hex_input.setTextCursor(selections[0].cursor)
+
+    def _apply_input_line_colors(self):
+        """解析后为输入区每行添加交替背景色，便于区分各报文"""
+        all_text = self.hex_input.toPlainText()
+        all_lines = all_text.split("\n")
+        line_map = getattr(self, '_frame_input_lines', [])
+
+        # 构建行号 -> 报文索引的映射
+        line_to_frame = {}
+        for fidx, src_lines in enumerate(line_map):
+            for ln in src_lines:
+                line_to_frame[ln] = fidx
+
+        selections = []
+        colors = [QColor("#F5F5F5"), QColor("#FFFFFF")]
+        for i, line in enumerate(all_lines):
+            if not line.strip() or line.strip().startswith("#"):
+                continue
+            fidx = line_to_frame.get(i, -1)
+            if fidx < 0:
+                continue
+
+            pos_start = sum(len(all_lines[j]) + 1 for j in range(i))
+            pos_end = pos_start + len(line)
+
+            sel = QTextEdit.ExtraSelection()
+            sel.format.setBackground(colors[fidx % 2])
+            cursor = self.hex_input.textCursor()
+            cursor.setPosition(pos_start)
+            cursor.setPosition(pos_end, QTextCursor.KeepAnchor)
+            sel.cursor = cursor
+            selections.append(sel)
+
+        self.hex_input.setExtraSelections(selections)
 
     def _highlight_input_bytes(self, start_byte: int, end_byte: int, frame_index: int = 0):
         """在原始报文输入区高亮指定字节范围"""
@@ -1003,7 +1677,7 @@ class MainWindow(QMainWindow):
         返回 list[byte_idx] = text_position_of_first_hex_char。
         """
         byte_map = []
-        is_log = self._is_log_format(text)
+        is_log = is_log_format(text)
         i = 0
         n = len(text)
 
@@ -1060,6 +1734,298 @@ class MainWindow(QMainWindow):
                 return i
         return 0
 
+    # ==================================================================
+    # 拖放文件支持
+    # ==================================================================
+
+    def dragEnterEvent(self, event):
+        """拖入事件：接受文件拖放"""
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                if url.isLocalFile():
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+
+    def dropEvent(self, event):
+        """放下事件：读取拖入的文件"""
+        urls = event.mimeData().urls()
+        if not urls:
+            return
+
+        file_path = urls[0].toLocalFile()
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            self.hex_input.setPlainText(content)
+            self.statusbar.showMessage(f"已加载拖放文件: {os.path.basename(file_path)}", 3000)
+        except Exception:
+            try:
+                with open(file_path, "rb") as f:
+                    raw = f.read()
+                hex_lines = []
+                for i in range(0, len(raw), 16):
+                    chunk = raw[i:i + 16]
+                    hex_lines.append(chunk.hex(" ").upper())
+                self.hex_input.setPlainText("\n".join(hex_lines))
+                self.statusbar.showMessage(
+                    f"已加载二进制文件: {os.path.basename(file_path)}", 3000)
+            except Exception as e:
+                QMessageBox.critical(self, "加载失败", f"无法读取文件:\n{e}")
+
+    # ==================================================================
+    # 实时输入校验
+    # ==================================================================
+
+    def _on_input_changed(self):
+        """输入区内容变化时实时校验"""
+        text = self.hex_input.toPlainText()
+        if not text.strip():
+            self.lbl_input_status.setText("")
+            return
+
+        # 统计有效十六进制字符
+        hex_chars = ''.join(c for c in text if c in '0123456789ABCDEFabcdef')
+        non_hex = len(text.replace(' ', '').replace('\n', '').replace('\r', '')) - len(hex_chars)
+
+        if non_hex > 0:
+            self.lbl_input_status.setText(f"⚠️ 含{non_hex}个非法字符")
+            self.lbl_input_status.setStyleSheet("color: #E65100; font-size: 9pt;")
+        elif len(hex_chars) % 2 != 0:
+            self.lbl_input_status.setText("⚠️ 十六进制长度为奇数")
+            self.lbl_input_status.setStyleSheet("color: #E65100; font-size: 9pt;")
+        else:
+            byte_count = len(hex_chars) // 2
+            self.lbl_input_status.setText(f"✓ {byte_count} 字节")
+            self.lbl_input_status.setStyleSheet("color: #4CAF50; font-size: 9pt;")
+
+    # ==================================================================
+    # 搜索
+    # ==================================================================
+
+    def _on_search(self, text: str):
+        """在表格中搜索关键字"""
+        keyword = text.strip().lower()
+        if not keyword:
+            # 显示所有行
+            for row in range(self.table_widget.rowCount()):
+                self.table_widget.setRowHidden(row, False)
+            self.lbl_search_count.setText("")
+            return
+
+        match_count = 0
+        for row in range(self.table_widget.rowCount()):
+            match = False
+            for col in range(self.table_widget.columnCount()):
+                item = self.table_widget.item(row, col)
+                if item and keyword in item.text().lower():
+                    match = True
+                    break
+            self.table_widget.setRowHidden(row, not match)
+            if match:
+                match_count += 1
+
+        self.lbl_search_count.setText(f"{match_count} 条匹配")
+
+    # ==================================================================
+    # 序号连续性检查
+    # ==================================================================
+
+    def _on_check_sequence(self):
+        """检查I帧序号连续性"""
+        if not self.all_frames:
+            QMessageBox.information(self, "提示", "没有已解析的报文，请先解析")
+            return
+
+        issues = self.parser.check_sequence()
+        if not issues:
+            QMessageBox.information(
+                self, "序号检查",
+                f"✅ 检查通过！共 {len(self.all_frames)} 条报文，未发现序号异常。")
+            return
+
+        # 构建详细报告
+        report_lines = [f"发现 {len(issues)} 处序号异常：\n"]
+        for issue in issues:
+            report_lines.append(f"  • {issue['detail']}")
+
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("序号检查结果")
+        dialog.setIcon(QMessageBox.Warning)
+        dialog.setText(f"发现 {len(issues)} 处序号跳变")
+        dialog.setDetailedText("\n".join(report_lines))
+        dialog.exec_()
+
+    # ==================================================================
+    # 多文件批量导入
+    # ==================================================================
+
+    def _on_import_file(self):
+        """导入文件（支持多选）"""
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "导入报文文件", "",
+            "报文文件 (*.txt *.log *.hex *.dat);;二进制文件 (*.bin);;所有文件 (*.*)"
+        )
+        if not paths:
+            return
+
+        if len(paths) == 1:
+            # 单文件：沿用原逻辑
+            self._load_single_file(paths[0])
+        else:
+            # 多文件：合并内容
+            all_content = []
+            for path in paths:
+                try:
+                    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read()
+                    all_content.append(f"# === 文件: {os.path.basename(path)} ===")
+                    all_content.append(content)
+                except Exception:
+                    try:
+                        with open(path, "rb") as f:
+                            raw = f.read()
+                        hex_lines = []
+                        for i in range(0, len(raw), 16):
+                            chunk = raw[i:i + 16]
+                            hex_lines.append(chunk.hex(" ").upper())
+                        all_content.append(f"# === 文件: {os.path.basename(path)} ===")
+                        all_content.append("\n".join(hex_lines))
+                    except Exception as e:
+                        all_content.append(f"# 读取失败: {os.path.basename(path)} - {e}")
+
+            self.hex_input.setPlainText("\n".join(all_content))
+            self.statusbar.showMessage(f"已合并导入 {len(paths)} 个文件", 3000)
+
+    def _load_single_file(self, path: str):
+        """加载单个文件"""
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            self.hex_input.setPlainText(content)
+            self.statusbar.showMessage(f"已导入: {os.path.basename(path)}", 3000)
+        except Exception:
+            try:
+                with open(path, "rb") as f:
+                    raw = f.read()
+                hex_lines = []
+                for i in range(0, len(raw), 16):
+                    chunk = raw[i:i + 16]
+                    hex_lines.append(chunk.hex(" ").upper())
+                self.hex_input.setPlainText("\n".join(hex_lines))
+                self.statusbar.showMessage(
+                    f"已导入二进制文件: {os.path.basename(path)}", 3000)
+            except Exception as e2:
+                QMessageBox.critical(self, "导入失败", f"无法读取文件:\n{e2}")
+
+    # ==================================================================
+    # 统计图表
+    # ==================================================================
+
+    def _on_show_stats(self):
+        """显示统计图表"""
+        if not self.all_frames:
+            QMessageBox.information(self, "提示", "没有已解析的报文，请先解析")
+            return
+        StatsDialog(self.all_frames, self).exec_()
+
+    # ==================================================================
+    # 协议合规检查
+    # ==================================================================
+
+    def _on_check_compliance(self):
+        """协议合规性检查"""
+        if not self.all_frames:
+            QMessageBox.information(self, "提示", "没有已解析的报文，请先解析")
+            return
+
+        issues = self.parser.check_compliance()
+        if not issues:
+            QMessageBox.information(
+                self, "协议合规检查",
+                f"✅ 检查通过！共 {len(self.all_frames)} 条报文，未发现协议违规。")
+            return
+
+        # 按严重程度分组
+        errors = [i for i in issues if i.get("severity") == "error"]
+        warnings = [i for i in issues if i.get("severity") == "warning"]
+        infos = [i for i in issues if i.get("severity") == "info"]
+
+        report = []
+        report.append(f"共发现 {len(issues)} 个问题：")
+        if errors:
+            report.append(f"  ❌ 错误: {len(errors)}")
+        if warnings:
+            report.append(f"  ⚠️ 警告: {len(warnings)}")
+        if infos:
+            report.append(f"  ℹ️ 提示: {len(infos)}")
+        report.append("")
+        for issue in issues:
+            icon = {"error": "❌", "warning": "⚠️", "info": "ℹ️"}.get(issue["severity"], "•")
+            report.append(f"  {icon} {issue['detail']}")
+
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("协议合规检查结果")
+        dialog.setIcon(QMessageBox.Warning if errors else QMessageBox.Information)
+        dialog.setText(f"发现 {len(issues)} 个合规问题")
+        dialog.setDetailedText("\n".join(report))
+        dialog.exec_()
+
+    # ==================================================================
+    # 报文配对分析
+    # ==================================================================
+
+    def _on_find_pairs(self):
+        """报文配对分析"""
+        if not self.all_frames:
+            QMessageBox.information(self, "提示", "没有已解析的报文，请先解析")
+            return
+
+        pairs = self.parser.find_pairs()
+        if not pairs:
+            QMessageBox.information(self, "配对分析", "未发现可配对的报文（总召/遥控/时钟同步）")
+            return
+
+        lines = [f"共发现 {len(pairs)} 组配对关系：\n"]
+        for p in pairs:
+            req_idx = f"#{p['request'].index}" if p['request'] else "无"
+            resp_idx = f"#{p['response'].index}" if p['response'] else "无"
+            status = p['status']
+            icon = "✅" if status in ("确认", "完成") else "⚠️"
+            lines.append(
+                f"  {icon} [{p['type']}] 请求:{req_idx} → 响应:{resp_idx} ({status})")
+
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("报文配对分析")
+        dialog.setIcon(QMessageBox.Information)
+        dialog.setText(f"发现 {len(pairs)} 组配对")
+        dialog.setDetailedText("\n".join(lines))
+        dialog.exec_()
+
+    # ==================================================================
+    # IOA地址别名
+    # ==================================================================
+
+    def _on_manage_aliases(self):
+        """打开IOA别名管理对话框"""
+        IOAAliasDialog(self).exec_()
+        # 刷新当前显示
+        if self.all_frames:
+            self._populate_table()
+            if self._current_frame_idx < len(self.all_frames):
+                self._populate_tree(self._current_frame_idx)
+
+    def closeEvent(self, event):
+        """关闭窗口时安全停止后台线程"""
+        if self._parse_worker and self._parse_worker.isRunning():
+            self._parse_worker.cancel()
+            if not self._parse_worker.wait(2000):
+                self._parse_worker.terminate()
+        event.accept()
+
     def _on_about(self):
         """关于对话框"""
         AboutDialog(self.APP_TITLE, self.APP_VERSION).exec_()
@@ -1087,12 +2053,13 @@ class MainWindow(QMainWindow):
             except ValueError:
                 pass
 
+        total_count = len(self.all_frames)
         saved = self.all_frames
         self.all_frames = filtered
         self._populate_table()
         self.all_frames = saved
         self.statusbar.showMessage(
-            f"过滤结果: {len(filtered)}/{len(self.all_frames)} 条报文", 3000)
+            f"过滤结果: {len(filtered)}/{total_count} 条报文", 3000)
 
     def _on_filter_reset(self):
         """重置过滤"""

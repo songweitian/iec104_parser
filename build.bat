@@ -51,7 +51,7 @@ echo.
 echo =====================================
 echo  构建完成！
 echo  可执行文件位置:
-echo  dist\IEC104_Parser.exe
+echo  dist\IEC104_Parser\IEC104_Parser.exe
 echo =====================================
 echo.
 echo 按任意键打开输出目录...
