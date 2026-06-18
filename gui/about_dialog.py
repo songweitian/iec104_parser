@@ -1,26 +1,24 @@
 """
-关于页面 - 显示版本信息、作者和IOA说明
+关于页面 - 版本信息和IOA地址说明
 """
 
 from datetime import datetime
 
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QTextEdit, QFrame, QTabWidget, QTableWidget, QTableWidgetItem,
-    QHeaderView, QWidget
+    QTableWidget, QTableWidgetItem, QHeaderView, QWidget
 )
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont
 
 
-# 编译日期 - 每次构建时更新
 BUILD_DATE = datetime.now().strftime("%Y-%m-%d")
 AUTHOR = "宋伟田"
 VERSION = "1.1.0"
 
 
 class AboutDialog(QDialog):
-    """关于对话框"""
+    """版本信息对话框"""
 
     def __init__(self, app_title: str = "IEC104报文解析器",
                  version: str = VERSION, parent=None):
@@ -29,7 +27,7 @@ class AboutDialog(QDialog):
         self.version = version
 
         self.setWindowTitle("关于")
-        self.setFixedSize(520, 480)
+        self.setFixedSize(420, 340)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
 
         self._setup_ui()
@@ -39,20 +37,16 @@ class AboutDialog(QDialog):
         layout.setSpacing(12)
         layout.setContentsMargins(24, 20, 24, 20)
 
-        # 标题
         title_label = QLabel(self.app_title)
-        title_font = QFont("Microsoft YaHei", 16, QFont.Bold)
-        title_label.setFont(title_font)
+        title_label.setFont(QFont("Microsoft YaHei", 16, QFont.Bold))
         title_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(title_label)
 
-        # 标签页
-        tabs = QTabWidget()
-
-        # 标签页1: 关于信息
-        about_widget = QWidget()
-        about_layout = QVBoxLayout(about_widget)
-        about_layout.setContentsMargins(12, 12, 12, 12)
+        from PyQt5.QtWidgets import QFrame
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setStyleSheet("background-color: #ddd;")
+        layout.addWidget(line)
 
         info_layout = QVBoxLayout()
         info_layout.setSpacing(8)
@@ -67,18 +61,49 @@ class AboutDialog(QDialog):
                        "支持CP56Time2a时标、品质描述词\n"
                        "支持文件导入/导出CSV/JSON/TXT")
 
-        about_layout.addLayout(info_layout)
-        about_layout.addStretch()
-        tabs.addTab(about_widget, "关于")
+        layout.addLayout(info_layout)
+        layout.addStretch()
 
-        # 标签页2: IOA 地址说明
-        ioa_widget = QWidget()
-        ioa_layout = QVBoxLayout(ioa_widget)
-        ioa_layout.setContentsMargins(12, 12, 12, 12)
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.accept)
+        close_btn.setMinimumWidth(80)
+        close_btn.setStyleSheet("QPushButton { padding: 6px 16px; border-radius: 4px; }")
+        btn_layout.addWidget(close_btn)
+        layout.addLayout(btn_layout)
 
-        ioa_label = QLabel("信息对象地址 (IOA) 按区间划分信号类型：")
-        ioa_label.setStyleSheet("font-weight: bold; margin-bottom: 8px;")
-        ioa_layout.addWidget(ioa_label)
+    def _add_info(self, layout: QVBoxLayout, label: str, value: str):
+        row = QHBoxLayout()
+        lbl = QLabel(f"{label}:")
+        lbl.setStyleSheet("color: #666; font-weight: bold;")
+        lbl.setFixedWidth(70)
+        row.addWidget(lbl)
+        val = QLabel(value)
+        val.setWordWrap(True)
+        row.addWidget(val, 1)
+        layout.addLayout(row)
+
+
+class IOAHelpDialog(QDialog):
+    """IOA 地址说明对话框"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("IOA 地址说明")
+        self.setFixedSize(560, 380)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        title = QLabel("信息对象地址 (IOA) 按区间划分信号类型")
+        title.setFont(QFont("Microsoft YaHei", 12, QFont.Bold))
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
 
         ioa_table = QTableWidget()
         ioa_table.setColumnCount(4)
@@ -107,35 +132,16 @@ class AboutDialog(QDialog):
         ioa_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         ioa_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
 
-        ioa_layout.addWidget(ioa_table)
+        layout.addWidget(ioa_table)
 
         note_label = QLabel("注：IOA 地址在项目中可自定义分配，以上为典型分段约定。")
-        note_label.setStyleSheet("color: #666; font-size: 9pt; margin-top: 8px;")
-        ioa_layout.addWidget(note_label)
+        note_label.setStyleSheet("color: #666; font-size: 9pt;")
+        layout.addWidget(note_label)
 
-        tabs.addTab(ioa_widget, "IOA 地址说明")
-
-        layout.addWidget(tabs)
-
-        # 关闭按钮
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
         close_btn = QPushButton("关闭")
         close_btn.clicked.connect(self.accept)
         close_btn.setMinimumWidth(80)
-        close_btn.setStyleSheet(
-            "QPushButton { padding: 6px 16px; border-radius: 4px; }")
         btn_layout.addWidget(close_btn)
         layout.addLayout(btn_layout)
-
-    def _add_info(self, layout: QVBoxLayout, label: str, value: str):
-        """添加信息行"""
-        row = QHBoxLayout()
-        lbl = QLabel(f"{label}:")
-        lbl.setStyleSheet("color: #666; font-weight: bold;")
-        lbl.setFixedWidth(70)
-        row.addWidget(lbl)
-        val = QLabel(value)
-        val.setWordWrap(True)
-        row.addWidget(val, 1)
-        layout.addLayout(row)

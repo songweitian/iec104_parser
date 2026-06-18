@@ -645,7 +645,8 @@ class MainWindow(QMainWindow):
         help_menu = menubar.addMenu("帮助(&H)")
         help_menu.addAction("软件激活(&A)...", self._open_license_dialog)
         help_menu.addSeparator()
-        help_menu.addAction("关于(&A)...", self._on_about)
+        help_menu.addAction("版本信息(&V)...", self._on_about)
+        help_menu.addAction("IOA 地址说明(&I)...", self._on_ioa_help)
 
     def _setup_toolbar(self):
         """设置工具栏"""
@@ -2644,8 +2645,13 @@ class MainWindow(QMainWindow):
         event.accept()
 
     def _on_about(self):
-        """关于对话框"""
+        """版本信息对话框"""
         AboutDialog(self.APP_TITLE, self.APP_VERSION).exec_()
+
+    def _on_ioa_help(self):
+        """IOA 地址说明对话框"""
+        from gui.about_dialog import IOAHelpDialog
+        IOAHelpDialog(self).exec_()
 
     def _check_license(self):
         """检查授权状态"""

@@ -4,7 +4,8 @@
 
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QLineEdit, QGroupBox, QFormLayout, QMessageBox, QApplication
+    QLineEdit, QGroupBox, QFormLayout, QMessageBox, QApplication,
+    QTableWidget, QTableWidgetItem, QHeaderView
 )
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont
@@ -22,7 +23,7 @@ class LicenseDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("软件激活")
-        self.setFixedSize(450, 320)
+        self.setFixedSize(450, 580)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         self._setup_ui()
         self._check_license()
@@ -60,7 +61,7 @@ class LicenseDialog(QDialog):
         self.code_input = QLineEdit()
         self.code_input.setPlaceholderText("XXXX-XXXX-XXXX-XXXX")
         self.code_input.setFont(QFont("Consolas", 11))
-        self.code_input.setMaxLength(19)
+        self.code_input.setMaxLength(35)
         input_layout.addWidget(self.code_input)
 
         self.btn_activate = QPushButton("激活")
@@ -69,6 +70,44 @@ class LicenseDialog(QDialog):
         input_layout.addWidget(self.btn_activate)
         input_group.setLayout(input_layout)
         layout.addWidget(input_group)
+
+        # 权限对比表格
+        perm_label = QLabel("功能权限对比：")
+        perm_label.setStyleSheet("font-weight: bold; margin-top: 4px;")
+        layout.addWidget(perm_label)
+
+        perm_table = QTableWidget()
+        perm_table.setColumnCount(3)
+        perm_table.setHorizontalHeaderLabels(["功能", "未激活", "已激活"])
+        perm_table.setRowCount(7)
+        perm_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        perm_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        perm_table.setSelectionBehavior(QTableWidget.SelectRows)
+        perm_table.setAlternatingRowColors(True)
+
+        perm_data = [
+            ("单条报文解析", "✅ 可用", "✅ 可用"),
+            ("文件导入", "❌ 不可用", "✅ 可用"),
+            ("导出 CSV/JSON/TXT", "❌ 不可用", "✅ 可用"),
+            ("帧生成器", "❌ 不可用", "✅ 可用"),
+            ("报文对比", "❌ 不可用", "✅ 可用"),
+            ("历史会话管理", "❌ 不可用", "✅ 可用"),
+            ("多标签页输入", "❌ 不可用", "✅ 可用"),
+        ]
+
+        for i, (func, before, after) in enumerate(perm_data):
+            perm_table.setItem(i, 0, QTableWidgetItem(func))
+            item_before = QTableWidgetItem(before)
+            item_after = QTableWidgetItem(after)
+            if "❌" in before:
+                item_before.setStyleSheet("color: #F44336;")
+            if "✅" in after:
+                item_after.setStyleSheet("color: #4CAF50;")
+            perm_table.setItem(i, 1, item_before)
+            perm_table.setItem(i, 2, item_after)
+
+        perm_table.setFixedHeight(180)
+        layout.addWidget(perm_table)
 
         # 提示
         hint = QLabel("请将硬件指纹发送给开发者获取激活码")
