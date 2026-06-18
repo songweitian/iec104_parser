@@ -376,10 +376,11 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(6, 6, 6, 6)
         main_layout.setSpacing(4)
 
-        splitter = QSplitter(Qt.Horizontal)
+        self.splitter = QSplitter(Qt.Horizontal)
 
         # === 左侧: 输入面板 ===
-        left_panel = QWidget()
+        self.left_panel = QWidget()
+        left_panel = self.left_panel
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
 
@@ -496,7 +497,7 @@ class MainWindow(QMainWindow):
         filter_layout.addStretch()
         left_layout.addWidget(filter_group)
 
-        splitter.addWidget(left_panel)
+        self.splitter.addWidget(left_panel)
 
         # === 右侧: 解析结果 ===
         right_panel = QWidget()
@@ -571,9 +572,9 @@ class MainWindow(QMainWindow):
             export_layout.addWidget(btn)
         right_layout.addLayout(export_layout)
 
-        splitter.addWidget(right_panel)
-        splitter.setSizes([500, 750])
-        main_layout.addWidget(splitter)
+        self.splitter.addWidget(right_panel)
+        self.splitter.setSizes([500, 750])
+        main_layout.addWidget(self.splitter)
 
     def _setup_menu(self):
         """设置菜单栏"""
@@ -590,6 +591,8 @@ class MainWindow(QMainWindow):
         view_menu = menubar.addMenu("查看(&V)")
         view_menu.addAction("解析报文(&P)", self._on_parse, "F5")
         view_menu.addAction("清空(&L)", self._on_clear, "Ctrl+L")
+        view_menu.addSeparator()
+        view_menu.addAction("折叠/展开输入面板(&B)", self._toggle_input_panel, "Ctrl+B")
         view_menu.addSeparator()
         view_menu.addAction("查找(&F)...", self._on_focus_search, "Ctrl+F")
         view_menu.addAction("统计图表(&T)...", self._on_show_stats, "Ctrl+T")
@@ -619,6 +622,11 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
         toolbar.addAction("CSV", self._on_export_csv)
         toolbar.addAction("JSON", self._on_export_json)
+        toolbar.addSeparator()
+        self._left_panel_visible = True
+        self._toggle_input_action = toolbar.addAction("◀ 隐藏输入")
+        self._toggle_input_action.triggered.connect(self._toggle_input_panel)
+        self._toggle_input_action.setToolTip("折叠/展开原始报文输入面板 (Ctrl+B)")
         toolbar.addSeparator()
         toolbar.addAction("关于", self._on_about)
 
@@ -1592,6 +1600,18 @@ class MainWindow(QMainWindow):
         """Ctrl+F 聚焦到地址过滤框"""
         self.filter_addr.setFocus()
         self.filter_addr.selectAll()
+
+    def _toggle_input_panel(self):
+        """折叠/展开原始报文输入面板"""
+        self._left_panel_visible = not self._left_panel_visible
+        if self._left_panel_visible:
+            self.left_panel.show()
+            self._toggle_input_action.setText("◀ 隐藏输入")
+            self.splitter.setSizes([500, 750])
+        else:
+            self.left_panel.hide()
+            self._toggle_input_action.setText("▶ 显示输入")
+        self._left_panel_visible_saved = self._left_panel_visible
 
     def _on_tree_select(self):
         """树节点选择时在十六进制视图中高亮对应字节范围"""
