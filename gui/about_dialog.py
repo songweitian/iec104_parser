@@ -46,7 +46,7 @@ class AboutDialog(QDialog):
         from PyQt5.QtWidgets import QFrame
         line = QFrame()
         line.setFrameShape(QFrame.HLine)
-        line.setStyleSheet("background-color: #ddd;")
+        line.setStyleSheet("")  # 使用系统默认颜色，适配深色主题
         layout.addWidget(line)
 
         info_layout = QVBoxLayout()

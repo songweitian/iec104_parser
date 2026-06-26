@@ -234,7 +234,7 @@ class SignalType(IntEnum):
     @classmethod
     def from_type_id(cls, type_id: int) -> "SignalType":
         """根据类型标识推断信号类型"""
-        if type_id in (1, 2, 3, 4, 20, 30, 31):
+        if type_id in (1, 2, 3, 4, 17, 18, 19, 20, 30, 31, 38, 39, 40):
             return cls.YX
         elif type_id in (5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 21,
                          32, 33, 34, 35, 36):
@@ -480,7 +480,7 @@ class IEC104Frame:
 # ============================================================================
 def parse_cp56time2a(data: bytes) -> datetime:
     """解析CP56Time2a格式时标 (7字节)
-    Byte 0-1: 毫秒 (0-59999)
+    Byte 0-1: 毫秒 (0-59999, 含秒: 值 = 秒*1000 + 毫秒)
     Byte 2: 分钟 (bit0-5)
     Byte 3: 小时 (bit0-4)
     Byte 4: 日 (bit0-4) + 星期 (bit5-7)
@@ -490,7 +490,10 @@ def parse_cp56time2a(data: bytes) -> datetime:
     if len(data) < 7:
         return datetime(2000, 1, 1)
 
-    ms = data[0] + ((data[1] & 0xFF) << 8)
+    ms_field = data[0] + ((data[1] & 0xFF) << 8)  # 0-59999 (秒*1000+毫秒)
+    second = ms_field // 1000       # 秒 (0-59)
+    millis = ms_field % 1000        # 毫秒 (0-999)
+    micros = millis * 1000          # 微秒 (0-999000)
     minute = data[2] & 0x3F
     hour = data[3] & 0x1F
     day = data[4] & 0x1F
@@ -501,36 +504,41 @@ def parse_cp56time2a(data: bytes) -> datetime:
     day = max(1, min(31, day))
     hour = min(23, hour)
     minute = min(59, minute)
+    second = min(59, second)
 
     try:
-        return datetime(year, month, day, hour, minute, 0, ms * 1000)
+        return datetime(year, month, day, hour, minute, second, micros)
     except ValueError:
         # 日期无效（如2月30日）时，回退到该月最后一天
         max_day = calendar.monthrange(year, month)[1]
         day = min(day, max_day)
         try:
-            return datetime(year, month, day, hour, minute, 0, ms * 1000)
+            return datetime(year, month, day, hour, minute, second, micros)
         except ValueError:
             return datetime(2000, 1, 1)
 
 
 def parse_cp24time2a(data: bytes, hour: int = 0) -> datetime:
     """解析CP24Time2a格式时标 (3字节) - 用于 type_id=2/4/6/8/10/12/14/16
-    Byte 0-1: 毫秒 (0-59999)
+    Byte 0-1: 毫秒 (0-59999, 含秒: 值 = 秒*1000 + 毫秒)
     Byte 2: 分钟 (bit0-5)
     注意: CP24Time2a 不含日期和小时信息，需要外部提供
     """
     if len(data) < 3:
         return datetime(2000, 1, 1)
 
-    ms = data[0] + ((data[1] & 0xFF) << 8)
+    ms_field = data[0] + ((data[1] & 0xFF) << 8)  # 0-59999
+    second = ms_field // 1000       # 秒 (0-59)
+    millis = ms_field % 1000        # 毫秒 (0-999)
+    micros = millis * 1000          # 微秒 (0-999000)
     minute = data[2] & 0x3F
 
     minute = min(59, minute)
+    second = min(59, second)
     hour = max(0, min(23, hour))
 
     try:
-        return datetime(2000, 1, 1, hour, minute, 0, ms * 1000)
+        return datetime(2000, 1, 1, hour, minute, second, micros)
     except ValueError:
         return datetime(2000, 1, 1)
 
@@ -653,6 +661,7 @@ class IEC104Parser:
         self.master_send_first: bool = IEC104Parser.DEFAULT_MASTER_FIRST
         self.last_master_send: bool = self.master_send_first
         self.mode: ParseMode = mode
+        self._last_known_hour: int = 0  # 最近已知的小时值，用于补充 CP24Time2a
 
     def set_mode(self, mode: ParseMode):
         """设置解析模式"""
@@ -713,6 +722,13 @@ class IEC104Parser:
             try:
                 frame.asdu = self._parse_asdu(raw_bytes[6:], apci)
                 self._build_description(frame)
+
+                # 从已解析的 CP56Time2a 时间戳更新小时值
+                if frame.asdu:
+                    for elem in frame.asdu.information_elements:
+                        if elem.timestamp and elem.timestamp.year > 2000:
+                            self._last_known_hour = elem.timestamp.hour
+                            break
             except Exception as e:
                 frame.error = f"ASDU解析异常: {e}"
                 logger.warning("ASDU解析异常: %s", e, exc_info=True)
@@ -743,6 +759,7 @@ class IEC104Parser:
         """批量解析多条报文"""
         frames = []
         self.last_master_send = self.master_send_first
+        self._last_known_hour = 0
 
         for hs in hex_strings:
             hs = hs.strip()
@@ -783,6 +800,13 @@ class IEC104Parser:
                 try:
                     frame.asdu = self._parse_asdu(raw_bytes[6:], frame.apci)
                     self._build_description(frame)
+
+                    # 从已解析的 CP56Time2a 时间戳更新小时值
+                    if frame.asdu:
+                        for elem in frame.asdu.information_elements:
+                            if elem.timestamp and elem.timestamp.year > 2000:
+                                self._last_known_hour = elem.timestamp.hour
+                                break
 
                     tid = frame.asdu.type_id
                     if tid in _CONTROL_TYPE_IDS:
@@ -1123,29 +1147,39 @@ class IEC104Parser:
 
         if (ctrl1 & 0x01) == 0:
             header.frame_type = "I-format"
-            header.send_seq = ((ctrl2 & 0x7F) << 8) | ctrl1
-            header.send_seq = header.send_seq >> 1
-            header.recv_seq = ((ctrl4 & 0x7F) << 8) | ctrl3
-            header.recv_seq = header.recv_seq >> 1
+            header.send_seq = (((ctrl2 & 0x7F) << 8) | (ctrl1 & 0xFE)) >> 1
+            header.recv_seq = (((ctrl4 & 0x7F) << 8) | (ctrl3 & 0xFE)) >> 1
         elif (ctrl1 & 0x03) == 0x01:
             header.frame_type = "S-format"
-            header.recv_seq = ((ctrl4 & 0x7F) << 8) | ctrl3
-            header.recv_seq = header.recv_seq >> 1
+            header.recv_seq = (((ctrl4 & 0x7F) << 8) | (ctrl3 & 0xFE)) >> 1
         elif (ctrl1 & 0x03) == 0x03:
             header.frame_type = "U-format"
 
         return header
 
+    def _update_hour_from_timestamp(self, timestamp: str):
+        """从原始时间戳字符串提取小时值，用于补充 CP24Time2a"""
+        if not timestamp:
+            return
+        try:
+            parts = timestamp.replace(',', '.').split(':')
+            if len(parts) >= 1:
+                hour = int(parts[0])
+                if 0 <= hour <= 23:
+                    self._last_known_hour = hour
+        except (ValueError, IndexError):
+            pass
+
     def _describe_u_frame(self, ctrl: bytes) -> str:
         """描述U帧功能"""
         func = ctrl[0]
         descs = {
-            0x07: "U帧: STARTDT 激活 (启动数据传输)",
-            0x13: "U帧: STARTDT 确认 (启动数据传输确认)",
-            0x23: "U帧: STOPDT 激活 (停止数据传输)",
-            0x33: "U帧: STOPDT 确认 (停止数据传输确认)",
-            0x43: "U帧: TESTFR 激活 (测试帧)",
-            0x73: "U帧: TESTFR 确认 (测试帧确认)",
+            0x04: "U帧: STARTDT 激活 (启动数据传输)",
+            0x08: "U帧: STARTDT 确认 (启动数据传输确认)",
+            0x10: "U帧: STOPDT 激活 (停止数据传输)",
+            0x20: "U帧: STOPDT 确认 (停止数据传输确认)",
+            0x40: "U帧: TESTFR 激活 (测试帧)",
+            0x80: "U帧: TESTFR 确认 (测试帧确认)",
         }
         for key, desc in descs.items():
             if func == key:
@@ -1235,7 +1269,7 @@ class IEC104Parser:
                     elem.value_desc = f"SPI={val_dec} | DEC={int(elem.value)} HEX=0x{data[0]:02X}"
                     consumed = 1
                     if len(data) >= 4:
-                        elem.timestamp = parse_cp24time2a(data[1:4])
+                        elem.timestamp = parse_cp24time2a(data[1:4], self._last_known_hour)
                         consumed = 4
                     else:
                         consumed = 1
@@ -1260,7 +1294,7 @@ class IEC104Parser:
                     elem.value_desc = f"DPI={dpi_map.get(dpi, '?')} | DEC={dpi} HEX=0x{data[0]:02X}"
                     consumed = 1
                     if len(data) >= 4:
-                        elem.timestamp = parse_cp24time2a(data[1:4])
+                        elem.timestamp = parse_cp24time2a(data[1:4], self._last_known_hour)
                         consumed = 4
                     else:
                         consumed = 1
@@ -1293,7 +1327,7 @@ class IEC104Parser:
                         elem.quality = QualityDescriptor(data[2])
                         consumed = 3
                         if len(data) >= 6:
-                            elem.timestamp = parse_cp24time2a(data[3:6])
+                            elem.timestamp = parse_cp24time2a(data[3:6], self._last_known_hour)
                             consumed = 6
 
             elif type_id == 11:  # M_ME_NB_1 测量值(标度化) (遥测)
@@ -1326,12 +1360,28 @@ class IEC104Parser:
                         elem.quality = QualityDescriptor(data[4])
                         consumed = 5
 
-            elif type_id == 20:  # M_PS_NA_1 成组单点信息 (遥信)
-                if len(data) >= 1:
+            elif type_id == 20:  # M_PS_NA_1 成组单点信息 (遥信): status(2) + CD(1) + QDS(1) = 4
+                if len(data) >= 4:
+                    status_word = data[0] + (data[1] << 8)
+                    change_detect = data[2]
+                    elem.quality = QualityDescriptor(data[3])
+                    elem.value = status_word
+                    # 逐位显示 16 个遥信状态
+                    bits = []
+                    for bit in range(16):
+                        state = (status_word >> bit) & 1
+                        changed = (change_detect >> bit) & 1
+                        marker = "*" if changed else ""
+                        bits.append(f"b{bit}={state}{marker}")
+                    elem.value_desc = (
+                        f"16位状态=0x{status_word:04X} | 变位=0x{change_detect:02X} | "
+                        f"QDS=0x{data[3]:02X} | {' '.join(bits)}"
+                    )
+                    consumed = 4
+                elif len(data) >= 1:
                     elem.siq = data[0]
-                    elem.quality = QualityDescriptor(data[0], is_siq_diq=True)
-                    elem.value = bool(data[0] & 0x01)
-                    elem.value_desc = f"SIQ=0x{data[0]:02X}"
+                    elem.value = data[0]
+                    elem.value_desc = f"状态=0x{data[0]:02X} (数据不足)"
                     consumed = 1
 
             elif type_id == 21:  # M_ME_ND_1 测量值(归一化,无品质) (遥测)
@@ -1365,19 +1415,21 @@ class IEC104Parser:
 
             elif type_id == 5:  # M_ST_NA_1 步位置信息 (遥测): step(1) + QDS(1) = 2
                 if len(data) >= 2:
-                    elem.value = data[0]
-                    elem.value_desc = f"步位置={data[0]} | DEC={data[0]} HEX=0x{data[0]:02X}"
+                    signed_val = self._to_signed(data[0], 8)
+                    elem.value = signed_val
+                    elem.value_desc = f"步位置={signed_val} | DEC={signed_val} HEX=0x{data[0]:02X}"
                     elem.quality = QualityDescriptor(data[1])
                     consumed = 2
 
             elif type_id == 6:  # M_ST_TA_1 带时标的步位置信息 (遥测): step(1) + QDS(1) + CP24Time2a(3) = 5
                 if len(data) >= 2:
-                    elem.value = data[0]
-                    elem.value_desc = f"步位置={data[0]} | DEC={data[0]} HEX=0x{data[0]:02X}"
+                    signed_val = self._to_signed(data[0], 8)
+                    elem.value = signed_val
+                    elem.value_desc = f"步位置={signed_val} | DEC={signed_val} HEX=0x{data[0]:02X}"
                     elem.quality = QualityDescriptor(data[1])
                     consumed = 2
                     if len(data) >= 5:
-                        elem.timestamp = parse_cp24time2a(data[2:5])
+                        elem.timestamp = parse_cp24time2a(data[2:5], self._last_known_hour)
                         consumed = 5
 
             elif type_id == 7:  # M_BO_NA_1 32比特串 (遥测): bitstring(4) + QDS(1) = 5
@@ -1394,7 +1446,7 @@ class IEC104Parser:
                     elem.quality = QualityDescriptor(data[4])
                     consumed = 5
                     if len(data) >= 8:
-                        elem.timestamp = parse_cp24time2a(data[5:8])
+                        elem.timestamp = parse_cp24time2a(data[5:8], self._last_known_hour)
                         consumed = 8
 
             elif type_id == 12:  # M_ME_TB_1 带时标的标度化值 (遥测): scaled(2) + QDS(1) + CP24Time2a(3) = 6
@@ -1405,7 +1457,7 @@ class IEC104Parser:
                     elem.quality = QualityDescriptor(data[2])
                     consumed = 3
                     if len(data) >= 6:
-                        elem.timestamp = parse_cp24time2a(data[3:6])
+                        elem.timestamp = parse_cp24time2a(data[3:6], self._last_known_hour)
                         consumed = 6
 
             elif type_id == 14:  # M_ME_TC_1 带时标的短浮点数 (遥测): float(4) + QDS(1) + CP24Time2a(3) = 8
@@ -1417,7 +1469,7 @@ class IEC104Parser:
                     elem.quality = QualityDescriptor(data[4])
                     consumed = 5
                     if len(data) >= 8:
-                        elem.timestamp = parse_cp24time2a(data[5:8])
+                        elem.timestamp = parse_cp24time2a(data[5:8], self._last_known_hour)
                         consumed = 8
 
             elif type_id == 16:  # M_IT_TA_1 带时标的累计量 (遥脉): counter(4) + QDS(1) + CP24Time2a(3) = 8
@@ -1427,7 +1479,7 @@ class IEC104Parser:
                     elem.quality = QualityDescriptor(data[4])
                     consumed = 5
                     if len(data) >= 8:
-                        elem.timestamp = parse_cp24time2a(data[5:8])
+                        elem.timestamp = parse_cp24time2a(data[5:8], self._last_known_hour)
                         consumed = 8
 
             elif type_id in (108, 109, 110):  # P_ME 参数命令
@@ -1443,7 +1495,7 @@ class IEC104Parser:
                     elem.value_desc = f"原始字节: {elem.raw_value.hex().upper()}"
                     consumed = min(remaining, 8)
         except Exception:
-            consumed = min(len(data), 4)
+            consumed = max(1, min(len(data), 4)) if len(data) > 0 else 0
             logger.warning("解析元素值异常 type_id=%d", type_id, exc_info=True)
 
         return consumed
@@ -1559,10 +1611,6 @@ class IEC104Parser:
                         elem.timestamp = parse_cp56time2a(data[17:24])
                         offset = 24
 
-            # CP56Time2a (7字节)
-            if len(data) >= offset + 7:
-                elem.timestamp = parse_cp56time2a(data[offset:offset + 7])
-                offset += 7
         except Exception:
             pass
         return offset
@@ -1681,8 +1729,9 @@ class IEC104Parser:
 
     def _parse_control_command_timestamp(self, type_id: int, data: bytes,
                                           elem: InfoElement) -> int:
-        """解析带时标的控制命令"""
-        consumed = self._parse_control_command(type_id, data, elem)
+        """解析带时标的控制命令 (type_id 58-64, 数据格式与45-51相同 + CP56Time2a)"""
+        base_type_id = type_id - 13  # 58→45, 59→46, ..., 64→51
+        consumed = self._parse_control_command(base_type_id, data, elem)
         if len(data) >= consumed + 7:
             elem.timestamp = parse_cp56time2a(data[consumed:consumed + 7])
             consumed += 7
@@ -1698,8 +1747,12 @@ class IEC104Parser:
         param_type = (qpm >> 6) & 0x03
         kpa = qpm & 0x3F
         param_type_map = {0: "不带", 1: "归一化", 2: "标度化", 3: "短浮点"}
+        kpa_map = {0: "未用", 1: "门限值", 2: "平滑系数(滤波时间)", 3: "传送下限", 4: "传送上限"}
         elem.value = qpm
-        elem.value_desc = f"QPM=0x{qpm:02X} | 参数类型={param_type_map.get(param_type, '?')} KPA={kpa}"
+        elem.value_desc = (
+            f"QPM=0x{qpm:02X} | 参数类型={param_type_map.get(param_type, '?')} "
+            f"KPA={kpa}({kpa_map.get(kpa, '保留')})"
+        )
         consumed = 1
 
         if type_id == 108 and len(data) >= 3:  # 归一化值
@@ -1756,6 +1809,17 @@ class IEC104Parser:
                 elem.value = elem.timestamp
                 elem.value_desc = f"时钟同步: {elem.timestamp}"
                 return 7
+        elif type_id == 107:  # C_TS_TA_1 带CP56Time2a的测试命令: 测试值(2) + CP56Time2a(7) = 9
+            if len(data) >= 9:
+                test_val = data[0] + (data[1] << 8)
+                elem.timestamp = parse_cp56time2a(data[2:9])
+                elem.value = test_val
+                elem.value_desc = f"测试值=0x{test_val:04X} | 时标={elem.timestamp}"
+                return 9
+            elif len(data) >= 1:
+                elem.value = data[0]
+                elem.value_desc = f"测试命令(数据不足) | DEC={data[0]} HEX=0x{data[0]:02X}"
+                return len(data)
         elif type_id in (101, 102, 104, 105, 106):
             elem.value = data[0] if len(data) >= 1 else 0
             elem.value_desc = f"命令参数=0x{elem.value:02X} | DEC={elem.value} HEX=0x{elem.value:02X}"
@@ -1804,9 +1868,18 @@ class IEC104Parser:
         elif self.mode == ParseMode.XN8000:
             return self._parse_xn8000_format(text)
         else:
-            # 普通模式 - 使用原有逻辑
-            from io import StringIO
-            hex_lines, _ = self._hex_to_lines_with_mapping_old(text)
+            # 普通模式
+            if is_log_format(text):
+                hex_lines, _ = parse_log_format_blocks(text)
+            else:
+                # 按行拆分
+                lines = text.strip().split('\n')
+                hex_lines = []
+                for line in lines:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    hex_lines.append(line)
             return self.parse_multiple(hex_lines)
 
     def _parse_xn3000_format(self, text: str) -> List[IEC104Frame]:
@@ -1820,6 +1893,7 @@ class IEC104Parser:
         import re
         self.frames = []
         self.last_master_send = self.master_send_first
+        self._last_known_hour = 0
 
         lines = text.split('\n')
         frames = []
@@ -1882,6 +1956,7 @@ class IEC104Parser:
         import re
         self.frames = []
         self.last_master_send = self.master_send_first
+        self._last_known_hour = 0
 
         lines = text.split('\n')
         frames = []
@@ -2004,6 +2079,9 @@ class IEC104Parser:
         frame.original_timestamp = timestamp
         frame.original_direction = direction
 
+        # 从原始时间戳提取小时，用于补充 CP24Time2a
+        self._update_hour_from_timestamp(timestamp)
+
         # 先按原始方向判断发送角色
         if direction.upper() in ('TX', 'SEND'):
             frame.send_role = "主站"
@@ -2044,6 +2122,13 @@ class IEC104Parser:
             try:
                 frame.asdu = self._parse_asdu(raw_bytes[6:], apci)
                 self._build_description(frame)
+
+                # 从已解析的 CP56Time2a 时间戳更新小时值
+                if frame.asdu:
+                    for elem in frame.asdu.information_elements:
+                        if elem.timestamp and elem.timestamp.year > 2000:
+                            self._last_known_hour = elem.timestamp.hour
+                            break
 
                 # 根据ASDU内容修正方向
                 tid = frame.asdu.type_id

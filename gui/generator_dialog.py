@@ -103,6 +103,11 @@ class GeneratorDialog(QDialog):
         self.copy_btn = QPushButton("复制到剪贴板")
         self.copy_btn.clicked.connect(self._on_copy)
         btn_layout.addWidget(self.copy_btn)
+
+        self.send_btn = QPushButton("发送到主窗口")
+        self.send_btn.setToolTip("将生成的报文发送到主窗口输入框")
+        self.send_btn.clicked.connect(self._on_send_to_main)
+        btn_layout.addWidget(self.send_btn)
         layout.addLayout(btn_layout)
 
         # 输出
@@ -155,5 +160,19 @@ class GeneratorDialog(QDialog):
         text = self.output.toPlainText()
         if text:
             QApplication.clipboard().setText(text)
-            if hasattr(self, 'statusBar') and self.statusBar():
-                self.statusBar().showMessage("已复制到剪贴板")
+            self.copy_btn.setText("✓ 已复制")
+            from PyQt5.QtCore import QTimer
+            QTimer.singleShot(1500, lambda: self.copy_btn.setText("复制到剪贴板"))
+
+    def _on_send_to_main(self):
+        """将生成的报文发送到主窗口输入框"""
+        text = self.output.toPlainText()
+        if not text:
+            return
+        parent = self.parent()
+        if parent and hasattr(parent, 'hex_input'):
+            parent.hex_input.setPlainText(text)
+            self.send_btn.setText("✓ 已发送")
+            from PyQt5.QtCore import QTimer
+            QTimer.singleShot(1500, lambda: self.send_btn.setText("发送到主窗口"))
+            self.accept()

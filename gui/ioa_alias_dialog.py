@@ -4,6 +4,7 @@ IOA 地址别名管理对话框
 """
 
 import os
+import sys
 import json
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -14,8 +15,15 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont
 
 
-ALIAS_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                          "ioa_aliases.json")
+def _get_app_dir() -> str:
+    """获取应用数据目录（兼容 --onefile 和开发模式）"""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    else:
+        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+ALIAS_FILE = os.path.join(_get_app_dir(), "ioa_aliases.json")
 
 # 缓存相关
 _cached_aliases: dict = {}
@@ -56,9 +64,19 @@ def save_aliases(aliases: dict):
     invalidate_alias_cache()
 
 
-def get_alias(ioa: int) -> str:
-    """获取单个IOA的别名，无别名返回空字符串"""
+def get_alias(ioa: int, common_address: int = 0) -> str:
+    """获取单个IOA的别名，无别名返回空字符串
+
+    优先按 CA+IOA 复合键查找，找不到再按 IOA 单独查找（兼容旧格式）。
+    """
     aliases = load_aliases()
+    # 优先查找复合键 "CA_IOA"
+    if common_address > 0:
+        composite_key = f"{common_address}_0x{ioa:06X}"
+        alias = aliases.get(composite_key, "")
+        if alias:
+            return alias
+    # 回退到仅 IOA 键
     return aliases.get(f"0x{ioa:06X}", "")
 
 
@@ -87,6 +105,13 @@ class IOAAliasDialog(QDialog):
         add_group = QGroupBox("添加/编辑别名")
         add_layout = QHBoxLayout(add_group)
 
+        add_layout.addWidget(QLabel("公共地址:"))
+        self.input_ca = QLineEdit()
+        self.input_ca.setPlaceholderText("留空=通用")
+        self.input_ca.setMaximumWidth(80)
+        self.input_ca.setToolTip("公共地址(ASDU地址)，留空表示通用（匹配所有公共地址）")
+        add_layout.addWidget(self.input_ca)
+
         add_layout.addWidget(QLabel("IOA地址:"))
         self.input_ioa = QLineEdit()
         self.input_ioa.setPlaceholderText("如: 0x000001 或 1")
@@ -107,7 +132,7 @@ class IOAAliasDialog(QDialog):
         # 别名表格
         self.table = QTableWidget()
         self.table.setColumnCount(3)
-        self.table.setHorizontalHeaderLabels(["IOA地址", "别名", "操作"])
+        self.table.setHorizontalHeaderLabels(["地址键 (CA_IOA 或 IOA)", "别名", "操作"])
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -153,6 +178,7 @@ class IOAAliasDialog(QDialog):
 
     def _on_add(self):
         """添加/更新别名"""
+        ca_text = self.input_ca.text().strip()
         ioa_text = self.input_ioa.text().strip()
         name = self.input_name.text().strip()
 
@@ -166,10 +192,21 @@ class IOAAliasDialog(QDialog):
                 ioa_val = int(ioa_text, 16)
             else:
                 ioa_val = int(ioa_text)
-            ioa_key = f"0x{ioa_val:06X}"
+            ioa_str = f"0x{ioa_val:06X}"
         except ValueError:
             QMessageBox.warning(self, "错误", "IOA地址格式不正确")
             return
+
+        # 构建键：有 CA 时用复合键，无 CA 时用纯 IOA 键
+        if ca_text:
+            try:
+                ca_val = int(ca_text)
+                ioa_key = f"{ca_val}_{ioa_str}"
+            except ValueError:
+                QMessageBox.warning(self, "错误", "公共地址格式不正确")
+                return
+        else:
+            ioa_key = ioa_str
 
         self.aliases[ioa_key] = name
         save_aliases(self.aliases)

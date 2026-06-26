@@ -14,6 +14,7 @@ def generate_i_frame(
     ioa: int,
     value,
     send_seq: int = 0,
+    recv_seq: int = 0,
     vsq: int = 1,
     origin_addr: int = 0,
 ) -> str:
@@ -64,10 +65,13 @@ def generate_i_frame(
     else:
         asdu.append(int(value) & 0xFF)
 
-    # APCI
-    apdu_len = len(asdu) + 4  # 4 control bytes
-    send_seq_bits = (send_seq << 1) & 0xFF
-    apci = bytes([0x68, apdu_len, send_seq_bits, 0x00, 0x00, 0x00])
+    # APCI - 控制域 4 字节
+    apdu_len = len(asdu) + 4
+    ctrl1 = ((send_seq & 0x7F) << 1) & 0xFF  # SN 低7位, bit0=0(I帧)
+    ctrl2 = (send_seq >> 7) & 0xFF            # SN 高8位
+    ctrl3 = ((recv_seq & 0x7F) << 1) & 0xFF  # RN 低7位
+    ctrl4 = (recv_seq >> 7) & 0xFF            # RN 高8位
+    apci = bytes([0x68, apdu_len, ctrl1, ctrl2, ctrl3, ctrl4])
 
     frame = apci + bytes(asdu)
     return ' '.join(f'{b:02X}' for b in frame)
@@ -75,20 +79,21 @@ def generate_i_frame(
 
 def generate_s_frame(recv_seq: int) -> str:
     """生成 S 格式帧"""
-    recv_seq_bits = (recv_seq << 1) & 0xFF
-    frame = bytes([0x68, 0x04, 0x01, 0x00, recv_seq_bits, 0x00])
+    ctrl3 = ((recv_seq & 0x7F) << 1) & 0xFF  # RN 低7位, bit0=1(S帧)
+    ctrl4 = (recv_seq >> 7) & 0xFF            # RN 高8位
+    frame = bytes([0x68, 0x04, 0x01, 0x00, ctrl3, ctrl4])
     return ' '.join(f'{b:02X}' for b in frame)
 
 
 def generate_u_frame(u_type: str = "STARTDT_ACT") -> str:
     """生成 U 格式帧"""
     u_types = {
-        "STARTDT_ACT": 0x07,
-        "STARTDT_CON": 0x0B,
-        "STOPDT_ACT": 0x13,
-        "STOPDT_CON": 0x23,
-        "TESTFR_ACT": 0x43,
-        "TESTFR_CON": 0x83,
+        "STARTDT_ACT": 0x04,
+        "STARTDT_CON": 0x08,
+        "STOPDT_ACT": 0x10,
+        "STOPDT_CON": 0x20,
+        "TESTFR_ACT": 0x40,
+        "TESTFR_CON": 0x80,
     }
     u_byte = u_types.get(u_type, 0x07)
     frame = bytes([0x68, 0x04, u_byte, 0x00, 0x00, 0x00])
@@ -96,14 +101,25 @@ def generate_u_frame(u_type: str = "STARTDT_ACT") -> str:
 
 
 def _generate_cp56time2a() -> bytes:
-    """生成当前时间的 CP56Time2a"""
+    """生成当前时间的 CP56Time2a (7字节)
+
+    Byte 0-1: 毫秒 (0-59999)
+    Byte 2:   分钟 (bit0-5)
+    Byte 3:   小时 (bit0-4)
+    Byte 4:   日 (bit0-4)
+    Byte 5:   月 (bit0-3)
+    Byte 6:   年 (bit0-6) + 夏时制 (bit7)
+    """
     from datetime import datetime
     now = datetime.now()
     ms = now.second * 1000 + now.microsecond // 1000
-    minute = now.minute | (now.hour << 6)
-    day = now.day | (now.month << 5)
-    year = now.year - 2000
-    return struct.pack('<H', ms) + bytes([minute, day, year, 0, 0, 0, 0])
+    return struct.pack('<H', ms) + bytes([
+        now.minute & 0x3F,          # Byte 2: 分钟
+        now.hour & 0x1F,            # Byte 3: 小时
+        now.day & 0x1F,             # Byte 4: 日
+        now.month & 0x0F,           # Byte 5: 月
+        (now.year - 2000) & 0x7F,   # Byte 6: 年
+    ])
 
 
 # TypeID 信息表

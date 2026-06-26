@@ -4,6 +4,7 @@
 """
 
 import os
+import sys
 import json
 import time
 from PyQt5.QtWidgets import (
@@ -15,7 +16,15 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont
 
 
-HISTORY_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sessions")
+def _get_app_dir() -> str:
+    """获取应用数据目录（兼容 --onefile 和开发模式）"""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    else:
+        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+HISTORY_DIR = os.path.join(_get_app_dir(), "sessions")
 
 
 class HistoryDialog(QDialog):
@@ -101,7 +110,9 @@ class HistoryDialog(QDialog):
 
         self.session_table.setRowCount(len(sessions))
         for i, s in enumerate(sessions):
-            self.session_table.setItem(i, 0, QTableWidgetItem(s['name']))
+            name_item = QTableWidgetItem(s['name'])
+            name_item.setData(Qt.UserRole, s['file'])
+            self.session_table.setItem(i, 0, name_item)
             self.session_table.setItem(i, 1, QTableWidgetItem(s['time']))
             self.session_table.setItem(i, 2, QTableWidgetItem(str(s['count'])))
             self.session_table.setItem(i, 3, QTableWidgetItem(s['size']))
@@ -155,19 +166,19 @@ class HistoryDialog(QDialog):
         if not name_item:
             return
 
-        # 查找对应文件
-        for f in os.listdir(HISTORY_DIR):
-            if f.endswith('.json'):
-                path = os.path.join(HISTORY_DIR, f)
-                try:
-                    with open(path, 'r', encoding='utf-8') as fh:
-                        data = json.load(fh)
-                    if data.get('name') == name_item.text():
-                        self.selected_session = data
-                        self.accept()
-                        return
-                except Exception:
-                    continue
+        # 从 UserRole 获取文件路径
+        filename = name_item.data(Qt.UserRole)
+        if not filename:
+            return
+
+        path = os.path.join(HISTORY_DIR, filename)
+        try:
+            with open(path, 'r', encoding='utf-8') as fh:
+                data = json.load(fh)
+            self.selected_session = data
+            self.accept()
+        except Exception as e:
+            QMessageBox.warning(self, "加载失败", f"无法加载会话: {e}")
 
     def _on_delete(self):
         """删除选中会话"""
@@ -179,21 +190,19 @@ class HistoryDialog(QDialog):
         if not name_item:
             return
 
+        filename = name_item.data(Qt.UserRole)
+        if not filename:
+            return
+
         reply = QMessageBox.question(self, "确认删除",
                                      f"确定要删除会话 '{name_item.text()}' 吗？",
                                      QMessageBox.Yes | QMessageBox.No)
         if reply != QMessageBox.Yes:
             return
 
-        for f in os.listdir(HISTORY_DIR):
-            if f.endswith('.json'):
-                path = os.path.join(HISTORY_DIR, f)
-                try:
-                    with open(path, 'r', encoding='utf-8') as fh:
-                        data = json.load(fh)
-                    if data.get('name') == name_item.text():
-                        os.remove(path)
-                        self._load_sessions()
-                        return
-                except Exception:
-                    continue
+        path = os.path.join(HISTORY_DIR, filename)
+        try:
+            os.remove(path)
+            self._load_sessions()
+        except Exception as e:
+            QMessageBox.warning(self, "删除失败", f"无法删除会话: {e}")

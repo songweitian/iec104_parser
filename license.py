@@ -4,6 +4,7 @@
 """
 
 import os
+import sys
 import hashlib
 import hmac
 import uuid
@@ -20,8 +21,19 @@ _key_parts = [
 ]
 _secret_key = b''.join(base64.b64decode(p) for p in _key_parts)
 
+
+def _get_app_dir() -> str:
+    """获取应用数据目录（兼容 --onefile 和开发模式）"""
+    if getattr(sys, 'frozen', False):
+        # PyInstaller 打包后，基于可执行文件路径
+        return os.path.dirname(sys.executable)
+    else:
+        # 开发模式，基于脚本路径
+        return os.path.dirname(os.path.abspath(__file__))
+
+
 # 授权文件路径
-LICENSE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "license.dat")
+LICENSE_FILE = os.path.join(_get_app_dir(), "license.dat")
 
 
 def get_hardware_fingerprint() -> str:
@@ -76,7 +88,7 @@ def save_license(fingerprint: str, code: str, holder: str = "") -> bool:
         return False
 
 
-def load_license() -> dict | None:
+def load_license():
     """加载授权文件"""
     try:
         if not os.path.exists(LICENSE_FILE):
@@ -109,7 +121,7 @@ def is_activated() -> bool:
     return load_license() is not None
 
 
-def activate(license_code: str, holder: str = "") -> tuple[bool, str]:
+def activate(license_code: str, holder: str = ""):
     """执行激活"""
     fingerprint = get_hardware_fingerprint()
     if verify_license_code(fingerprint, license_code):
