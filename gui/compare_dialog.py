@@ -69,7 +69,8 @@ class CompareDialog(QDialog):
         btn_compare = QPushButton("开始对比")
         btn_compare.clicked.connect(self._do_compare)
         btn_compare.setStyleSheet(
-            "QPushButton { background-color: #2196F3; color: white; font-weight: bold; padding: 6px 16px; }")
+            "QPushButton { background-color: #2196F3; color: white; font-weight: bold; "
+            "padding: 6px 16px; border-radius: 4px; border: none; }")
         btn_layout.addWidget(btn_compare)
         btn_layout.addStretch()
         self.lbl_stats = QLabel("")

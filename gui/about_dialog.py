@@ -2,8 +2,6 @@
 关于页面 - 版本信息和IOA地址说明
 """
 
-from datetime import datetime
-
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QWidget
@@ -12,7 +10,8 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont
 
 
-BUILD_DATE = datetime.now().strftime("%Y-%m-%d")
+# 发布日期（手动维护，与每次正式发版同步更新）
+BUILD_DATE = "2026-08-27"
 AUTHOR = "宋伟田"
 EMAIL = "3028905947@qq.com"
 VERSION = "1.1.0"

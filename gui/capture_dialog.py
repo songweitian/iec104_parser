@@ -65,7 +65,7 @@ class CaptureDialog(QDialog):
         self.start_btn.clicked.connect(self._on_start)
         self.start_btn.setStyleSheet(
             "QPushButton { background-color: #4CAF50; color: white; "
-            "font-weight: bold; padding: 6px 20px; border-radius: 4px; }")
+            "font-weight: bold; padding: 6px 20px; border-radius: 4px; border: none; }")
 
         close_btn = QPushButton("关闭")
         close_btn.clicked.connect(self.accept)

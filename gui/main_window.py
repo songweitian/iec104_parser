@@ -22,8 +22,10 @@ from PyQt5.QtWidgets import (
     QDialog, QListWidget, QListWidgetItem, QFrame, QPlainTextEdit,
     QDialogButtonBox, QFormLayout, QInputDialog
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QThread, QTimer
-from PyQt5.QtGui import QFont, QColor, QTextCursor, QIcon, QPalette, QPainter, QBrush, QPen, QPixmap
+from PyQt5.QtCore import Qt, pyqtSignal, QThread, QTimer, QSettings, QSize, QPoint
+from PyQt5.QtGui import (QFont, QColor, QTextCursor, QIcon, QPalette,
+                         QPainter, QBrush, QPen, QPixmap, QFontMetrics,
+                         QLinearGradient)
 
 # 确保能找到父模块
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -36,8 +38,116 @@ from iec104_parser import (
 from gui.about_dialog import AboutDialog
 from gui.stats_dialog import StatsDialog
 from gui.ioa_alias_dialog import IOAAliasDialog, get_alias
+from gui.style import LIGHT_QSS
 
 logger = logging.getLogger(__name__)
+
+# 文件导入大小上限：防止大文件把界面/内存卡死
+MAX_TEXT_IMPORT_BYTES = 20 * 1024 * 1024   # 文本类导入上限 20MB
+MAX_BIN_IMPORT_BYTES = 8 * 1024 * 1024     # 二进制转hex导入上限 8MB
+
+# UI 设置持久化（QSettings 注册表键前缀 ui/）
+_SETTINGS_ORG = "SWT"
+_SETTINGS_APP = "IEC104 Parser"
+
+# 过滤按钮样式：空闲蓝色 / 生效中橙色（让用户一眼看出过滤还在起作用）
+FILTER_BTN_STYLE_IDLE = (
+    "QPushButton { background-color: #2196F3; color: white; font-weight: bold; "
+    "padding: 3px 12px; border-radius: 3px; border: none; }"
+    "QPushButton:hover { background-color: #1976D2; }"
+)
+FILTER_BTN_STYLE_ACTIVE = (
+    "QPushButton { background-color: #FF9800; color: white; font-weight: bold; "
+    "padding: 3px 12px; border-radius: 3px; border: none; }"
+    "QPushButton:hover { background-color: #F57C00; }"
+)
+
+# 授权状态常驻按钮：状态色
+LICENSE_COLOR_OK = "#2E7D32"
+LICENSE_COLOR_WARN = "#FF9800"    # 剩余 ≤7 天 / 未激活
+LICENSE_COLOR_DANGER = "#F44336"  # 剩余 ≤3 天 / 已到期
+
+_ICON_PRIMARY = QColor("#1565C0")
+
+
+def create_app_icon() -> QIcon:
+    """应用图标：蓝渐变圆角底 + 白色内描边 + “104”字样。
+
+    模块级函数，供 main.py 设置 QApplication 全局图标。
+    """
+    pm = QPixmap(128, 128)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+
+    # 渐变圆角底
+    grad = QLinearGradient(0, 0, 0, 128)
+    grad.setColorAt(0.0, QColor("#1E88E5"))
+    grad.setColorAt(1.0, QColor("#0D47A1"))
+    p.setPen(Qt.NoPen)
+    p.setBrush(QBrush(grad))
+    p.drawRoundedRect(4, 4, 120, 120, 28, 28)
+
+    # 半透明白色内描边
+    p.setBrush(Qt.NoBrush)
+    p.setPen(QPen(QColor(255, 255, 255, 70), 3))
+    p.drawRoundedRect(11, 11, 106, 106, 23, 23)
+
+    # 顶部高光带
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(255, 255, 255, 18))
+    p.drawRoundedRect(8, 8, 112, 46, 22, 22)
+
+    # 主字样
+    p.setPen(QPen(Qt.white))
+    p.setFont(QFont("Arial", 46, QFont.Bold))
+    p.drawText(pm.rect().adjusted(0, 4, 0, 4), Qt.AlignCenter, "104")
+
+    p.end()
+    return QIcon(pm)
+
+
+def _doc_icon(tag: str, tag_color: str) -> QIcon:
+    """文档轮廓 + 彩色格式标签的小图标（CSV/JSON/TXT 工具栏用）"""
+    pm = QPixmap(64, 64)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+
+    p.setPen(QPen(_ICON_PRIMARY, 4, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+    p.setBrush(Qt.white)
+    p.drawRoundedRect(18, 8, 30, 48, 5, 5)
+    # 右上折角
+    p.drawLine(38, 8, 38, 18)
+    p.drawLine(38, 18, 48, 18)
+
+    # 格式标签文字
+    p.setFont(QFont("Arial", 13, QFont.Bold))
+    p.setPen(QPen(QColor(tag_color)))
+    p.drawText(pm.rect(), Qt.AlignCenter | Qt.AlignBottom, tag)
+
+    p.end()
+    return QIcon(pm)
+
+
+def _arrow_icon(rightward: bool) -> QIcon:
+    """水平方向箭头（通信模拟 ⇄ 用一支）"""
+    pm = QPixmap(64, 64)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    pen = QPen(_ICON_PRIMARY, 6, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+    p.setPen(pen)
+    if rightward:
+        p.drawLine(10, 24, 48, 24)
+        p.drawLine(40, 15, 50, 24)
+        p.drawLine(40, 33, 50, 24)
+    else:
+        p.drawLine(54, 40, 16, 40)
+        p.drawLine(24, 31, 14, 40)
+        p.drawLine(24, 49, 14, 40)
+    p.end()
+    return QIcon(pm)
 
 
 class SortableTableWidget(QTableWidget):
@@ -128,12 +238,17 @@ class ParseWorker(QThread):
     parse_finished = pyqtSignal(list)         # 解析完成的帧列表
     parse_error = pyqtSignal(str)             # 错误信息
 
-    def __init__(self, parser: IEC104Parser, raw_text: str, parse_mode: ParseMode):
+    def __init__(self, parser: IEC104Parser, raw_text: str, parse_mode: ParseMode,
+                 max_frames: int = 0):
         super().__init__()
         self.parser = parser
         self.raw_text = raw_text
         self.parse_mode = parse_mode
         self._is_cancelled = False
+        # 帧数上限：0 表示不限（未激活时传 1，每次仅解析第 1 条）
+        self.max_frames = max_frames
+        # 因达到帧数上限而提前停止（供主线程读取后提示用户）
+        self.hit_frame_limit = False
 
     def cancel(self):
         """请求取消解析"""
@@ -171,6 +286,12 @@ class ParseWorker(QThread):
                     frame = self._parse_single_frame(worker_parser, hex_line, len(frames) + 1)
                     frames.append(frame)
 
+                    # 未激活帧数上限：解析满即停
+                    if self.max_frames and len(frames) >= self.max_frames:
+                        self.hit_frame_limit = True
+                        self.parse_finished.emit(frames)
+                        return
+
                     # 每解析100帧更新一次进度
                     if (i + 1) % 100 == 0 or i + 1 == total:
                         self.progress_updated.emit(i + 1, total)
@@ -205,6 +326,12 @@ class ParseWorker(QThread):
                         )
                         frames.append(frame)
                         xn_line_map.append(list(src_lines))
+
+                        # 未激活帧数上限：解析满即停
+                        if self.max_frames and len(frames) >= self.max_frames:
+                            self.hit_frame_limit = True
+                            self.parse_finished.emit(frames)
+                            return
 
                     if (i + 1) % 100 == 0 or i + 1 == total:
                         self.progress_updated.emit(i + 1, total)
@@ -423,10 +550,21 @@ class MainWindow(QMainWindow):
         self._current_theme = "light"
         self._auto_detect = True
         self._is_activated = False
+        self._is_license_expired = False
 
         # 后台解析相关
         self._parse_worker: Optional[ParseWorker] = None
         self._is_parsing: bool = False
+        self._parse_cancelled: bool = False
+
+        # 过滤生效状态（防止用户忘记列表处于过滤中）
+        self._filter_active: bool = False
+        self._filter_counts: tuple = None  # (保留条数, 总条数)
+
+        # 导入/导出记忆的目录
+        self._last_dir: str = ""
+        # 用户保存过的列宽偏好（关闭时采集，下次启动直接套用）
+        self._saved_col_widths: Optional[list] = None
 
         self.setWindowTitle(self.APP_TITLE)
         self.resize(1320, 840)
@@ -436,11 +574,15 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
 
         self._setup_ui()
+        # 浅色基础样式表：统一各控件圆角/内边距/焦点环（深色主题切换时整体替换）
+        self.setStyleSheet(LIGHT_QSS)
         self._setup_menu()
         self._setup_toolbar()
         self._setup_statusbar()
 
         self._check_license()
+        # 授权已到期的提示放在窗口显示后触发（singleShot 在事件循环启动后执行）
+        QTimer.singleShot(0, self._may_prompt_expired)
         self._update_status_stats()
 
         self.hex_input.setPlainText(
@@ -448,6 +590,9 @@ class MainWindow(QMainWindow):
             "# 支持格式: 68 04 01 00 0E 00  或  680401000E00\n"
             "# 每行一条报文，以 # 开头的行为注释\n\n"
         )
+
+        # 恢复上次关闭时的界面状态（窗口大小/分栏/主题/列宽/目录）
+        self._load_ui_settings()
 
     def _setup_ui(self):
         """构建界面布局"""
@@ -475,12 +620,12 @@ class MainWindow(QMainWindow):
         self.input_tabs.currentChanged.connect(self._on_tab_changed)
         hex_layout.addWidget(self.input_tabs)
 
-        # 创建第一个输入标签页
+        # 创建第一个输入标签页（启动初始化，不走激活校验）
         self._input_tab_list = []  # [(tab_widget, hex_input), ...]
         self._tab_data = {}  # {tab_index: {"frames": [...], "input_lines": [...], "bookmarks": set()}}
         self._current_tab_index = 0
         self._bookmarks = set()  # Set of frame indices
-        self._add_input_tab()
+        self._add_input_tab(require_license=False)
 
         # 输入操作按钮
         btn_layout = QHBoxLayout()
@@ -488,7 +633,7 @@ class MainWindow(QMainWindow):
         self.btn_parse.clicked.connect(self._on_parse)
         self.btn_parse.setStyleSheet(
             "QPushButton { background-color: #2196F3; color: white; "
-            "font-weight: bold; padding: 6px 16px; border-radius: 4px; }"
+            "font-weight: bold; padding: 6px 16px; border-radius: 4px; border: none; }"
             "QPushButton:hover { background-color: #1976D2; }"
         )
         self.btn_clear = QPushButton("清空")
@@ -546,7 +691,7 @@ class MainWindow(QMainWindow):
 
         filter_grid.addWidget(QLabel("类型:"), row, 2)
         self.filter_type = QComboBox()
-        self.filter_type.setMinimumWidth(180)
+        self.filter_type.setMinimumWidth(120)
         self.filter_type.addItem("全部", -1)
         for tid in sorted(TypeID):
             desc = TypeID.get_description(tid.value)
@@ -555,7 +700,7 @@ class MainWindow(QMainWindow):
 
         filter_grid.addWidget(QLabel("COT:"), row, 6)
         self.filter_cot = QComboBox()
-        self.filter_cot.setMinimumWidth(140)
+        self.filter_cot.setMinimumWidth(100)
         self.filter_cot.addItem("全部", -1)
         for cot in range(1, 42):
             self.filter_cot.addItem(f"{cot}: {COT.get_description(cot)}", cot)
@@ -563,9 +708,9 @@ class MainWindow(QMainWindow):
 
         filter_grid.addWidget(QLabel("地址:"), row, 10)
         self.filter_addr = QLineEdit()
-        self.filter_addr.setPlaceholderText("CA")
-        self.filter_addr.setMaximumWidth(60)
-        self.filter_addr.setToolTip("公共地址(ASDU地址)")
+        self.filter_addr.setPlaceholderText("CA/0x1A")
+        self.filter_addr.setMaximumWidth(90)
+        self.filter_addr.setToolTip("公共地址(ASDU地址)，支持十进制或 0x 十六进制")
         filter_grid.addWidget(self.filter_addr, row, 11)
 
         # 第2行: 方向 | 时间范围 | IOA范围 | 筛选/重置
@@ -609,10 +754,8 @@ class MainWindow(QMainWindow):
 
         self.filter_btn = QPushButton("筛选")
         self.filter_btn.clicked.connect(self._on_filter)
-        self.filter_btn.setStyleSheet(
-            "QPushButton { background-color: #2196F3; color: white; font-weight: bold; padding: 3px 12px; border-radius: 3px; }"
-            "QPushButton:hover { background-color: #1976D2; }"
-        )
+        self.filter_btn.setStyleSheet(FILTER_BTN_STYLE_IDLE)
+        self.filter_btn.setToolTip("按条件过滤报文列表")
         filter_grid.addWidget(self.filter_btn, row, 10)
         self.filter_reset = QPushButton("重置")
         self.filter_reset.clicked.connect(self._on_filter_reset)
@@ -710,7 +853,7 @@ class MainWindow(QMainWindow):
         right_layout.addLayout(export_layout)
 
         self.splitter.addWidget(right_panel)
-        self.splitter.setSizes([400, 900])
+        self.splitter.setSizes([430, 870])
         self.splitter.setStretchFactor(0, 1)
         self.splitter.setStretchFactor(1, 2)
         self.splitter.setHandleWidth(6)
@@ -750,11 +893,12 @@ class MainWindow(QMainWindow):
 
         tools_menu = menubar.addMenu("工具(&T)")
         tools_menu.addAction("报文对比(&C)...", self._open_compare, "Ctrl+Shift+M")
+        tools_menu.addAction("通信模拟(&U)...", self._open_simulator, "Ctrl+M")
         tools_menu.addAction("帧生成器(&G)...", self._open_generator, "Ctrl+G")
         tools_menu.addAction("历史报文管理(&H)...", self._open_history_manager, "Ctrl+Shift+R")
         tools_menu.addSeparator()
         tools_menu.addAction("序号检查(&S)...", self._on_check_sequence, "Ctrl+Shift+S")
-        tools_menu.addAction("协议合规检查(&C)...", self._on_check_compliance)
+        tools_menu.addAction("协议合规检查(&R)...", self._on_check_compliance)
         tools_menu.addAction("报文配对分析(&P)...", self._on_find_pairs)
         tools_menu.addSeparator()
         tools_menu.addAction("IOA地址别名(&I)...", self._on_manage_aliases, "Ctrl+Shift+I")
@@ -769,44 +913,87 @@ class MainWindow(QMainWindow):
         """设置工具栏"""
         toolbar = QToolBar("主工具栏")
         toolbar.setMovable(False)
+        toolbar.setIconSize(QSize(18, 18))
+        toolbar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.addToolBar(toolbar)
 
-        act_parse = toolbar.addAction("解析", self._on_parse)
+        act_parse = toolbar.addAction(self._vector_icon("parse"), "解析", self._on_parse)
         act_parse.setToolTip("解析报文 (F5)")
-        act_import = toolbar.addAction("导入", self._on_import_file)
+        act_import = toolbar.addAction(self._vector_icon("import"), "导入", self._on_import_file)
         act_import.setToolTip("导入文件 (Ctrl+I)")
         toolbar.addSeparator()
-        act_gen = toolbar.addAction("生成报文", self._open_generator)
+        act_gen = toolbar.addAction(self._vector_icon("gen"), "生成报文", self._open_generator)
         act_gen.setToolTip("帧生成器 (Ctrl+G)")
+        act_sim = toolbar.addAction(self._vector_icon("sim"), "通信模拟", self._open_simulator)
+        act_sim.setToolTip("IEC104 通信模拟器 (Ctrl+M)")
         toolbar.addSeparator()
-        act_csv = toolbar.addAction("CSV", self._on_export_csv)
+        act_csv = toolbar.addAction(_doc_icon("CSV", "#43A047"), "CSV", self._on_export_csv)
         act_csv.setToolTip("导出CSV (Ctrl+Shift+C)")
-        act_json = toolbar.addAction("JSON", self._on_export_json)
+        act_json = toolbar.addAction(_doc_icon("JSON", "#FB8C00"), "JSON", self._on_export_json)
         act_json.setToolTip("导出JSON (Ctrl+Shift+J)")
         toolbar.addSeparator()
         self._left_panel_visible = True
-        self._toggle_input_action = toolbar.addAction("◀ 隐藏输入")
+        self._toggle_input_action = toolbar.addAction(self._vector_icon("hideinput"),
+                                                      "◀ 隐藏输入")
         self._toggle_input_action.triggered.connect(self._toggle_input_panel)
         self._toggle_input_action.setToolTip("折叠/展开原始报文输入面板 (Ctrl+B)")
         toolbar.addSeparator()
-        act_about = toolbar.addAction("关于", self._on_about)
+        act_about = toolbar.addAction(self._vector_icon("about"), "关于", self._on_about)
         act_about.setToolTip("关于本软件")
 
     def _setup_icon(self):
-        """创建应用程序图标"""
-        pixmap = QPixmap(64, 64)
-        pixmap.fill(Qt.transparent)
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.Antialiasing)
-        painter.setBrush(QColor("#1565C0"))
-        painter.setPen(Qt.NoPen)
-        painter.drawRoundedRect(4, 4, 56, 56, 10, 10)
-        painter.setPen(QPen(Qt.white, 2))
-        font = QFont("Arial", 18, QFont.Bold)
-        painter.setFont(font)
-        painter.drawText(pixmap.rect(), Qt.AlignCenter, "104")
-        painter.end()
-        self.setWindowIcon(QIcon(pixmap))
+        """设置应用图标（渐变精修版，同时注册为全局图标）"""
+        icon = create_app_icon()
+        self.setWindowIcon(icon)
+        QApplication.setWindowIcon(icon)
+
+    def _vector_icon(self, name: str) -> QIcon:
+        """按名称绘制工具栏矢量小图标（蓝 #1565C0 线条风格）"""
+        pm = QPixmap(64, 64)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        pen = QPen(_ICON_PRIMARY, 5, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        p.setPen(pen)
+
+        if name == "parse":          # ▶ 解析
+            p.setBrush(QBrush(_ICON_PRIMARY))
+            p.setPen(Qt.NoPen)
+            p.drawPolygon([QPoint(22, 16), QPoint(22, 48), QPoint(50, 32)])
+        elif name == "import":       # 文件夹 导入
+            p.setBrush(QColor("#90CAF9"))
+            p.drawRoundedRect(8, 24, 48, 28, 5, 5)
+            p.drawRoundedRect(8, 15, 22, 12, 3, 3)
+            p.setBrush(Qt.NoBrush)
+            p.setPen(pen)
+            p.drawRoundedRect(8, 24, 48, 28, 5, 5)
+        elif name == "gen":          # ✨ 生成（魔棒+火花）
+            p.drawLine(16, 50, 42, 24)
+            p.drawLine(46, 14, 46, 20)
+            p.drawLine(43, 17, 49, 17)
+            p.drawLine(54, 24, 54, 30)
+            p.drawLine(51, 27, 57, 27)
+        elif name == "sim":          # ⇄ 通信模拟
+            p.drawLine(10, 26, 46, 26)
+            p.drawLine(38, 18, 48, 26)
+            p.drawLine(38, 34, 48, 26)
+            p.drawLine(54, 40, 18, 40)
+            p.drawLine(26, 32, 16, 40)
+            p.drawLine(26, 48, 16, 40)
+        elif name == "hideinput":    # ◀ 折叠输入面板
+            p.drawRect(10, 14, 44, 36)
+            p.setBrush(QBrush(_ICON_PRIMARY))
+            p.drawRect(10, 14, 10, 36)
+            p.drawLine(38, 25, 29, 32)
+            p.drawLine(29, 32, 38, 39)
+        elif name == "about":        # ⓘ 关于
+            p.drawEllipse(11, 11, 42, 42)
+            p.drawPoint(32, 21)
+            p.drawLine(32, 21, 32, 22)
+            p.drawLine(32, 30, 32, 45)
+
+        p.end()
+        return QIcon(pm)
 
     def _setup_statusbar(self):
         """设置状态栏"""
@@ -815,6 +1002,14 @@ class MainWindow(QMainWindow):
 
         self.lbl_stats = QLabel("就绪")
         self.statusbar.addWidget(self.lbl_stats, 1)
+
+        # 授权状态常驻按钮（点击打开激活对话框；颜色随时效变化）
+        self.btn_license_state = QPushButton("")
+        self.btn_license_state.setFlat(True)
+        self.btn_license_state.setCursor(Qt.PointingHandCursor)
+        self.btn_license_state.clicked.connect(self._open_license_dialog)
+        self.btn_license_state.setToolTip("授权状态，点击查看详情 / 激活")
+        self.statusbar.addPermanentWidget(self.btn_license_state)
 
         # 进度条（解析时显示）
         self.progress_bar = QProgressBar()
@@ -829,7 +1024,7 @@ class MainWindow(QMainWindow):
         self.btn_cancel_parse = QPushButton("取消解析")
         self.btn_cancel_parse.setMaximumHeight(20)
         self.btn_cancel_parse.setStyleSheet(
-            "QPushButton { background-color: #f44336; color: white; padding: 2px 8px; border-radius: 3px; }"
+            "QPushButton { background-color: #f44336; color: white; padding: 2px 8px; border-radius: 3px; border: none; }"
             "QPushButton:hover { background-color: #d32f2f; }"
         )
         self.btn_cancel_parse.clicked.connect(self._on_cancel_parse)
@@ -860,8 +1055,12 @@ class MainWindow(QMainWindow):
         master_send = sum(1 for f in frames if f.direction == "主站→子站")
         slave_send = sum(1 for f in frames if f.direction == "子站→主站")
 
-        # 状态栏简要信息
-        summary = f"共 {total} 帧 | I:{i_frames} S:{s_frames} U:{u_frames}"
+        # 状态栏简要信息（过滤中时前置常驻提示，防止误以为数据缺失）
+        prefix = ""
+        if getattr(self, '_filter_active', False) and self._filter_counts:
+            kept, tot = self._filter_counts
+            prefix = f"🔍 过滤中 {kept}/{tot} | "
+        summary = f"{prefix}共 {total} 帧 | I:{i_frames} S:{s_frames} U:{u_frames}"
         if total - valid > 0:
             summary += f" | ❌ {total - valid} 错误"
         self.lbl_stats.setText(summary)
@@ -1011,12 +1210,18 @@ class MainWindow(QMainWindow):
     def _start_parse(self, raw_text: str):
         """启动解析流程"""
 
-        # 如果正在解析，先取消
-        if self._is_parsing:
-            if self._parse_worker and self._parse_worker.isRunning():
-                self._parse_worker.cancel()
-                self._parse_worker.wait(1000)
-            self._is_parsing = False
+        # 上一次解析未结束时：请求取消并等待其收尾，避免双线程并发写结果
+        if self._parse_worker and self._parse_worker.isRunning():
+            self._parse_worker.cancel()
+            try:
+                self._parse_worker.parse_finished.disconnect(self._on_parse_finished)
+                self._parse_worker.progress_updated.disconnect(self._on_parse_progress)
+                self._parse_worker.parse_error.disconnect(self._on_parse_error)
+            except TypeError:
+                pass  # 信号本就未连接
+            if not self._parse_worker.wait(2000):
+                self.statusbar.showMessage("上一次解析仍在结束中，请稍候再试", 3000)
+                return
 
         # 清除旧数据
         self.parser.clear()
@@ -1042,7 +1247,10 @@ class MainWindow(QMainWindow):
 
         # 启动后台解析
         self._is_parsing = True
-        self._parse_worker = ParseWorker(self.parser, raw_text, self.parse_mode)
+        # 未激活版本：每次仅解析第 1 条报文（激活后不限制）
+        max_frames = 0 if self._is_activated else 1
+        self._parse_worker = ParseWorker(self.parser, raw_text, self.parse_mode,
+                                         max_frames=max_frames)
 
         # 连接信号
         self._parse_worker.progress_updated.connect(self._on_parse_progress)
@@ -1088,6 +1296,7 @@ class MainWindow(QMainWindow):
             self.btn_parse.setText("⏳ 解析中...")
         else:
             self.btn_parse.setText("▶ 解析报文")
+            self.btn_cancel_parse.setEnabled(True)
 
     def _on_parse_progress(self, current: int, total: int):
         """更新解析进度"""
@@ -1122,10 +1331,33 @@ class MainWindow(QMainWindow):
         # 恢复按钮状态
         self._set_parsing_state(False)
 
-        # 统计信息
+        # 统计信息（用户取消时明确提示为部分结果；未激活截断时提示单条限制）
+        limit_hit = getattr(self._parse_worker, 'hit_frame_limit', False)
         error_count = sum(1 for f in self.all_frames if f.error)
-        self.statusbar.showMessage(
-            f"解析完成: {len(self.all_frames)} 条报文, {error_count} 条失败", 5000)
+        if self._parse_cancelled:
+            self._parse_cancelled = False
+            self.statusbar.showMessage(
+                f"已取消: 显示部分结果（{len(self.all_frames)} 条报文），重新解析可获取完整结果", 5000)
+        elif limit_hit:
+            self.statusbar.showMessage(
+                "未激活: 每次仅解析第 1 条报文，其余已被忽略", 5000)
+        else:
+            self.statusbar.showMessage(
+                f"解析完成: {len(self.all_frames)} 条报文, {error_count} 条失败", 5000)
+
+        # 未激活被截断 → 弹窗说明并提供激活入口
+        if limit_hit:
+            box = QMessageBox(self)
+            box.setWindowTitle("功能限制")
+            box.setIcon(QMessageBox.Information)
+            box.setText(
+                "未激活版本每次只能解析 1 条报文，本次输入中的其余报文已被忽略。\n\n"
+                "激活后可一次性解析全部报文，并解锁文件导入、导出等功能。")
+            box.addButton("打开激活窗口", QMessageBox.ActionRole)
+            box.addButton("知道了", QMessageBox.RejectRole)
+            box.exec_()
+            if box.buttonRole(box.clickedButton()) == QMessageBox.ActionRole:
+                self._open_license_dialog()
 
         # 自动切换到报文列表标签
         self.result_tabs.setCurrentIndex(1)
@@ -1169,11 +1401,12 @@ class MainWindow(QMainWindow):
     def _on_cancel_parse(self):
         """取消解析"""
         if self._parse_worker and self._parse_worker.isRunning():
+            self._parse_cancelled = True
             self._parse_worker.cancel()
+            self.btn_cancel_parse.setEnabled(False)
             self.statusbar.showMessage("正在取消解析...", 0)
-            # 等待线程结束
-            if not self._parse_worker.wait(2000):
-                self._parse_worker.terminate()
+            # 线程在检查点自行退出并回调 _on_parse_finished 呈现部分结果，
+            # 不使用 terminate()（强制杀线程可能导致 Qt 内部状态损坏）
 
     def _on_mode_changed(self, index: int):
         """解析模式变更"""
@@ -1236,39 +1469,41 @@ class MainWindow(QMainWindow):
         # 重新应用特殊按钮样式
         self.btn_parse.setStyleSheet(
             "QPushButton { background-color: #1976D2; color: white; "
-            "font-weight: bold; padding: 6px 16px; border-radius: 4px; }"
+            "font-weight: bold; padding: 6px 16px; border-radius: 4px; border: none; }"
             "QPushButton:hover { background-color: #1565C0; }"
         )
         self.btn_cancel_parse.setStyleSheet(
-            "QPushButton { background-color: #c62828; color: white; padding: 2px 8px; border-radius: 3px; }"
+            "QPushButton { background-color: #c62828; color: white; padding: 2px 8px; border-radius: 3px; border: none; }"
             "QPushButton:hover { background-color: #b71c1c; }"
         )
 
     def _apply_light_theme(self):
-        """应用浅色主题（恢复默认）"""
-        self.setStyleSheet("")
+        """应用浅色主题（恢复基础样式表）"""
+        self.setStyleSheet(LIGHT_QSS)
         # 重新应用特殊按钮样式
         self.btn_parse.setStyleSheet(
             "QPushButton { background-color: #2196F3; color: white; "
-            "font-weight: bold; padding: 6px 16px; border-radius: 4px; }"
+            "font-weight: bold; padding: 6px 16px; border-radius: 4px; border: none; }"
             "QPushButton:hover { background-color: #1976D2; }"
         )
         self.btn_cancel_parse.setStyleSheet(
-            "QPushButton { background-color: #f44336; color: white; padding: 2px 8px; border-radius: 3px; }"
+            "QPushButton { background-color: #f44336; color: white; padding: 2px 8px; border-radius: 3px; border: none; }"
             "QPushButton:hover { background-color: #d32f2f; }"
         )
 
     def _apply_theme_to_dialog(self, dialog):
-        """将当前主题应用到子对话框"""
-        if self._dark_theme:
-            dialog.setStyleSheet(self.styleSheet())
+        """将当前主题应用到子对话框（浅色为统一基础表，深色为完整暗色表）"""
+        dialog.setStyleSheet(self.styleSheet())
 
     # ==================================================================
     # 多标签页输入
     # ==================================================================
 
-    def _add_input_tab(self, title=None, content=None):
+    def _add_input_tab(self, title=None, content=None, require_license=True):
         """添加新的输入标签页"""
+        # 菜单/快捷键新建标签页属于受限功能；启动时的首个标签页绕过校验
+        if require_license and not self._require_license():
+            return None
         tab_widget = QWidget()
         tab_layout = QVBoxLayout(tab_widget)
         tab_layout.setContentsMargins(0, 0, 0, 0)
@@ -1382,17 +1617,20 @@ class MainWindow(QMainWindow):
         visible_rows = []
         for i in range(self.table_widget.rowCount()):
             if not self.table_widget.isRowHidden(i):
-                visible_rows.append(i)
+                visible_rows.append(self._frame_idx_at_row(i))
 
         if not visible_rows:
             QMessageBox.information(self, "提示", "没有可见的数据")
             return
 
         default_name = f"iec104_parsed_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        if self._last_dir:
+            default_name = os.path.join(self._last_dir, default_name)
         path, _ = QFileDialog.getSaveFileName(self, "导出CSV", default_name,
                                                 "CSV文件 (*.csv);;所有文件 (*)")
         if not path:
             return
+        self._last_dir = os.path.dirname(path) or self._last_dir
         try:
             with open(path, "w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.writer(f)
@@ -1446,17 +1684,20 @@ class MainWindow(QMainWindow):
         visible_rows = []
         for i in range(self.table_widget.rowCount()):
             if not self.table_widget.isRowHidden(i):
-                visible_rows.append(i)
+                visible_rows.append(self._frame_idx_at_row(i))
 
         if not visible_rows:
             QMessageBox.information(self, "提示", "没有可见的数据")
             return
 
         default_name = f"iec104_parsed_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        if self._last_dir:
+            default_name = os.path.join(self._last_dir, default_name)
         path, _ = QFileDialog.getSaveFileName(self, "导出JSON", default_name,
                                                 "JSON文件 (*.json);;所有文件 (*)")
         if not path:
             return
+        self._last_dir = os.path.dirname(path) or self._last_dir
         try:
             data = []
             for row_idx in visible_rows:
@@ -1530,17 +1771,20 @@ class MainWindow(QMainWindow):
         visible_rows = []
         for i in range(self.table_widget.rowCount()):
             if not self.table_widget.isRowHidden(i):
-                visible_rows.append(i)
+                visible_rows.append(self._frame_idx_at_row(i))
 
         if not visible_rows:
             QMessageBox.information(self, "提示", "没有可见的数据")
             return
 
         default_name = f"iec104_parsed_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        if self._last_dir:
+            default_name = os.path.join(self._last_dir, default_name)
         path, _ = QFileDialog.getSaveFileName(self, "导出TXT", default_name,
                                                 "文本文件 (*.txt);;所有文件 (*)")
         if not path:
             return
+        self._last_dir = os.path.dirname(path) or self._last_dir
         try:
             export_count = len(visible_rows)
             total_count = len(self.all_frames)
@@ -1662,9 +1906,10 @@ class MainWindow(QMainWindow):
             # 行背景色
             row_color = self._row_color_for_frame(frame)
 
-            # 序号
+            # 序号（UserRole 存储帧索引，排序后仍可正确还原行→数据映射）
             idx_item = QTableWidgetItem(str(frame.index))
             idx_item.setBackground(row_color)
+            idx_item.setData(Qt.UserRole, i)
             idx_item.setData(Qt.UserRole + 1, frame.index)
             self.table_widget.setItem(row, 0, idx_item)
 
@@ -1764,16 +2009,23 @@ class MainWindow(QMainWindow):
         # 恢复更新（排序由 SortableTableWidget 的表头点击处理）
         self.table_widget.setUpdatesEnabled(True)
 
-        # 调整列宽
-        self.table_widget.resizeColumnsToContents()
-        self.table_widget.setColumnWidth(0, 45)    # 序号
-        self.table_widget.setColumnWidth(1, 120)   # 原始时间
-        self.table_widget.setColumnWidth(2, 90)    # 方向
-        self.table_widget.setColumnWidth(3, 55)    # 信号类型
-        self.table_widget.setColumnWidth(8, 280)   # 值
-        self.table_widget.setColumnWidth(9, 250)   # 描述
-        self.table_widget.setColumnWidth(10, 55)   # 输入行
-        self.table_widget.setColumnWidth(11, 70)   # 间隔
+        # 恢复书签标记（书签以帧索引存储）
+        if self._bookmarks:
+            for r in range(total_frames):
+                item = self.table_widget.item(r, 0)
+                d = item.data(Qt.UserRole) if item else None
+                if isinstance(d, int) and d in self._bookmarks:
+                    self._update_bookmark_visual(r)
+
+        # 调整列宽：优先套用用户上次的列宽（同时避免大表全量自适应卡顿），
+        # 没有则按前 300 行采样估算
+        if self._saved_col_widths:
+            for c, wd in enumerate(self._saved_col_widths):
+                if c < self.table_widget.columnCount() and wd >= 20:
+                    self.table_widget.setColumnWidth(c, wd)
+        else:
+            for c, wd in enumerate(self._estimate_col_widths()):
+                self.table_widget.setColumnWidth(c, wd)
 
         # 自动选中第一条报文
         if self.all_frames and self.table_widget.rowCount() > 0:
@@ -2025,15 +2277,38 @@ class MainWindow(QMainWindow):
     # 事件处理
     # ==================================================================
 
+    def _frame_idx_at_row(self, row: int) -> int:
+        """视图行号 -> all_frames 索引（表头排序后行序会变，需经此转换）"""
+        item = self.table_widget.item(row, 0)
+        if item is not None:
+            data = item.data(Qt.UserRole)
+            if isinstance(data, int):
+                return data
+        return row
+
+    def _row_of_frame(self, frame_idx: int) -> int:
+        """all_frames 索引 -> 视图行号；找不到返回 -1"""
+        for r in range(self.table_widget.rowCount()):
+            item = self.table_widget.item(r, 0)
+            if item is not None and item.data(Qt.UserRole) == frame_idx:
+                return r
+        return -1
+
     def _on_table_click(self, row: int, col: int):
         """表格行单击 -> 更新解析详情（不切换标签页）"""
-        self._current_frame_idx = row
-        self._populate_tree(row)
+        fi = self._frame_idx_at_row(row)
+        if not (0 <= fi < len(self.all_frames)):
+            return
+        self._current_frame_idx = fi
+        self._populate_tree(fi)
 
     def _on_table_double_click(self, row: int, col: int):
         """表格行双击 -> 切换到解析详情标签页"""
-        self._current_frame_idx = row
-        self._populate_tree(row)
+        fi = self._frame_idx_at_row(row)
+        if not (0 <= fi < len(self.all_frames)):
+            return
+        self._current_frame_idx = fi
+        self._populate_tree(fi)
         self.result_tabs.setCurrentIndex(0)
 
     def _on_input_context_menu(self, pos):
@@ -2078,17 +2353,22 @@ class MainWindow(QMainWindow):
             return
         self._current_frame_idx = frame_index
         self._populate_tree(frame_index)
-        self.table_widget.selectRow(frame_index)
+        target_row = self._row_of_frame(frame_index)
+        if target_row >= 0:
+            self.table_widget.selectRow(target_row)
         self.result_tabs.setCurrentIndex(0)
 
     def _on_table_context_menu(self, pos):
         """表格右键菜单"""
         row = self.table_widget.rowAt(pos.y())
-        if row < 0 or row >= len(self.all_frames):
+        if row < 0:
+            return
+        fi = self._frame_idx_at_row(row)
+        if not (0 <= fi < len(self.all_frames)):
             return
 
         self.table_widget.selectRow(row)
-        frame = self.all_frames[row]
+        frame = self.all_frames[fi]
 
         menu = QMenu(self)
 
@@ -2126,8 +2406,8 @@ class MainWindow(QMainWindow):
 
         menu.addSeparator()
 
-        # 书签标记
-        is_bookmarked = row in self._bookmarks
+        # 书签标记（书签集合以帧索引存储）
+        is_bookmarked = fi in self._bookmarks
         act_bookmark = menu.addAction("取消书签" if is_bookmarked else "📌 添加书签")
         act_bookmark.triggered.connect(lambda: self._toggle_bookmark(row))
 
@@ -2185,8 +2465,9 @@ class MainWindow(QMainWindow):
             return
         ioas = []
         for row in rows:
-            if row < len(self.all_frames):
-                frame = self.all_frames[row]
+            fi = self._frame_idx_at_row(row)
+            if 0 <= fi < len(self.all_frames):
+                frame = self.all_frames[fi]
                 if frame.asdu:
                     for elem in frame.asdu.information_elements:
                         ioas.append(f"0x{elem.ioa:06X}")
@@ -2216,27 +2497,34 @@ class MainWindow(QMainWindow):
 
     def _show_detail(self, row: int):
         """显示指定行的解析详情"""
-        self._current_frame_idx = row
-        self._populate_tree(row)
+        fi = self._frame_idx_at_row(row)
+        if not (0 <= fi < len(self.all_frames)):
+            return
+        self._current_frame_idx = fi
+        self._populate_tree(fi)
         self.result_tabs.setCurrentIndex(0)
 
     def _show_hex_view(self, row: int):
         """显示指定行的十六进制视图"""
-        self._current_frame_idx = row
-        self._update_hex_view(row)
+        fi = self._frame_idx_at_row(row)
+        if not (0 <= fi < len(self.all_frames)):
+            return
+        self._current_frame_idx = fi
+        self._update_hex_view(fi)
         self.result_tabs.setCurrentIndex(2)
 
     def _locate_original_message(self, row: int):
         """定位原始报文 - 滚动到输入区对应位置并高亮"""
+        fi = self._frame_idx_at_row(row)
         line_map = getattr(self, '_frame_input_lines', [])
-        if row < 0 or row >= len(line_map) or not line_map[row]:
+        if fi < 0 or fi >= len(line_map) or not line_map[fi]:
             self.statusbar.showMessage("未找到对应的原始报文位置", 2000)
             return
 
-        self._highlight_input_line_for_frame(row)
+        self._highlight_input_line_for_frame(fi)
         self.hex_input.setFocus()
 
-        self.statusbar.showMessage(f"已定位到输入区第 {line_map[row][0] + 1} 行", 2000)
+        self.statusbar.showMessage(f"已定位到输入区第 {line_map[fi][0] + 1} 行", 2000)
 
     def _on_focus_search(self):
         """Ctrl+F 聚焦到报文搜索框"""
@@ -2247,7 +2535,7 @@ class MainWindow(QMainWindow):
         """折叠/展开原始报文输入面板"""
         self._left_panel_visible = not self._left_panel_visible
         if self._left_panel_visible:
-            self.splitter.setSizes([400, 900])
+            self.splitter.setSizes([430, 870])
             self._toggle_input_action.setText("◀ 隐藏输入")
         else:
             self.splitter.setSizes([0, self.splitter.width()])
@@ -2463,55 +2751,40 @@ class MainWindow(QMainWindow):
         urls = event.mimeData().urls()
         if not urls:
             return
+        # 与菜单“导入文件”保持一致的激活门控
+        if not self._require_license():
+            self._clear_drag_feedback()
+            event.ignore()
+            return
 
+        loaded_count = failed_count = 0
         all_content = []
-        loaded_count = 0
-
-        for url in urls:
-            file_path = url.toLocalFile()
-            if not file_path:
-                continue
-
-            if file_path.lower().endswith('.pcap'):
-                try:
-                    from pcap_importer import pcap_to_hex_text
-                    hex_text = pcap_to_hex_text(file_path)
-                    if hex_text:
-                        all_content.append(f"# === 文件: {os.path.basename(file_path)} ===")
-                        all_content.append(hex_text)
-                        loaded_count += 1
-                    else:
-                        all_content.append(f"# 未找到 IEC104 报文: {os.path.basename(file_path)}")
-                except Exception as e:
-                    all_content.append(f"# 导入失败: {os.path.basename(file_path)} - {e}")
-                continue
-
-            try:
-                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                    content = f.read()
-                all_content.append(f"# === 文件: {os.path.basename(file_path)} ===")
-                all_content.append(content)
-                loaded_count += 1
-            except Exception:
-                try:
-                    with open(file_path, "rb") as f:
-                        raw = f.read()
-                    hex_lines = []
-                    for i in range(0, len(raw), 16):
-                        chunk = raw[i:i + 16]
-                        hex_lines.append(chunk.hex(" ").upper())
-                    all_content.append(f"# === 文件: {os.path.basename(file_path)} ===")
-                    all_content.append("\n".join(hex_lines))
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            for url in urls:
+                file_path = url.toLocalFile()
+                if not file_path:
+                    continue
+                name = os.path.basename(file_path)
+                content, err = self._read_import_file(file_path)
+                if content is not None:
+                    all_content.append(content)
                     loaded_count += 1
-                except Exception as e:
-                    all_content.append(f"# 读取失败: {os.path.basename(file_path)} - {e}")
+                else:
+                    all_content.append(f"# 导入失败: {name} - {err}")
+                    failed_count += 1
+        finally:
+            QApplication.restoreOverrideCursor()
 
         if all_content:
             self._clear_drag_feedback()
             self.hex_input.setPlainText("\n".join(all_content))
-            self.statusbar.showMessage(f"已拖放导入 {loaded_count} 个文件", 3000)
-            # 已激活用户自动解析
-            if self._is_activated and loaded_count > 0:
+            msg = f"已拖放导入 {loaded_count} 个文件"
+            if failed_count:
+                msg += f"，{failed_count} 个失败"
+            self.statusbar.showMessage(msg, 3000)
+            # 走到这里说明已激活，自动解析
+            if loaded_count > 0:
                 self._on_parse()
 
     # ==================================================================
@@ -2519,15 +2792,31 @@ class MainWindow(QMainWindow):
     # ==================================================================
 
     def _on_input_changed(self):
-        """输入区内容变化时实时校验"""
+        """输入区内容变化时实时校验（忽略注释行与日志格式的时间/方向标记）"""
         text = self.hex_input.toPlainText()
         if not text.strip():
             self.lbl_input_status.setText("")
             return
 
-        # 统计有效十六进制字符（忽略空格、换行、点分隔符、0x前缀）
-        cleaned = text.replace(' ', '').replace('\n', '').replace('\r', '').replace('.', '')
-        cleaned = cleaned.replace('0x', '').replace('0X', '')
+        # 逐行收集数据行：跳过空行/# 注释/日志格式元数据行（如 "13:25:00.692 RX:"）
+        data_lines = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith('#'):
+                continue
+            if re.match(r'^[\d\- :.]*?(RX|TX|send|recv)\s*:\s*$',
+                        stripped, re.IGNORECASE):
+                continue
+            data_lines.append(stripped)
+
+        if not data_lines:
+            self.lbl_input_status.setText("")
+            return
+
+        raw = ''.join(data_lines)
+        # 统计有效十六进制字符（忽略空格、点分隔符、0x前缀）
+        cleaned = raw.replace(' ', '').replace('\t', '').replace('.', '')
+        cleaned = re.sub(r'0[xX]', '', cleaned)
         hex_chars = ''.join(c for c in cleaned if c in '0123456789ABCDEFabcdef')
         non_hex = len(cleaned) - len(hex_chars)
 
@@ -2623,11 +2912,12 @@ class MainWindow(QMainWindow):
         if not self._require_license():
             return
         paths, _ = QFileDialog.getOpenFileNames(
-            self, "导入报文文件", "",
+            self, "导入报文文件", self._last_dir,
             "报文文件 (*.txt *.log *.hex *.dat *.bin *.pcap);;所有文件 (*.*)"
         )
         if not paths:
             return
+        self._last_dir = os.path.dirname(paths[0]) or self._last_dir
 
         if len(paths) == 1:
             # 单文件：沿用原逻辑
@@ -2635,72 +2925,91 @@ class MainWindow(QMainWindow):
         else:
             # 多文件：合并内容
             all_content = []
-            for path in paths:
-                try:
-                    if path.lower().endswith('.pcap'):
-                        from pcap_importer import pcap_to_hex_text
-                        content = pcap_to_hex_text(path)
-                        if content:
-                            all_content.append(f"# === 文件: {os.path.basename(path)} ===")
-                            all_content.append(content)
-                        else:
-                            all_content.append(f"# 读取失败: {os.path.basename(path)} - 未找到 IEC104 报文")
-                        continue
-                    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                        content = f.read()
-                    all_content.append(f"# === 文件: {os.path.basename(path)} ===")
-                    all_content.append(content)
-                except Exception:
-                    try:
-                        with open(path, "rb") as f:
-                            raw = f.read()
-                        hex_lines = []
-                        for i in range(0, len(raw), 16):
-                            chunk = raw[i:i + 16]
-                            hex_lines.append(chunk.hex(" ").upper())
-                        all_content.append(f"# === 文件: {os.path.basename(path)} ===")
-                        all_content.append("\n".join(hex_lines))
-                    except Exception as e:
-                        all_content.append(f"# 读取失败: {os.path.basename(path)} - {e}")
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                for path in paths:
+                    content, err = self._read_import_file(path)
+                    if content is not None:
+                        all_content.append(content)
+                    else:
+                        all_content.append(
+                            f"# 读取失败: {os.path.basename(path)} - {err}")
+            finally:
+                QApplication.restoreOverrideCursor()
 
             self.hex_input.setPlainText("\n".join(all_content))
             self.statusbar.showMessage(f"已合并导入 {len(paths)} 个文件", 3000)
 
-    def _load_single_file(self, path: str):
-        """加载单个文件"""
+    def _read_import_file(self, path: str):
+        """读取导入文件（带大小上限，防止大文件卡死界面）
+
+        Returns:
+            (content, error): 成功返回 (文本内容(含文件头注释), None)；
+              文本读取失败时按二进制转hex行；失败返回 (None, 错误信息)。
+        """
+        try:
+            size = os.path.getsize(path)
+        except OSError as e:
+            return None, str(e)
+
+        # PCAP
         if path.lower().endswith('.pcap'):
+            if size > MAX_BIN_IMPORT_BYTES:
+                return None, (f"文件过大 "
+                              f"({size // (1024 * 1024)}MB > 上限 "
+                              f"{MAX_BIN_IMPORT_BYTES // (1024 * 1024)}MB)")
             try:
                 from pcap_importer import pcap_to_hex_text
-                hex_text = pcap_to_hex_text(path)
-                if hex_text:
-                    self.hex_input.setPlainText(hex_text)
-                    self.statusbar.showMessage(f"已导入 PCAP: {os.path.basename(path)}", 3000)
-                else:
-                    QMessageBox.warning(self, "导入失败", "PCAP 文件中未找到 IEC104 报文")
-            except ImportError:
-                QMessageBox.warning(self, "导入失败", "PCAP 导入模块未找到")
+                text = pcap_to_hex_text(path)
             except Exception as e:
-                QMessageBox.warning(self, "导入失败", f"导入 PCAP 失败: {e}")
+                return None, str(e)
+            if not text:
+                return None, "未找到 IEC104 报文"
+            return f"# === 文件: {os.path.basename(path)} ===\n{text}", None
+
+        # 文本（超限直接拒绝，不读入）
+        if size <= MAX_TEXT_IMPORT_BYTES:
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                header = f"# === 文件: {os.path.basename(path)} ===\n"
+                return header + content, None
+            except OSError:
+                pass  # 文本打开失败 → 尝试按二进制处理
+
+        # 二进制转 hex 行
+        limit = min(MAX_BIN_IMPORT_BYTES, MAX_TEXT_IMPORT_BYTES)
+        if size > limit:
+            return None, (f"文件过大 ({size // (1024 * 1024)}MB > 上限 "
+                          f"{limit // (1024 * 1024)}MB)")
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+        except OSError as e:
+            return None, str(e)
+        hex_lines = [raw[i:i + 16].hex(" ").upper() for i in range(0, len(raw), 16)]
+        header = f"# === 文件: {os.path.basename(path)} ===\n"
+        return header + "\n".join(hex_lines), None
+
+    def _load_single_file(self, path: str):
+        """加载单个文件"""
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            content, err = self._read_import_file(path)
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        if content is None:
+            if err == "未找到 IEC104 报文":
+                QMessageBox.warning(self, "导入失败", "PCAP 文件中未找到 IEC104 报文")
+            else:
+                QMessageBox.critical(self, "导入失败", f"无法读取文件:\n{err}")
             return
 
-        try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read()
-            self.hex_input.setPlainText(content)
-            self.statusbar.showMessage(f"已导入: {os.path.basename(path)}", 3000)
-        except Exception:
-            try:
-                with open(path, "rb") as f:
-                    raw = f.read()
-                hex_lines = []
-                for i in range(0, len(raw), 16):
-                    chunk = raw[i:i + 16]
-                    hex_lines.append(chunk.hex(" ").upper())
-                self.hex_input.setPlainText("\n".join(hex_lines))
-                self.statusbar.showMessage(
-                    f"已导入二进制文件: {os.path.basename(path)}", 3000)
-            except Exception as e2:
-                QMessageBox.critical(self, "导入失败", f"无法读取文件:\n{e2}")
+        self.hex_input.setPlainText(content)
+        suffix = " (PCAP)" if path.lower().endswith('.pcap') else ""
+        self.statusbar.showMessage(
+            f"已导入{suffix}: {os.path.basename(path)}", 3000)
 
     # ==================================================================
     # 统计图表
@@ -2822,60 +3131,83 @@ class MainWindow(QMainWindow):
         self._apply_theme_to_dialog(dialog)
         dialog.exec_()
 
+    def _open_simulator(self):
+        """打开通信模拟器（非模态，可同时操作主窗口）"""
+        if not self._require_license():
+            return
+        # 防止重复打开
+        if hasattr(self, '_simulator_dialog') and self._simulator_dialog and self._simulator_dialog.isVisible():
+            self._simulator_dialog.activateWindow()
+            return
+        from gui.simulator_dialog import SimulatorDialog
+        self._simulator_dialog = SimulatorDialog(self)
+        self._apply_theme_to_dialog(self._simulator_dialog)
+        self._simulator_dialog.setAttribute(Qt.WA_DeleteOnClose, False)
+        self._simulator_dialog.show()
+
     # ==================================================================
     # 书签功能
     # ==================================================================
 
     def _toggle_bookmark(self, row: int):
-        """切换书签状态"""
-        if row in self._bookmarks:
-            self._bookmarks.discard(row)
-            self.statusbar.showMessage(f"已取消报文 #{row+1} 的书签", 2000)
+        """切换书签状态（入参为视图行号，书签集合以帧索引存储）"""
+        fi = self._frame_idx_at_row(row)
+        frame = self.all_frames[fi] if 0 <= fi < len(self.all_frames) else None
+        display = str(frame.index) if frame else str(fi + 1)
+        if fi in self._bookmarks:
+            self._bookmarks.discard(fi)
+            self.statusbar.showMessage(f"已取消报文 #{display} 的书签", 2000)
         else:
-            self._bookmarks.add(row)
-            self.statusbar.showMessage(f"已添加报文 #{row+1} 的书签", 2000)
-        self._update_bookmark_visual(row)
+            self._bookmarks.add(fi)
+            self.statusbar.showMessage(f"已添加报文 #{display} 的书签", 2000)
+        target_row = self._row_of_frame(fi)
+        if target_row >= 0:
+            self._update_bookmark_visual(target_row)
 
     def _update_bookmark_visual(self, row: int):
-        """更新书签行的视觉效果"""
+        """更新书签行的视觉效果（row 为视图行号）"""
         item = self.table_widget.item(row, 0)
-        if item:
-            if row in self._bookmarks:
-                item.setText(f"📌 {row+1}")
-            else:
-                item.setText(str(row+1))
+        if not item:
+            return
+        idx_val = item.data(Qt.UserRole + 1)
+        base_text = str(idx_val) if isinstance(idx_val, int) else str(row + 1)
+        if self._frame_idx_at_row(row) in self._bookmarks:
+            item.setText(f"📌 {base_text}")
+        else:
+            item.setText(base_text)
+
+    def _select_bookmark_row(self, frame_idx: int):
+        """按帧索引选中对应表格行并刷新详情"""
+        row = self._row_of_frame(frame_idx)
+        if row >= 0:
+            self.table_widget.selectRow(row)
+            self._on_table_click(row, 0)
 
     def _goto_next_bookmark(self):
         """跳转到下一个书签"""
         if not self._bookmarks:
             self.statusbar.showMessage("没有书签，按 Space 添加", 2000)
             return
-        current = self.table_widget.currentRow()
-        sorted_bm = sorted(self._bookmarks)
-        for bm in sorted_bm:
-            if bm > current:
-                self.table_widget.selectRow(bm)
-                self._on_table_click(bm, 0)
+        current_fi = self._frame_idx_at_row(self.table_widget.currentRow())
+        for bm in sorted(self._bookmarks):
+            if bm > current_fi:
+                self._select_bookmark_row(bm)
                 return
         # Wrap around
-        self.table_widget.selectRow(sorted_bm[0])
-        self._on_table_click(sorted_bm[0], 0)
+        self._select_bookmark_row(sorted(self._bookmarks)[0])
 
     def _goto_prev_bookmark(self):
         """跳转到上一个书签"""
         if not self._bookmarks:
             self.statusbar.showMessage("没有书签，按 Space 添加", 2000)
             return
-        current = self.table_widget.currentRow()
-        sorted_bm = sorted(self._bookmarks, reverse=True)
-        for bm in sorted_bm:
-            if bm < current:
-                self.table_widget.selectRow(bm)
-                self._on_table_click(bm, 0)
+        current_fi = self._frame_idx_at_row(self.table_widget.currentRow())
+        for bm in sorted(self._bookmarks, reverse=True):
+            if bm < current_fi:
+                self._select_bookmark_row(bm)
                 return
         # Wrap around
-        self.table_widget.selectRow(sorted_bm[0])
-        self._on_table_click(sorted_bm[0], 0)
+        self._select_bookmark_row(sorted(self._bookmarks)[0])
 
     # ==================================================================
     # 快捷添加IOA别名
@@ -2918,12 +3250,83 @@ class MainWindow(QMainWindow):
             QTableWidget.keyPressEvent(self.table_widget, event)
 
     def closeEvent(self, event):
-        """关闭窗口时安全停止后台线程"""
+        """关闭窗口时安全停止后台线程并保存界面状态"""
         if self._parse_worker and self._parse_worker.isRunning():
             self._parse_worker.cancel()
-            if not self._parse_worker.wait(2000):
-                self._parse_worker.terminate()
+            # 等待线程自行退出（不用 terminate：强杀线程有崩溃风险）
+            self._parse_worker.wait(5000)
+        self._save_ui_settings()
         event.accept()
+
+    # ==================================================================
+    # 界面设置持久化（窗口大小/分栏/主题/列宽/最近目录）
+    # ==================================================================
+
+    def _load_ui_settings(self):
+        """启动时恢复上次关闭时的界面状态"""
+        try:
+            s = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+
+            geometry = s.value("ui/geometry")
+            if geometry is not None:
+                self.restoreGeometry(geometry)
+
+            splitter_state = s.value("ui/splitter")
+            if splitter_state is not None:
+                self.splitter.restoreState(splitter_state)
+
+            dark = s.value("ui/dark_theme", False, type=bool)
+            if dark and not self._dark_theme:
+                self._dark_theme = True
+                self._apply_dark_theme()
+
+            widths = s.value("ui/col_widths")
+            if isinstance(widths, (list, tuple)) and widths:
+                try:
+                    saved = [int(float(w)) for w in widths]
+                    if len(saved) == self.table_widget.columnCount():
+                        self._saved_col_widths = saved
+                except (TypeError, ValueError):
+                    self._saved_col_widths = None
+
+            last_dir = s.value("ui/last_dir", "")
+            if isinstance(last_dir, str):
+                self._last_dir = last_dir
+        except Exception as e:
+            logger.warning(f"恢复界面设置失败: {e}")
+
+    def _save_ui_settings(self):
+        """关闭时保存界面状态"""
+        try:
+            s = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+            s.setValue("ui/geometry", self.saveGeometry())
+            s.setValue("ui/splitter", self.splitter.saveState())
+            s.setValue("ui/dark_theme", self._dark_theme)
+            s.setValue("ui/last_dir", self._last_dir)
+            widths = [self.table_widget.columnWidth(c)
+                      for c in range(self.table_widget.columnCount())]
+            s.setValue("ui/col_widths", widths)
+        except Exception as e:
+            logger.warning(f"保存界面设置失败: {e}")
+
+    def _estimate_col_widths(self, sample_rows: int = 300) -> list:
+        """按前 N 行文本实际宽度估算各列列宽。
+
+        大报表（数千行）调用 resizeColumnsToContents 会逐单元格测量导致明显卡顿，
+        抽样估算在毫秒级完成，视觉效果接近。
+        """
+        fm = QFontMetrics(self.table_widget.font())
+        cols = self.table_widget.columnCount()
+        rows = min(self.table_widget.rowCount(), sample_rows)
+        max_w = [40] * cols
+        for r in range(rows):
+            for c in range(cols):
+                item = self.table_widget.item(r, c)
+                if item:
+                    w = fm.horizontalAdvance(item.text()) + 28
+                    if w > max_w[c]:
+                        max_w[c] = w
+        return [min(w, 420) for w in max_w]
 
     def _on_about(self):
         """版本信息对话框"""
@@ -2938,19 +3341,91 @@ class MainWindow(QMainWindow):
 
     def _check_license(self):
         """检查授权状态"""
-        from license import is_activated
-        self._is_activated = is_activated()
-        if not self._is_activated:
+        from license import get_license_status
+        status = get_license_status()
+        self._is_activated = status["activated"]
+        self._is_license_expired = status["expired"]
+        self._license_days_remaining = status.get("days_remaining")
+        self._license_expiry_date = status.get("expiry_date", "")
+        if status["expired"]:
+            self.setWindowTitle(f"{self.APP_TITLE} [授权已到期 - 功能已锁定]")
+        elif not self._is_activated:
             self.setWindowTitle(f"{self.APP_TITLE} [未激活 - 仅支持单条解析]")
+        else:
+            self.setWindowTitle(self.APP_TITLE)
+        self._update_license_label()
+
+    def _update_license_label(self):
+        """更新状态栏授权常驻按钮的文字与颜色"""
+        from license import get_license_status
+        st = get_license_status()
+        if st["activated"]:
+            if st.get("permanent"):
+                self.btn_license_state.setText("已激活")
+                color, weight = LICENSE_COLOR_OK, "normal"
+            else:
+                days = st.get("days_remaining")
+                exp = st.get("expiry_date", "")
+                text = f"剩{days}天" if days is not None else (exp or "限时授权")
+                if days is not None and days <= 3:
+                    color, weight = LICENSE_COLOR_DANGER, "bold"
+                elif days is not None and days <= 7:
+                    color, weight = LICENSE_COLOR_WARN, "bold"
+                else:
+                    color, weight = LICENSE_COLOR_OK, "normal"
+                self.btn_license_state.setText(text)
+        elif st["expired"]:
+            self.btn_license_state.setText("授权已到期")
+            color, weight = LICENSE_COLOR_DANGER, "bold"
+        else:
+            self.btn_license_state.setText("未激活")
+            color, weight = LICENSE_COLOR_WARN, "bold"
+        self.btn_license_state.setStyleSheet(
+            f"QPushButton {{ border: none; color: {color}; font-weight: {weight}; "
+            f"padding: 0 8px; background: transparent; }}"
+            f"QPushButton:hover {{ color: #1565C0; }}")
+
+    def _may_prompt_expired(self):
+        """启动时若授权已到期则锁定提示；限时授权临近到期则红色预警"""
+        from license import get_license_status
+        st = get_license_status()
+        if st["expired"]:
+            QMessageBox.warning(
+                self, "授权已到期",
+                "您的软件授权已到期，受限功能已被锁定。\n\n"
+                "请联系开发者获取新的激活码，在 帮助 → 软件激活 "
+                "中输入即可恢复全部功能。")
+            return
+        # 剩余 ≤3 天的红色预警（永久/未激活不弹）
+        if st["activated"] and not st.get("permanent"):
+            days = st.get("days_remaining")
+            if days is not None and days <= 3:
+                QMessageBox.warning(
+                    self, "授权即将到期",
+                    f"您的软件授权将于 {days} 天后到期（{st.get('expiry_date', '')}）。\n\n"
+                    "到期后受限功能将被锁定，请尽快联系开发者续期。\n"
+                    "在 帮助 → 软件激活 中输入新激活码即可完成续期。")
 
     def _require_license(self) -> bool:
-        """检查是否需要激活，未激活则提示并返回False"""
+        """检查是否需要激活，未激活/已过期则提示并返回False"""
         if self._is_activated:
             return True
-        QMessageBox.information(self, "功能限制",
-                                "此功能需要激活后使用。\n\n"
-                                "请在 帮助 → 软件激活 中输入激活码。\n"
-                                "将硬件指纹发送给开发者即可获取激活码。")
+        box = QMessageBox(self)
+        if self._is_license_expired:
+            box.setWindowTitle("授权已到期")
+            box.setIcon(QMessageBox.Warning)
+            box.setText("您的软件授权已到期，功能已被锁定。\n\n"
+                        "请联系开发者获取新的激活码，在 帮助 → 软件激活 中输入即可恢复。")
+        else:
+            box.setWindowTitle("功能限制")
+            box.setIcon(QMessageBox.Information)
+            box.setText("此功能需要激活后使用。\n\n"
+                        "将硬件指纹发送给开发者即可获取激活码。")
+        box.addButton("打开激活窗口", QMessageBox.ActionRole)
+        box.addButton("取消", QMessageBox.RejectRole)
+        box.exec_()
+        if box.buttonRole(box.clickedButton()) == QMessageBox.ActionRole:
+            self._open_license_dialog()
         return False
 
     def _open_license_dialog(self):
@@ -3005,27 +3480,37 @@ class MainWindow(QMainWindow):
                         if f.asdu and f.asdu.cot_cause == cot]
         if addr_text:
             try:
-                addr = int(addr_text)
+                addr = int(addr_text, 0)   # 支持十进制与 0x 前缀十六进制
+            except ValueError:
+                addr = None
+            if addr is None:
+                self.statusbar.showMessage(
+                    f"公共地址 '{addr_text}' 格式无效，已忽略该筛选条件", 4000)
+            else:
                 filtered = [f for f in filtered
                             if f.asdu and f.asdu.common_address == addr]
-            except ValueError:
-                pass
 
         # 方向过滤
         if direction:
             filtered = [f for f in filtered if f.direction == direction]
 
-        # 时间范围过滤
+        # 时间范围过滤（非法输入给出提示并忽略该条件，不抛异常）
         if time_from or time_to:
             def parse_filter_time(t):
                 parts = t.replace(',', '.').split(':')
                 if len(parts) == 3:
-                    h, m, s = int(parts[0]), int(parts[1]), float(parts[2])
+                    try:
+                        h, m, s = int(parts[0]), int(parts[1]), float(parts[2])
+                    except ValueError:
+                        return None
                     return h * 3600 + m * 60 + s
                 return None
 
             t_from = parse_filter_time(time_from) if time_from else None
             t_to = parse_filter_time(time_to) if time_to else None
+            if (time_from and t_from is None) or (time_to and t_to is None):
+                self.statusbar.showMessage(
+                    "时间格式无效，请使用 HH:MM:SS（如 13:25:00.500），该条件已忽略", 4000)
 
             def time_in_range(frame):
                 if not frame.original_timestamp:
@@ -3041,12 +3526,21 @@ class MainWindow(QMainWindow):
 
             filtered = [f for f in filtered if time_in_range(f)]
 
-        # IOA 范围过滤
+        # IOA 范围过滤（非法输入给出提示并忽略）
+        ioa_invalid = False
         try:
             ioa_from = int(self.ioa_from_input.text(), 0) if self.ioa_from_input.text() else None
+        except ValueError:
+            ioa_from = None
+            ioa_invalid = True
+        try:
             ioa_to = int(self.ioa_to_input.text(), 0) if self.ioa_to_input.text() else None
         except ValueError:
-            ioa_from = ioa_to = None
+            ioa_to = None
+            ioa_invalid = True
+        if ioa_invalid:
+            self.statusbar.showMessage(
+                "IOA 范围格式无效，已忽略该筛选条件（支持十进制或 0x 前缀）", 4000)
 
         if ioa_from is not None or ioa_to is not None:
             def ioa_in_range(elem):
@@ -3062,6 +3556,16 @@ class MainWindow(QMainWindow):
                         and any(ioa_in_range(e) for e in f.asdu.information_elements)]
 
         total_count = len(self.all_frames)
+
+        # 过滤生效状态可视化：先置标志再刷新统计，保证统计栏同步显示"过滤中"前缀
+        has_criteria = bool(
+            signal or direction or addr_text or time_from or time_to
+            or ioa_from is not None or ioa_to is not None
+            or (type_id != -1 and type_id is not None)
+            or (cot != -1 and cot is not None))
+        self._filter_active = has_criteria
+        self._filter_counts = (len(filtered), total_count) if has_criteria else None
+
         saved = self.all_frames
         try:
             self.all_frames = filtered
@@ -3069,6 +3573,12 @@ class MainWindow(QMainWindow):
             self._update_status_stats()
         finally:
             self.all_frames = saved
+
+        self.filter_btn.setStyleSheet(
+            FILTER_BTN_STYLE_ACTIVE if has_criteria else FILTER_BTN_STYLE_IDLE)
+        self.filter_btn.setToolTip(
+            "⚠ 过滤生效中（条件仍保留），点「重置」恢复全部"
+            if has_criteria else "按条件过滤报文列表")
         self.statusbar.showMessage(
             f"过滤结果: {len(filtered)}/{total_count} 条报文", 3000)
 
@@ -3083,6 +3593,10 @@ class MainWindow(QMainWindow):
         self.filter_time_to.clear()
         self.ioa_from_input.clear()
         self.ioa_to_input.clear()
+        self._filter_active = False
+        self._filter_counts = None
+        self.filter_btn.setStyleSheet(FILTER_BTN_STYLE_IDLE)
+        self.filter_btn.setToolTip("按条件过滤报文列表")
         self._populate_table()
         self._update_status_stats()
         self.statusbar.showMessage("过滤已重置", 2000)

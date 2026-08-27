@@ -9,15 +9,22 @@ import os
 # 确保可以导入项目模块
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from gui.main_window import MainWindow
+from gui.main_window import MainWindow, create_app_icon
 from PyQt5.QtWidgets import QApplication
+from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont
 
 
 def main():
     """应用程序入口"""
+    # 高分屏适配：跟随系统缩放（125%/150% 屏幕），必须在 QApplication 创建前设置
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    # 全局应用图标（对话框/任务栏统一使用）
+    app.setWindowIcon(create_app_icon())
 
     # 设置全局字体
     font = QFont("Microsoft YaHei", 9)

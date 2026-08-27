@@ -139,7 +139,11 @@ class GeneratorDialog(QDialog):
                 try:
                     value = float(value) if '.' in value else int(value)
                 except ValueError:
-                    value = 0
+                    # 非法输入明确提示并中止，而不是静默按 0 生成
+                    QMessageBox.warning(
+                        self, "输入无效",
+                        f"值 '{value}' 不是合法数字，请输入整数或小数（如 100 或 3.14）。")
+                    return
 
                 frame = generate_i_frame(type_id, cot, common_addr, ioa, value)
 
