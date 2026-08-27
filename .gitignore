@@ -15,5 +15,6 @@ sessions/
 
 # ===== 本机文件（不入库） =====
 .agents/
+.claude/
 *.doc
 ~$*
