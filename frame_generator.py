@@ -58,6 +58,22 @@ def generate_i_frame(
         asdu.append(int(value) & 0xFF)
     elif type_id == 46:  # 双点命令
         asdu.append(int(value) & 0xFF)
+    elif type_id in (48, 49, 50):  # 设点命令(归一化/标度化/短浮点)带时标
+        if type_id == 48:  # C_SE_NA_1 归一化
+            val = int(value)
+            asdu.append(val & 0xFF)
+            asdu.append((val >> 8) & 0xFF)
+            asdu.append(0)  # QOI
+        elif type_id == 49:  # C_SE_NB_1 标度化
+            val = int(value)
+            asdu.append(val & 0xFF)
+            asdu.append((val >> 8) & 0xFF)
+            asdu.append(0)  # QOI
+        elif type_id == 50:  # C_SE_TA_1 短浮点
+            float_bytes = struct.pack('<f', float(value))
+            asdu.extend(float_bytes)
+            asdu.append(0)  # QOI
+        asdu.extend(_generate_cp56time2a())
     elif type_id == 100:  # 总召唤
         asdu.append(int(value) & 0xFF)  # QOI
     elif type_id == 103:  # 时钟同步
@@ -88,12 +104,12 @@ def generate_s_frame(recv_seq: int) -> str:
 def generate_u_frame(u_type: str = "STARTDT_ACT") -> str:
     """生成 U 格式帧"""
     u_types = {
-        "STARTDT_ACT": 0x04,
-        "STARTDT_CON": 0x08,
-        "STOPDT_ACT": 0x10,
-        "STOPDT_CON": 0x20,
-        "TESTFR_ACT": 0x40,
-        "TESTFR_CON": 0x80,
+        "STARTDT_ACT": 0x07,
+        "STARTDT_CON": 0x0B,
+        "STOPDT_ACT": 0x13,
+        "STOPDT_CON": 0x23,
+        "TESTFR_ACT": 0x43,
+        "TESTFR_CON": 0x83,
     }
     u_byte = u_types.get(u_type, 0x07)
     frame = bytes([0x68, 0x04, u_byte, 0x00, 0x00, 0x00])
@@ -137,6 +153,9 @@ TYPE_INFO = {
     36: ("M_ME_TF_1", "短浮点(CP56Time2a)"),
     45: ("C_SC_NA_1", "单点命令"),
     46: ("C_DC_NA_1", "双点命令"),
+    48: ("C_SE_NA_1", "设点命令(归一化)"),
+    49: ("C_SE_NB_1", "设点命令(标度化)"),
+    50: ("C_SE_TA_1", "设点命令(短浮点,带时标)"),
     100: ("C_IC_NA_1", "总召唤命令"),
     103: ("C_CS_NA_1", "时钟同步命令"),
 }

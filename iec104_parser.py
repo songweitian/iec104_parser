@@ -718,7 +718,7 @@ class IEC104Parser:
         self.last_master_send = not self.last_master_send
 
         # 如果是I帧，解析ASDU
-        if apci.frame_type == "I-format":
+        if apci.frame_type == "I-format" and len(raw_bytes) > 6:
             try:
                 frame.asdu = self._parse_asdu(raw_bytes[6:], apci)
                 self._build_description(frame)
@@ -1174,12 +1174,12 @@ class IEC104Parser:
         """描述U帧功能"""
         func = ctrl[0]
         descs = {
-            0x04: "U帧: STARTDT 激活 (启动数据传输)",
-            0x08: "U帧: STARTDT 确认 (启动数据传输确认)",
-            0x10: "U帧: STOPDT 激活 (停止数据传输)",
-            0x20: "U帧: STOPDT 确认 (停止数据传输确认)",
-            0x40: "U帧: TESTFR 激活 (测试帧)",
-            0x80: "U帧: TESTFR 确认 (测试帧确认)",
+            0x07: "U帧: STARTDT 激活 (启动数据传输)",
+            0x0B: "U帧: STARTDT 确认 (启动数据传输确认)",
+            0x13: "U帧: STOPDT 激活 (停止数据传输)",
+            0x23: "U帧: STOPDT 确认 (停止数据传输确认)",
+            0x43: "U帧: TESTFR 激活 (测试帧)",
+            0x83: "U帧: TESTFR 确认 (测试帧确认)",
         }
         for key, desc in descs.items():
             if func == key:
