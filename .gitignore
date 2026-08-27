@@ -1,0 +1,19 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# ===== PyInstaller 构建产物（build.bat 每次重新生成） =====
+build/
+dist/
+*.spec
+
+# ===== 运行时生成的本地数据 =====
+config/
+sessions/
+*.log
+
+# ===== 本机文件（不入库） =====
+.agents/
+*.doc
+~$*
