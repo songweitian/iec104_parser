@@ -59,9 +59,10 @@ class LicenseDialog(QDialog):
         input_group = QGroupBox("输入激活码")
         input_layout = QHBoxLayout()
         self.code_input = QLineEdit()
-        self.code_input.setPlaceholderText("XXXX-XXXX-XXXX-XXXX")
+        self.code_input.setPlaceholderText("XXXX-XXXX-XXXX-XXXX 或 XXXX-XXXX-XXXX-XXXX-YYYY-MM-DD")
         self.code_input.setFont(QFont("Consolas", 11))
-        self.code_input.setMaxLength(35)
+        self.code_input.setMaxLength(60)
+        self.code_input.returnPressed.connect(self._on_activate)  # 回车直接激活
         input_layout.addWidget(self.code_input)
 
         self.btn_activate = QPushButton("激活")
@@ -71,49 +72,46 @@ class LicenseDialog(QDialog):
         input_group.setLayout(input_layout)
         layout.addWidget(input_group)
 
-        # 权限对比表格
-        perm_label = QLabel("功能权限对比：")
-        perm_label.setStyleSheet("font-weight: bold; margin-top: 4px;")
-        layout.addWidget(perm_label)
-
-        perm_table = QTableWidget()
-        perm_table.setColumnCount(3)
-        perm_table.setHorizontalHeaderLabels(["功能", "未激活", "已激活"])
-        perm_table.setRowCount(7)
-        perm_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        perm_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        perm_table.setSelectionBehavior(QTableWidget.SelectRows)
-        perm_table.setAlternatingRowColors(True)
+        # 权限对比表格（已激活后隐藏）
+        self.perm_label = QLabel("功能权限对比：")
+        self.perm_label.setStyleSheet("font-weight: bold; margin-top: 4px;")
+        layout.addWidget(self.perm_label)
 
         perm_data = [
-            ("单条报文解析", "✅ 可用", "✅ 可用"),
-            ("文件导入", "❌ 不可用", "✅ 可用"),
+            ("单条报文解析（每次1条）", "✅ 可用", "✅ 多条批量解析"),
+            ("文件导入（菜单+拖放）", "❌ 不可用", "✅ 可用"),
             ("导出 CSV/JSON/TXT", "❌ 不可用", "✅ 可用"),
-            ("帧生成器", "❌ 不可用", "✅ 可用"),
-            ("报文对比", "❌ 不可用", "✅ 可用"),
+            ("帧生成器 / 报文对比", "❌ 不可用", "✅ 可用"),
+            ("通信模拟器", "❌ 不可用", "✅ 可用"),
             ("历史会话管理", "❌ 不可用", "✅ 可用"),
             ("多标签页输入", "❌ 不可用", "✅ 可用"),
         ]
+        self.perm_table = QTableWidget(len(perm_data), 3)
+        self.perm_table.setHorizontalHeaderLabels(["功能", "未激活", "已激活"])
+        self.perm_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.perm_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.perm_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.perm_table.setAlternatingRowColors(True)
 
         for i, (func, before, after) in enumerate(perm_data):
-            perm_table.setItem(i, 0, QTableWidgetItem(func))
+            self.perm_table.setItem(i, 0, QTableWidgetItem(func))
             item_before = QTableWidgetItem(before)
             item_after = QTableWidgetItem(after)
             if "❌" in before:
                 item_before.setForeground(QColor("#F44336"))
             if "✅" in after:
                 item_after.setForeground(QColor("#4CAF50"))
-            perm_table.setItem(i, 1, item_before)
-            perm_table.setItem(i, 2, item_after)
+            self.perm_table.setItem(i, 1, item_before)
+            self.perm_table.setItem(i, 2, item_after)
 
-        perm_table.setFixedHeight(180)
-        layout.addWidget(perm_table)
+        self.perm_table.setFixedHeight(180)
+        layout.addWidget(self.perm_table)
 
         # 提示
-        hint = QLabel("请将硬件指纹发送给开发者获取激活码\n联系邮箱: 3028905947@qq.com")
-        hint.setStyleSheet("color: #666; font-size: 9pt;")
-        hint.setAlignment(Qt.AlignCenter)
-        layout.addWidget(hint)
+        self.hint = QLabel("请将硬件指纹发送给开发者获取激活码\n联系邮箱: 3028905947@qq.com")
+        self.hint.setStyleSheet("color: #666; font-size: 9pt;")
+        self.hint.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.hint)
 
         layout.addStretch()
 
@@ -126,16 +124,37 @@ class LicenseDialog(QDialog):
         layout.addLayout(btn_layout)
 
     def _check_license(self):
-        """检查当前激活状态"""
+        """检查当前激活状态（含限时授权与过期状态）"""
         info = get_license_info()
-        if info["activated"]:
-            self.lbl_status.setText("✅ 已激活")
+        if info.get("expired"):
+            self.lbl_status.setText("⚠ 授权已到期 - 功能已锁定，请重新输入激活码")
+            self.lbl_status.setStyleSheet("color: #F44336; font-size: 11pt; padding: 8px;")
+            self._set_perm_section_visible(True)
+            self.code_input.setEnabled(True)
+            self.btn_activate.setEnabled(True)
+        elif info["activated"]:
+            if info.get("permanent"):
+                text = "✅ 已激活（永久授权）"
+            else:
+                days = info.get("days_remaining")
+                text = f"✅ 已激活（有效期至 {info.get('expiry_date', '')}" \
+                       + (f"，剩余 {days} 天" if days is not None else "") + "）"
+            self.lbl_status.setText(text)
             self.lbl_status.setStyleSheet("color: #4CAF50; font-size: 11pt; padding: 8px;")
             self.code_input.setEnabled(False)
             self.btn_activate.setEnabled(False)
+            # 已激活无需再看权限对比，隐藏以精简界面
+            self._set_perm_section_visible(False)
         else:
-            self.lbl_status.setText("⚠ 未激活 - 仅支持单条报文解析")
+            self.lbl_status.setText("⚠ 未激活 - 每次仅解析1条，导入/导出等受限")
             self.lbl_status.setStyleSheet("color: #FF9800; font-size: 11pt; padding: 8px;")
+            self._set_perm_section_visible(True)
+
+    def _set_perm_section_visible(self, visible: bool):
+        """显示/隐藏权限对比区域；隐藏时同步收缩对话框高度"""
+        for w in (self.perm_label, self.perm_table, self.hint):
+            w.setVisible(visible)
+        self.setFixedSize(450, 580 if visible else 330)
 
     def _on_activate(self):
         """执行激活"""
