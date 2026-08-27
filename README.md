@@ -116,14 +116,21 @@ python main.py
 # 安装打包工具
 pip install pyinstaller
 
-# 运行构建脚本
+# 运行构建脚本（推荐，参数与下方手动命令一致）
 build.bat
 
 # 或手动打包
-python -m PyInstaller --onedir --windowed --name="IEC104_Parser" main.py
+python -m PyInstaller --onedir --windowed --name="IEC104_Parser" ^
+    --icon=assets/app.ico ^
+    --exclude-module gen_license ^
+    main.py
 
-# 可执行文件在 dist/IEC104_Parser/ 目录下
+# 可执行文件在 dist/IEC104_Parser/ 目录下，
+# license.dat 需与 IEC104_Parser.exe 同目录
 ```
+
+> ⚠ 打包注意：不要使用 `--add-data` 将源码目录打进发行包——
+> 那会把 `gen_license.py`（激活码签发工具，含签名密钥）等源码泄露给使用者。
 
 ## 使用说明
 

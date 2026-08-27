@@ -30,12 +30,13 @@ if errorlevel 1 (
 
 REM 构建
 echo [构建] 正在创建可执行文件...
+REM 注意：不要用 --add-data 打包源码目录（会把 gen_license.py 签码密钥等带进发行包）
 python -m PyInstaller ^
     --name="IEC104_Parser" ^
     --onedir ^
     --windowed ^
-    --icon=NONE ^
-    --add-data=".;." ^
+    --icon=assets\app.ico ^
+    --exclude-module gen_license ^
     --noconfirm ^
     --clean ^
     main.py

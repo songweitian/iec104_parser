@@ -70,38 +70,43 @@ LICENSE_COLOR_DANGER = "#F44336"  # 剩余 ≤3 天 / 已到期
 _ICON_PRIMARY = QColor("#1565C0")
 
 
-def create_app_icon() -> QIcon:
+def create_app_icon(size: int = 128) -> QIcon:
     """应用图标：蓝渐变圆角底 + 白色内描边 + “104”字样。
 
-    模块级函数，供 main.py 设置 QApplication 全局图标。
+    模块级函数，供 main.py 设置 QApplication 全局图标；
+    size 指定渲染边长，打包脚本传 256 生成多尺寸 ico。
     """
-    pm = QPixmap(128, 128)
+    s = size / 128.0
+    pm = QPixmap(size, size)
     pm.fill(Qt.transparent)
     p = QPainter(pm)
     p.setRenderHint(QPainter.Antialiasing)
 
     # 渐变圆角底
-    grad = QLinearGradient(0, 0, 0, 128)
+    grad = QLinearGradient(0, 0, 0, size)
     grad.setColorAt(0.0, QColor("#1E88E5"))
     grad.setColorAt(1.0, QColor("#0D47A1"))
     p.setPen(Qt.NoPen)
     p.setBrush(QBrush(grad))
-    p.drawRoundedRect(4, 4, 120, 120, 28, 28)
+    p.drawRoundedRect(round(4*s), round(4*s), round(120*s), round(120*s), round(28*s), round(28*s))
 
     # 半透明白色内描边
     p.setBrush(Qt.NoBrush)
-    p.setPen(QPen(QColor(255, 255, 255, 70), 3))
-    p.drawRoundedRect(11, 11, 106, 106, 23, 23)
+    p.setPen(QPen(QColor(255, 255, 255, 70), max(1.0, 3*s)))
+    p.drawRoundedRect(round(11*s), round(11*s), round(106*s), round(106*s), round(23*s), round(23*s))
 
     # 顶部高光带
     p.setPen(Qt.NoPen)
     p.setBrush(QColor(255, 255, 255, 18))
-    p.drawRoundedRect(8, 8, 112, 46, 22, 22)
+    p.drawRoundedRect(round(8*s), round(8*s), round(112*s), round(46*s), round(22*s), round(22*s))
 
-    # 主字样
+    # 主字样（像素字号，保证不同尺寸下占比一致）
     p.setPen(QPen(Qt.white))
-    p.setFont(QFont("Arial", 46, QFont.Bold))
-    p.drawText(pm.rect().adjusted(0, 4, 0, 4), Qt.AlignCenter, "104")
+    font = QFont("Arial")
+    font.setPixelSize(round(size * 0.36))
+    font.setBold(True)
+    p.setFont(font)
+    p.drawText(pm.rect().adjusted(0, round(4*s), 0, round(4*s)), Qt.AlignCenter, "104")
 
     p.end()
     return QIcon(pm)
@@ -2967,15 +2972,21 @@ class MainWindow(QMainWindow):
                 return None, "未找到 IEC104 报文"
             return f"# === 文件: {os.path.basename(path)} ===\n{text}", None
 
-        # 文本（超限直接拒绝，不读入）
+        # 文本（超限直接拒绝，不读入）；utf-8 失败回退 GBK（工控机日志常见编码）
         if size <= MAX_TEXT_IMPORT_BYTES:
-            try:
-                with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                    content = f.read()
+            content = None
+            for enc in ("utf-8", "gbk"):
+                try:
+                    with open(path, "r", encoding=enc) as f:
+                        content = f.read()
+                    break
+                except UnicodeDecodeError:
+                    continue  # 换下一种编码
+                except OSError:
+                    break      # 文本打开失败 → 尝试按二进制处理
+            if content is not None:
                 header = f"# === 文件: {os.path.basename(path)} ===\n"
                 return header + content, None
-            except OSError:
-                pass  # 文本打开失败 → 尝试按二进制处理
 
         # 二进制转 hex 行
         limit = min(MAX_BIN_IMPORT_BYTES, MAX_TEXT_IMPORT_BYTES)
