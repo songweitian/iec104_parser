@@ -232,6 +232,7 @@ class MainWindow(QMainWindow):
         )
         self.btn_clear = QPushButton("清空")
         self.btn_clear.clicked.connect(self._on_clear)
+        self.btn_clear.setToolTip("清空当前输入与解析结果 (Ctrl+L)")
         self.btn_import_file = QPushButton("📁 导入文件")
         self.btn_import_file.clicked.connect(self._on_import_file)
         self.btn_import_file.setStyleSheet(
@@ -239,6 +240,7 @@ class MainWindow(QMainWindow):
             "QPushButton:hover { background-color: #e3f2fd; border-color: #2196F3; }"
         )
 
+        btn_layout.setSpacing(6)
         btn_layout.addWidget(self.btn_parse)
         btn_layout.addWidget(self.btn_clear)
         btn_layout.addWidget(self.btn_import_file)
@@ -247,6 +249,7 @@ class MainWindow(QMainWindow):
         self.lbl_input_status.setStyleSheet("color: #888; font-size: 9pt;")
         btn_layout.addWidget(self.lbl_input_status)
         self.lbl_line_count = QLabel("0 行")
+        self.lbl_line_count.setStyleSheet("color: #666; font-size: 9pt; padding-right: 4px;")
         btn_layout.addWidget(self.lbl_line_count)
         hex_layout.addLayout(btn_layout)
         left_layout.addWidget(hex_group)
@@ -370,9 +373,12 @@ class MainWindow(QMainWindow):
         self.tree_widget = QTreeWidget()
         self.tree_widget.setHeaderLabels(["字段", "值", "说明"])
         self.tree_widget.setAlternatingRowColors(True)
-        self.tree_widget.setColumnWidth(0, 220)
-        self.tree_widget.setColumnWidth(1, 280)
+        self.tree_widget.setColumnWidth(0, 200)
+        self.tree_widget.setColumnWidth(1, 260)
         self.tree_widget.setColumnWidth(2, 300)
+        self.tree_widget.header().setStretchLastSection(True)
+        self.tree_widget.setRootIsDecorated(True)
+        self.tree_widget.setUniformRowHeights(True)
         self.tree_widget.itemSelectionChanged.connect(self._on_tree_select)
         # 空状态提示
         placeholder = QTreeWidgetItem(self.tree_widget)
@@ -388,16 +394,17 @@ class MainWindow(QMainWindow):
         table_layout.setSpacing(2)
 
         search_layout = QHBoxLayout()
+        search_layout.setSpacing(4)
         search_layout.addWidget(QLabel("🔍 搜索:"))
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("输入关键字或正则搜索...")
+        self.search_input.setClearButtonEnabled(True)
         self._search_timer = QTimer()
         self._search_timer.setSingleShot(True)
         self._search_timer.setInterval(300)
         self._search_timer.timeout.connect(self._do_search)
         self.search_input.textChanged.connect(self._on_search_text_changed)
-        self.search_input.setClearButtonEnabled(True)
-        search_layout.addWidget(self.search_input)
+        search_layout.addWidget(self.search_input, 1)
         self.lbl_search_count = QLabel("")
         self.lbl_search_count.setStyleSheet("color: #888; font-size: 9pt;")
         search_layout.addWidget(self.lbl_search_count)
@@ -412,6 +419,7 @@ class MainWindow(QMainWindow):
         self.table_widget.setSelectionBehavior(QTableWidget.SelectRows)
         self.table_widget.horizontalHeader().setStretchLastSection(True)
         self.table_widget.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table_widget.verticalHeader().setDefaultSectionSize(26)
         # 虚拟绘制：不创建单元格对象，由 FrameCellDelegate 实时绘制（万帧级性能）
         self._cell_delegate = FrameCellDelegate(self)
         self.table_widget.setItemDelegate(self._cell_delegate)
@@ -454,11 +462,11 @@ class MainWindow(QMainWindow):
         right_layout.addLayout(export_layout)
 
         self.splitter.addWidget(right_panel)
-        self.splitter.setSizes([430, 870])
+        self.splitter.setSizes([420, 900])
         self.splitter.setStretchFactor(0, 1)
         self.splitter.setStretchFactor(1, 2)
-        self.splitter.setHandleWidth(6)
-        self.left_panel.setMinimumWidth(250)
+        self.splitter.setHandleWidth(8)
+        self.left_panel.setMinimumWidth(280)
         main_layout.addWidget(self.splitter)
 
     def _setup_menu(self):
