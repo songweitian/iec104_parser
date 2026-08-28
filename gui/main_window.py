@@ -1682,33 +1682,67 @@ class MainWindow(QMainWindow):
         )
 
     def _format_hex_html(self, raw: str, hl_start: int = -1, hl_end: int = -1) -> str:
-        """格式化十六进制为HTML，支持高亮指定字节范围"""
+        """格式化十六进制为HTML，支持高亮指定字节范围，并附 ASCII 对照列。
+
+        布局：每行 16 字节，每 8 字节多一个分隔，行尾显示 ASCII 可打印字符对照。
+        """
         cleaned = raw.replace(" ", "").replace("\n", "")
         cleaned = ''.join(c for c in cleaned if c in '0123456789ABCDEFabcdef')
         if len(cleaned) % 2 != 0:
             return raw
 
-        parts = []
-        for i in range(0, len(cleaned), 2):
-            if i > 0:
-                if i % 32 == 0:
-                    parts.append("<br>")
-                elif i % 16 == 0:
-                    parts.append("&nbsp;&nbsp;")  # 每 8 字节额外分隔
+        dim_color = "#777" if self._dark_theme else "#999"   # ASCII 对照列文字
+        ascii_dim = "#4a4a4a" if self._dark_theme else "#ddd"  # 不可打印字符占位
+        rows = []
+        row_bytes = []
+        row_texts = []
+
+        def flush_row():
+            # 行内 hex 拼接（每 8 字节一个分隔）
+            inner = []
+            for j, b in enumerate(row_bytes):
+                if j > 0 and j % 8 == 0:
+                    inner.append("&nbsp;&nbsp;")
                 else:
-                    parts.append(" ")
+                    inner.append(" ")
+                inner.append(b)
+            hex_part = "".join(inner).strip()
+            ascii_part = "".join(row_texts)
+            rows.append(
+                f'<span style="color:{dim_color}">|</span>{hex_part}'
+                f'<span style="color:{dim_color}">&nbsp;&nbsp;| {ascii_part} |</span>'
+            )
+            row_bytes.clear()
+            row_texts.clear()
+
+        for i in range(0, len(cleaned), 2):
             byte_idx = i // 2
             hex_byte = cleaned[i:i+2].upper()
+            # ASCII 对照：可打印显示原字符，否则显示 '.'
+            val = int(hex_byte, 16)
+            ch = chr(val)
+            if 0x20 <= val <= 0x7E:
+                ascii_ch = ch.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                ascii_txt = f'<span style="color:{dim_color}">{ascii_ch}</span>'
+            else:
+                ascii_txt = f'<span style="color:{ascii_dim}">.</span>'
+
             if hl_start <= byte_idx < hl_end:
                 hl_bg = "#5C4B00" if self._dark_theme else "#FFEB3B"
                 hl_fg = "#FFD54F" if self._dark_theme else "#000"
-                parts.append(
+                row_bytes.append(
                     f'<span style="background-color:{hl_bg};color:{hl_fg};'
                     f'padding:1px 2px;border-radius:2px">{hex_byte}</span>'
                 )
             else:
-                parts.append(hex_byte)
-        return "".join(parts)
+                row_bytes.append(hex_byte)
+            row_texts.append(ascii_txt)
+
+            if len(row_bytes) == 16:
+                flush_row()
+        if row_bytes:
+            flush_row()
+        return "<br>".join(rows)
 
     def _format_hex(self, raw: str) -> str:
         """格式化十六进制字符串，每16字节换行"""

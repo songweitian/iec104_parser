@@ -25,6 +25,7 @@ class LicenseDialog(QDialog):
         self.setWindowTitle("软件激活")
         self.setFixedSize(450, 580)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        self._dark_theme = False
         self._setup_ui()
         self._check_license()
 
@@ -109,7 +110,7 @@ class LicenseDialog(QDialog):
 
         # 提示
         self.hint = QLabel("请将硬件指纹发送给开发者获取激活码\n联系邮箱: 3028905947@qq.com")
-        self.hint.setStyleSheet("color: #666; font-size: 9pt;")
+        self.hint.setStyleSheet("color: #888; font-size: 9pt;")
         self.hint.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.hint)
 
@@ -122,6 +123,12 @@ class LicenseDialog(QDialog):
         close_btn.clicked.connect(self.accept)
         btn_layout.addWidget(close_btn)
         layout.addLayout(btn_layout)
+
+    def _on_theme_applied(self):
+        """主题切换后刷新提示文字颜色"""
+        color = "#aaa" if self._dark_theme else "#888"
+        if hasattr(self, "hint"):
+            self.hint.setStyleSheet(f"color: {color}; font-size: 9pt;")
 
     def _check_license(self):
         """检查当前激活状态（含限时授权与过期状态）"""

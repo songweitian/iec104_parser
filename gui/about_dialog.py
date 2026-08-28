@@ -23,8 +23,12 @@ class AboutDialog(QDialog):
         self.version = version
 
         self.setWindowTitle("关于")
-        self.setFixedSize(420, 340)
+        self.setFixedSize(420, 360)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+
+        # 主题标记（由 MainWindow._apply_theme_to_dialog 同步）
+        self._dark_theme = False
+        self._info_label_widgets = []
 
         self._setup_ui()
 
@@ -73,13 +77,20 @@ class AboutDialog(QDialog):
     def _add_info(self, layout: QVBoxLayout, label: str, value: str):
         row = QHBoxLayout()
         lbl = QLabel(f"{label}:")
-        lbl.setStyleSheet("color: #666; font-weight: bold;")
+        lbl.setStyleSheet("color: #888; font-weight: bold;")
         lbl.setFixedWidth(70)
         row.addWidget(lbl)
         val = QLabel(value)
         val.setWordWrap(True)
         row.addWidget(val, 1)
         layout.addLayout(row)
+        self._info_label_widgets.append(lbl)
+
+    def _on_theme_applied(self):
+        """主题切换后刷新信息标签颜色（深色提亮）"""
+        color = "#bbb" if self._dark_theme else "#888"
+        for lbl in self._info_label_widgets:
+            lbl.setStyleSheet(f"color: {color}; font-weight: bold;")
 
 
 class IOAHelpDialog(QDialog):
@@ -90,6 +101,7 @@ class IOAHelpDialog(QDialog):
         self.setWindowTitle("IOA 地址说明")
         self.setFixedSize(560, 380)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        self._dark_theme = False
         self._setup_ui()
 
     def _setup_ui(self):
@@ -132,8 +144,9 @@ class IOAHelpDialog(QDialog):
         layout.addWidget(ioa_table)
 
         note_label = QLabel("注：IOA 地址在项目中可自定义分配，以上为典型分段约定。")
-        note_label.setStyleSheet("color: #666; font-size: 9pt;")
+        note_label.setStyleSheet("color: #888; font-size: 9pt;")
         layout.addWidget(note_label)
+        self._note_label = note_label
 
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
@@ -142,3 +155,9 @@ class IOAHelpDialog(QDialog):
         close_btn.setMinimumWidth(80)
         btn_layout.addWidget(close_btn)
         layout.addLayout(btn_layout)
+
+    def _on_theme_applied(self):
+        """主题切换后刷新注释文字颜色"""
+        color = "#aaa" if self._dark_theme else "#888"
+        if hasattr(self, "_note_label"):
+            self._note_label.setStyleSheet(f"color: {color}; font-size: 9pt;")
