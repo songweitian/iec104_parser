@@ -35,6 +35,9 @@ YX_OFF_COLOR = QColor("#F44336")
 GRAY_BG = QColor("#F5F5F5")
 BLUE_LIGHT = QColor("#E3F2FD")
 PURPLE_LIGHT = QColor("#F3E5F5")
+# 深色主题下的收发日志行背景（暗色系，避免浅色刺眼）
+BLUE_DARK = QColor("#1A3650")
+PURPLE_DARK = QColor("#3A2A4A")
 
 # 配置文件路径
 CONFIG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config")
@@ -58,6 +61,8 @@ class SimulatorDialog(QDialog):
         # 遥控/遥调操作控件引用：{ioa: {"btn_on":.., "btn_off":.., "btn_set":.., "btn_select":..}}
         self._yk_ops = {}
         self._yt_ops = {}
+        # 当前是否为深色主题（由 _apply_theme 依据样式表内容判定）
+        self._dark_theme = False
         # 角色切换确认状态（记录上次角色，切换被拒时回退下拉框）
         self._last_role_index = 0
         self._suppress_role_confirm = False
@@ -1253,6 +1258,20 @@ class SimulatorDialog(QDialog):
             self.auto_timer.stop()
             self.chk_auto_send.setChecked(False)
 
+    def _log_row_bg(self, direction):
+        """收发日志行背景色（按主题选取，避免深色下浅底刺眼）"""
+        if self._dark_theme:
+            return BLUE_DARK if direction == "发" else PURPLE_DARK
+        return BLUE_LIGHT if direction == "发" else PURPLE_LIGHT
+
+    def _on_theme_applied(self):
+        """主题切换后刷新已存在日志行的背景色"""
+        for r in range(self.log_table.rowCount()):
+            direction_item = self.log_table.item(r, 2)
+            if direction_item:
+                self.log_table.item(r, 0).setBackground(
+                    self._log_row_bg(direction_item.text()))
+
     def _add_frame_row(self, direction, hex_str):
         from datetime import datetime
         ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -1264,7 +1283,7 @@ class SimulatorDialog(QDialog):
 
         row = self.log_table.rowCount()
         self.log_table.insertRow(row)
-        bg = BLUE_LIGHT if direction == "发" else PURPLE_LIGHT
+        bg = self._log_row_bg(direction)
         seq = str(row + 1)
         for col, text in enumerate([seq, ts, direction, ftype, desc]):
             item = QTableWidgetItem(text)

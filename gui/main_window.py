@@ -269,14 +269,15 @@ class MainWindow(QMainWindow):
         mode_layout.addStretch()
         left_layout.addWidget(mode_group)
 
-        # 过滤选项 - 2行网格布局
+        # 过滤选项 - 分组布局（标签+控件对齐，筛选/重置独立在行尾）
         filter_group = QGroupBox("过滤条件")
-        filter_grid = QGridLayout(filter_group)
-        filter_grid.setSpacing(4)
+        filter_layout = QVBoxLayout(filter_group)
+        filter_layout.setSpacing(4)
 
         # 第1行: 信号类型 | 类型标识 | 传送原因 | 地址
-        row = 0
-        filter_grid.addWidget(QLabel("信号:"), row, 0)
+        row1 = QHBoxLayout()
+        row1.setSpacing(6)
+        row1.addWidget(QLabel("信号:"))
         self.filter_signal = QComboBox()
         self.filter_signal.addItem("全部", "")
         self.filter_signal.addItem("遥信", "遥信")
@@ -284,79 +285,77 @@ class MainWindow(QMainWindow):
         self.filter_signal.addItem("遥控", "遥控")
         self.filter_signal.addItem("遥调", "遥调")
         self.filter_signal.addItem("遥脉", "遥脉")
-        filter_grid.addWidget(self.filter_signal, row, 1)
+        row1.addWidget(self.filter_signal)
 
-        filter_grid.addWidget(QLabel("类型:"), row, 2)
+        row1.addWidget(QLabel("类型:"))
         self.filter_type = QComboBox()
         self.filter_type.setMinimumWidth(120)
         self.filter_type.addItem("全部", -1)
         for tid in sorted(TypeID):
             desc = TypeID.get_description(tid.value)
             self.filter_type.addItem(f"{tid.value}: {tid.name} ({desc})", tid.value)
-        filter_grid.addWidget(self.filter_type, row, 3, 1, 3)
+        row1.addWidget(self.filter_type, 1)
 
-        filter_grid.addWidget(QLabel("COT:"), row, 6)
+        row1.addWidget(QLabel("COT:"))
         self.filter_cot = QComboBox()
         self.filter_cot.setMinimumWidth(100)
         self.filter_cot.addItem("全部", -1)
         for cot in range(1, 42):
             self.filter_cot.addItem(f"{cot}: {COT.get_description(cot)}", cot)
-        filter_grid.addWidget(self.filter_cot, row, 7, 1, 3)
+        row1.addWidget(self.filter_cot)
 
-        filter_grid.addWidget(QLabel("地址:"), row, 10)
+        row1.addWidget(QLabel("地址:"))
         self.filter_addr = QLineEdit()
         self.filter_addr.setPlaceholderText("CA/0x1A")
         self.filter_addr.setMaximumWidth(90)
         self.filter_addr.setToolTip("公共地址(ASDU地址)，支持十进制或 0x 十六进制")
-        filter_grid.addWidget(self.filter_addr, row, 11)
+        row1.addWidget(self.filter_addr)
+        filter_layout.addLayout(row1)
 
         # 第2行: 方向 | 时间范围 | IOA范围 | 筛选/重置
-        row = 1
-        filter_grid.addWidget(QLabel("方向:"), row, 0)
+        row2 = QHBoxLayout()
+        row2.setSpacing(6)
+        row2.addWidget(QLabel("方向:"))
         self.filter_direction = QComboBox()
         self.filter_direction.addItem("全部", "")
         self.filter_direction.addItem("主→从", "主站→子站")
         self.filter_direction.addItem("从→主", "子站→主站")
-        filter_grid.addWidget(self.filter_direction, row, 1)
+        row2.addWidget(self.filter_direction)
 
-        filter_grid.addWidget(QLabel("时间:"), row, 2)
-        time_layout = QHBoxLayout()
-        time_layout.setSpacing(2)
+        row2.addWidget(QLabel("时间:"))
         self.filter_time_from = QLineEdit()
         self.filter_time_from.setPlaceholderText("HH:MM:SS")
-        self.filter_time_from.setMaximumWidth(90)
-        time_layout.addWidget(self.filter_time_from)
-        time_layout.addWidget(QLabel("~"))
+        self.filter_time_from.setMaximumWidth(85)
+        row2.addWidget(self.filter_time_from)
+        row2.addWidget(QLabel("~"))
         self.filter_time_to = QLineEdit()
         self.filter_time_to.setPlaceholderText("HH:MM:SS")
-        self.filter_time_to.setMaximumWidth(90)
-        time_layout.addWidget(self.filter_time_to)
-        filter_grid.addLayout(time_layout, row, 3, 1, 3)
+        self.filter_time_to.setMaximumWidth(85)
+        row2.addWidget(self.filter_time_to)
 
-        filter_grid.addWidget(QLabel("IOA:"), row, 6)
-        ioa_layout = QHBoxLayout()
-        ioa_layout.setSpacing(2)
+        row2.addWidget(QLabel("IOA:"))
         self.ioa_from_input = QLineEdit()
         self.ioa_from_input.setPlaceholderText("起始")
-        self.ioa_from_input.setMaximumWidth(70)
+        self.ioa_from_input.setMaximumWidth(65)
         self.ioa_from_input.setToolTip("IOA起始地址，支持十进制或0x前缀")
-        ioa_layout.addWidget(self.ioa_from_input)
-        ioa_layout.addWidget(QLabel("~"))
+        row2.addWidget(self.ioa_from_input)
+        row2.addWidget(QLabel("~"))
         self.ioa_to_input = QLineEdit()
         self.ioa_to_input.setPlaceholderText("结束")
-        self.ioa_to_input.setMaximumWidth(70)
+        self.ioa_to_input.setMaximumWidth(65)
         self.ioa_to_input.setToolTip("IOA结束地址")
-        ioa_layout.addWidget(self.ioa_to_input)
-        filter_grid.addLayout(ioa_layout, row, 7, 1, 3)
+        row2.addWidget(self.ioa_to_input)
 
+        row2.addStretch(1)
         self.filter_btn = QPushButton("筛选")
         self.filter_btn.clicked.connect(self._on_filter)
         self.filter_btn.setStyleSheet(FILTER_BTN_STYLE_IDLE)
         self.filter_btn.setToolTip("按条件过滤报文列表")
-        filter_grid.addWidget(self.filter_btn, row, 10)
+        row2.addWidget(self.filter_btn)
         self.filter_reset = QPushButton("重置")
         self.filter_reset.clicked.connect(self._on_filter_reset)
-        filter_grid.addWidget(self.filter_reset, row, 11)
+        row2.addWidget(self.filter_reset)
+        filter_layout.addLayout(row2)
 
         left_layout.addWidget(filter_group)
 
@@ -990,6 +989,11 @@ class MainWindow(QMainWindow):
     def _apply_theme_to_dialog(self, dialog):
         """将当前主题应用到子对话框（浅色为统一基础表，深色为完整暗色表）"""
         dialog.setStyleSheet(self.styleSheet())
+        # 同步主题标记（供对话框内部绘制时区分深浅色）
+        if hasattr(dialog, "_dark_theme"):
+            dialog._dark_theme = self._dark_theme
+            if hasattr(dialog, "_on_theme_applied"):
+                dialog._on_theme_applied()
 
     # ==================================================================
     # 多标签页输入
@@ -1298,12 +1302,18 @@ class MainWindow(QMainWindow):
 
         统一供填充/过滤/搜索/重置使用：重建 _view_order 与反查表、重设行数、
         清除上一轮的行隐藏标记，随后整体重绘可见区。
+
+        无可见数据时保留一行空态占位（delegate 绘制引导文字）。
         """
         self._view_order = [int(x) for x in display_indices]
         self._frame_to_row = {fi: vi for vi, fi in enumerate(self._view_order)}
         self._base_order = list(self._view_order)
         self._pre_search_order = []
         self.table_widget.setRowCount(0)
+        if not self._view_order:
+            # 空态：一行占位，delegate 据此绘制引导提示
+            self._view_order = [-1]
+            self._frame_to_row = {}
         self.table_widget.setRowCount(len(self._view_order))
         for r in range(len(self._view_order)):
             self.table_widget.setRowHidden(r, False)
@@ -1314,16 +1324,28 @@ class MainWindow(QMainWindow):
         if not (0 <= vi < len(self._view_order)):
             return self._frame_cell(-1, col)
         fi = self._view_order[vi]
+        if fi == -1:
+            # 空态占位行：第0列显示引导，其余列为空
+            text = "无报文可显示 — 请先在左侧粘贴/导入报文后点击「解析报文」" if col == 0 else ""
+            return {"text": text, "bg": self._empty_bg(), "fg": self._empty_fg(),
+                    "bold": False, "align": Qt.AlignLeft | Qt.AlignVCenter,
+                    "sort": None}
         if not (0 <= fi < len(self.all_frames)):
             return self._frame_cell(-1, col)
         return self._frame_cell(fi, col)
+
+    def _empty_bg(self):
+        return QColor("#1e1e1e") if self._dark_theme else QColor("#FFFFFF")
+
+    def _empty_fg(self):
+        return QColor("#888") if self._dark_theme else QColor("#aaa")
 
     def _frame_cell(self, fi: int, col: int) -> dict:
         """帧索引 fi、列 col 的单元格内容（供 _cell 与搜索匹配复用）。
 
         返回 dict：text / bg / fg / bold / align 以及 sort 排序键。
         """
-        empty = {"text": "-", "bg": QColor("#FFFFFF"), "fg": None,
+        empty = {"text": "-", "bg": self._empty_bg(), "fg": self._empty_fg(),
                  "bold": False, "align": Qt.AlignLeft | Qt.AlignVCenter,
                  "sort": None}
         if not (0 <= fi < len(self.all_frames)):
