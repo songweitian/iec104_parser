@@ -927,7 +927,7 @@ class MainWindow(QMainWindow):
     # ==================================================================
 
     def _toggle_theme(self):
-        """切换深色/浅色主题"""
+        """切换深色/浅色主题（同步已打开的子对话框）"""
         self._dark_theme = not self._dark_theme
         if self._dark_theme:
             self._apply_dark_theme()
@@ -935,6 +935,13 @@ class MainWindow(QMainWindow):
         else:
             self._apply_light_theme()
             self.statusbar.showMessage("已切换到浅色主题", 2000)
+        self._sync_open_dialogs_theme()
+
+    def _sync_open_dialogs_theme(self):
+        """把当前主题同步到已打开的非模态子对话框"""
+        dlg = getattr(self, '_simulator_dialog', None)
+        if dlg and dlg.isVisible():
+            self._apply_theme_to_dialog(dlg)
 
     def _apply_dark_theme(self):
         """应用深色主题（样式表统一维护在 gui/style.py）"""
@@ -949,6 +956,7 @@ class MainWindow(QMainWindow):
             "QPushButton { background-color: #c62828; color: white; padding: 2px 8px; border-radius: 3px; border: none; }"
             "QPushButton:hover { background-color: #b71c1c; }"
         )
+        self._apply_status_label_colors(dark=True)
 
     def _apply_light_theme(self):
         """应用浅色主题（恢复基础样式表）"""
@@ -963,6 +971,21 @@ class MainWindow(QMainWindow):
             "QPushButton { background-color: #f44336; color: white; padding: 2px 8px; border-radius: 3px; border: none; }"
             "QPushButton:hover { background-color: #d32f2f; }"
         )
+        self._apply_status_label_colors(dark=False)
+
+    def _apply_status_label_colors(self, dark: bool):
+        """按主题设置状态文字标签颜色（次要信息在深色下提亮、浅色下正常）"""
+        dim = "#999" if dark else "#888"      # 次要信息
+        faint = "#aaa" if dark else "#666"    # 更弱信息（行数/计数）
+        try:
+            self.lbl_input_status.setStyleSheet(f"color: {dim}; font-size: 9pt;")
+            self.lbl_line_count.setStyleSheet(
+                f"color: {faint}; font-size: 9pt; padding-right: 4px;")
+            self.lbl_search_count.setStyleSheet(f"color: {dim}; font-size: 9pt;")
+            self.lbl_count.setStyleSheet(f"color: {faint}; padding: 0 8px;")
+            self.lbl_version.setStyleSheet(f"color: {dim}; padding: 0 8px;")
+        except AttributeError:
+            pass  # 初始化早期属性未就绪
 
     def _apply_theme_to_dialog(self, dialog):
         """将当前主题应用到子对话框（浅色为统一基础表，深色为完整暗色表）"""
