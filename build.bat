@@ -21,6 +21,13 @@ if errorlevel 1 (
     pip install PyQt5 -i https://pypi.tuna.tsinghua.edu.cn/simple
 )
 
+REM 检测cryptography依赖（Ed25519 激活码验签需要）
+python -c "import cryptography" >nul 2>&1
+if errorlevel 1 (
+    echo [安装] 正在安装 cryptography 依赖...
+    pip install cryptography -i https://pypi.tuna.tsinghua.edu.cn/simple
+)
+
 REM 检测PyInstaller
 python -c "import PyInstaller" >nul 2>&1
 if errorlevel 1 (

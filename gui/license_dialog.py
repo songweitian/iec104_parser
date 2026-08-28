@@ -59,9 +59,9 @@ class LicenseDialog(QDialog):
         input_group = QGroupBox("输入激活码")
         input_layout = QHBoxLayout()
         self.code_input = QLineEdit()
-        self.code_input.setPlaceholderText("XXXX-XXXX-XXXX-XXXX 或 XXXX-XXXX-XXXX-XXXX-YYYY-MM-DD")
+        self.code_input.setPlaceholderText("粘贴开发者提供的激活码（永久授权或带日期的限时授权）")
         self.code_input.setFont(QFont("Consolas", 11))
-        self.code_input.setMaxLength(60)
+        self.code_input.setMaxLength(200)
         self.code_input.returnPressed.connect(self._on_activate)  # 回车直接激活
         input_layout.addWidget(self.code_input)
 
