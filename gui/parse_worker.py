@@ -1,4 +1,4 @@
-"""后台解析/抓包工作线程（从 gui/main_window.py 拆分）。
+"""后台解析工作线程（从 gui/main_window.py 拆分）。
 
 把不依赖 MainWindow 的“非 UI 逻辑”独立成模块，便于：
 - 缩小主窗口文件的维护面（E8 拆分）；
@@ -15,24 +15,6 @@ from iec104_parser import (
     hex_to_bytes, is_log_format, split_concatenated_frames, parse_log_format_blocks,
     _CONTROL_TYPE_IDS, _MONITOR_TYPE_IDS,
 )
-
-
-class CaptureWorker(QThread):
-    """网络抓包后台线程 (预留)"""
-    packet_received = pyqtSignal(bytes)
-
-    def __init__(self, interface: str, port: int):
-        super().__init__()
-        self.interface = interface
-        self.port = port
-        self.running = False
-
-    def run(self):
-        self.running = True
-        pass
-
-    def stop(self):
-        self.running = False
 
 
 class ParseWorker(QThread):
@@ -176,35 +158,6 @@ class ParseWorker(QThread):
             line_map.append([i])
         return hex_lines, line_map
 
-    def _split_concatenated_frames(self, hex_block: str) -> list:
-        cleaned = hex_block.replace(" ", "").replace(".", "")
-        cleaned = ''.join(c for c in cleaned if c in '0123456789ABCDEFabcdef')
-        if len(cleaned) < 12:
-            return [hex_block] if cleaned else []
-
-        frames = []
-        i = 0
-        while i < len(cleaned) - 1:
-            if cleaned[i:i+2].lower() == '68':
-                if i + 4 > len(cleaned):
-                    break
-                try:
-                    apdu_len = int(cleaned[i+2:i+4], 16)
-                except ValueError:
-                    i += 2
-                    continue
-                frame_len = apdu_len + 2
-                hex_len = frame_len * 2
-                if i + hex_len <= len(cleaned):
-                    frames.append(cleaned[i:i+hex_len])
-                    i += hex_len
-                else:
-                    frames.append(cleaned[i:])
-                    break
-            else:
-                i += 2
-        return frames
-
     def _extract_xn_blocks(self, text: str, parse_mode: ParseMode):
         """提取XN格式的数据块，返回 (blocks, line_map)"""
         lines = text.strip().split('\n')
@@ -294,11 +247,13 @@ class ParseWorker(QThread):
                     frame.send_role = "主站"
                     frame.recv_role = "子站"
                     parser.last_master_send = True
+                    parser._last_i_sender = 'master'
                 elif tid in _MONITOR_TYPE_IDS:
                     frame.direction = "子站→主站"
                     frame.send_role = "子站"
                     frame.recv_role = "主站"
                     parser.last_master_send = False
+                    parser._last_i_sender = 'slave'
 
                 frame.signal_type = frame.asdu.signal_type
                 frame.signal_label = frame.asdu.signal_type.label
@@ -307,6 +262,17 @@ class ParseWorker(QThread):
                 frame.error = f"ASDU解析异常: {e}"
         elif apci.frame_type == "S-format":
             frame.description = f"S帧 (确认帧, RN={apci.recv_seq})"
+            # M3: S帧由最近收到 I 帧的一方发送确认，据此推断方向
+            if parser._last_i_sender == 'master':
+                frame.direction = "子站→主站"
+                frame.send_role = "子站"
+                frame.recv_role = "主站"
+                parser.last_master_send = False
+            elif parser._last_i_sender == 'slave':
+                frame.direction = "主站→子站"
+                frame.send_role = "主站"
+                frame.recv_role = "子站"
+                parser.last_master_send = True
         elif apci.frame_type == "U-format":
             frame.description = parser._describe_u_frame(raw_bytes[2:6])
 

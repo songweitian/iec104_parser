@@ -662,6 +662,8 @@ class IEC104Parser:
         self.last_master_send: bool = self.master_send_first
         self.mode: ParseMode = mode
         self._last_known_hour: int = 0  # 最近已知的小时值，用于补充 CP24Time2a
+        # M3: 最近一条 I 帧的发送方（'master'/'slave'/None），用于 S/U 帧方向判定
+        self._last_i_sender: Optional[str] = None
 
     def set_mode(self, mode: ParseMode):
         """设置解析模式"""
@@ -671,6 +673,7 @@ class IEC104Parser:
         """设置第一个报文是否由主站发出"""
         self.master_send_first = master_first
         self.last_master_send = master_first
+        self._last_i_sender = None
 
     def parse_hex(self, hex_string: str, source: str = "") -> IEC104Frame:
         """解析单个十六进制报文"""
@@ -734,20 +737,35 @@ class IEC104Parser:
                 logger.warning("ASDU解析异常: %s", e, exc_info=True)
         elif apci.frame_type == "S-format":
             frame.description = f"S帧 (确认帧, 接收序号RN={apci.recv_seq})"
+            # M3: S帧由最近收到 I 帧的一方发送确认，据此推断方向
+            if self._last_i_sender == 'master':
+                frame.send_role = "子站"
+                frame.recv_role = "主站"
+                frame.direction = "子站→主站"
+                self.last_master_send = False
+            elif self._last_i_sender == 'slave':
+                frame.send_role = "主站"
+                frame.recv_role = "子站"
+                frame.direction = "主站→子站"
+                self.last_master_send = True
         elif apci.frame_type == "U-format":
             frame.description = self._describe_u_frame(raw_bytes[2:6])
 
-        # 根据 ASDU 内容修正方向
+        # 根据 ASDU 内容修正方向（并同步状态，避免后续帧沿用错误的交替猜测）
         if frame.asdu:
             tid = frame.asdu.type_id
             if tid in _CONTROL_TYPE_IDS:
                 frame.direction = "主站→子站"
                 frame.send_role = "主站"
                 frame.recv_role = "子站"
+                self.last_master_send = True
+                self._last_i_sender = 'master'
             elif tid in _MONITOR_TYPE_IDS:
                 frame.direction = "子站→主站"
                 frame.send_role = "子站"
                 frame.recv_role = "主站"
+                self.last_master_send = False
+                self._last_i_sender = 'slave'
 
             frame.signal_type = frame.asdu.signal_type
             frame.signal_label = frame.asdu.signal_type.label
@@ -813,10 +831,12 @@ class IEC104Parser:
                         frame.direction = "主站→子站"
                         frame.send_role = "主站"
                         frame.recv_role = "子站"
+                        self._last_i_sender = 'master'
                     elif tid in _MONITOR_TYPE_IDS:
                         frame.direction = "子站→主站"
                         frame.send_role = "子站"
                         frame.recv_role = "主站"
+                        self._last_i_sender = 'slave'
                     else:
                         # 对S/U以外的未知I帧，使用交替判断
                         if self.last_master_send:
@@ -839,16 +859,28 @@ class IEC104Parser:
                     self.last_master_send = not self.last_master_send
             elif frame.apci.frame_type == "S-format":
                 frame.description = f"S帧 (确认帧, RN={frame.apci.recv_seq})"
-                # S帧方向根据交替模式判断
-                if self.last_master_send:
+                # M3: S帧由最近收到 I 帧的一方发送确认，据此推断方向
+                if self._last_i_sender == 'master':
                     frame.direction = "子站→主站"
                     frame.send_role = "子站"
                     frame.recv_role = "主站"
-                else:
+                    self.last_master_send = False
+                elif self._last_i_sender == 'slave':
                     frame.direction = "主站→子站"
                     frame.send_role = "主站"
                     frame.recv_role = "子站"
-                self.last_master_send = not self.last_master_send
+                    self.last_master_send = True
+                else:
+                    # 无已知 I 帧状态时回退交替判断
+                    if self.last_master_send:
+                        frame.direction = "子站→主站"
+                        frame.send_role = "子站"
+                        frame.recv_role = "主站"
+                    else:
+                        frame.direction = "主站→子站"
+                        frame.send_role = "主站"
+                        frame.recv_role = "子站"
+                    self.last_master_send = not self.last_master_send
             elif frame.apci.frame_type == "U-format":
                 frame.description = self._describe_u_frame(raw_bytes[2:6])
                 # U帧方向根据交替模式判断
@@ -2088,11 +2120,13 @@ class IEC104Parser:
             frame.recv_role = "子站"
             frame.direction = "主站→子站"
             self.last_master_send = True
+            self._last_i_sender = 'master'
         elif direction.upper() in ('RX', 'RECV'):
             frame.send_role = "子站"
             frame.recv_role = "主站"
             frame.direction = "子站→主站"
             self.last_master_send = False
+            self._last_i_sender = 'slave'
 
         try:
             raw_bytes = self._hex_to_bytes(frame.raw_hex)

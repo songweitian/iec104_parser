@@ -227,7 +227,6 @@ class TestInputFormats:
         frame = parser.parse_hex("68.04.01.00.0E.00")
         assert frame.apci is not None
 
-    @pytest.mark.xfail(reason="parse_from_text normal mode has missing _hex_to_lines_with_mapping_old method")
     def test_comment_lines_ignored(self):
         parser = IEC104Parser()
         text = "# comment\n68 04 01 00 0E 00"

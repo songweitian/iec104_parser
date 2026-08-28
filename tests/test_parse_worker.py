@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import QApplication
 # 整个进程持有一个 QApplication 单例（局部引用会被 GC，信号触发即失效）
 _APP = QApplication.instance() or QApplication([])
 
-from iec104_parser import IEC104Parser, ParseMode
+from iec104_parser import IEC104Parser, ParseMode, split_concatenated_frames
 from gui.parse_worker import ParseWorker
 
 
@@ -66,14 +66,12 @@ class TestExtractHexLines:
 
 class TestSplitConcatenatedFrames:
     def test_two_s_frames(self):
-        w = ParseWorker(None, "", ParseMode.NORMAL)
-        frames = w._split_concatenated_frames(CONCAT_2S)
+        frames = split_concatenated_frames(CONCAT_2S)
         assert len(frames) == 2
         assert frames == ["680401000e00", "680402000a00"]
 
     def test_short_block_returns_as_is(self):
-        w = ParseWorker(None, "", ParseMode.NORMAL)
-        assert w._split_concatenated_frames("68 04") == ["68 04"]
+        assert split_concatenated_frames("68 04") == ["68 04"]
 
 
 class TestExtractXnBlocks:
