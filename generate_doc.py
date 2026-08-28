@@ -6,6 +6,7 @@ from docx import Document
 from docx.shared import Pt, Inches, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT
+from version import APP_VERSION, AUTHOR, EMAIL, BUILD_DATE
 
 
 def create_manual():
@@ -38,7 +39,7 @@ def create_manual():
     doc.add_paragraph()
     info = doc.add_paragraph()
     info.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = info.add_run('版本: v1.1.0\n作者: 宋伟田\n邮箱: 3028905947@qq.com\n日期: 2026-06-18')
+    run = info.add_run(f'版本: v{APP_VERSION}\n作者: {AUTHOR}\n邮箱: {EMAIL}\n日期: {BUILD_DATE}')
     run.font.size = Pt(12)
     run.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
 

@@ -9,12 +9,8 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont
 
-
-# 发布日期（手动维护，与每次正式发版同步更新）
-BUILD_DATE = "2026-08-27"
-AUTHOR = "宋伟田"
-EMAIL = "3028905947@qq.com"
-VERSION = "1.1.0"
+# 版本信息统一从 version.py 导入（发版只改一处）
+from version import BUILD_DATE, AUTHOR, EMAIL, VERSION
 
 
 class AboutDialog(QDialog):

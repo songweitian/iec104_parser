@@ -13,6 +13,7 @@ from gui.main_window import MainWindow, create_app_icon
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont
+from version import APP_NAME, APP_VERSION, APP_ORG
 
 
 def main():
@@ -31,9 +32,9 @@ def main():
     app.setFont(font)
 
     # 设置应用程序元数据
-    app.setApplicationName("IEC104 Parser")
-    app.setApplicationVersion("1.1.0")
-    app.setOrganizationName("SWT")
+    app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(APP_VERSION)
+    app.setOrganizationName(APP_ORG)
 
     # 启动主窗口
     window = MainWindow()

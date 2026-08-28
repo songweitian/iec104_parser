@@ -6,7 +6,6 @@ import os
 import sys
 import re
 import json
-import csv
 import struct
 import logging
 from datetime import datetime
@@ -33,15 +32,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from iec104_parser import (
     IEC104Parser, IEC104Frame, SignalType, TypeID, COT,
     APCIHeader, ASDU, InfoElement, ParseMode,
-    hex_to_bytes, is_log_format, split_concatenated_frames, parse_log_format_blocks
+    hex_to_bytes, is_log_format
 )
 from gui.about_dialog import AboutDialog
 from gui.stats_dialog import StatsDialog
 from gui.ioa_alias_dialog import IOAAliasDialog, get_alias
-from gui.style import LIGHT_QSS
+from gui.style import LIGHT_QSS, DARK_QSS
+from gui.exporters import export_csv, export_json, export_txt
 # 拆分出去的模块，这里重新导出以保持 `from gui.main_window import ...` 既有引用不变
 from gui.icons import create_app_icon, _doc_icon, _arrow_icon, _ICON_PRIMARY
-from gui.parse_worker import CaptureWorker, ParseWorker
+from gui.parse_worker import ParseWorker
+from version import APP_TITLE, APP_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -121,9 +122,6 @@ class FrameCellDelegate(QStyledItemDelegate):
 class MainWindow(QMainWindow):
     """主窗口"""
 
-    APP_TITLE = "IEC60870-5-104 报文解析器"
-    APP_VERSION = "1.1.0"
-
     def __init__(self):
         super().__init__()
         self.parser = IEC104Parser()
@@ -132,7 +130,6 @@ class MainWindow(QMainWindow):
         self._frame_byte_offset = []
         self._frame_input_lines = []
         self._current_frame_idx = 0
-        self.capture_worker: Optional[CaptureWorker] = None
         self.parse_mode: ParseMode = ParseMode.NORMAL
         self._dark_theme = False
         self._current_theme = "light"
@@ -163,7 +160,7 @@ class MainWindow(QMainWindow):
         self._sort_order: int = Qt.AscendingOrder
         self._frame_intervals: list = []
 
-        self.setWindowTitle(self.APP_TITLE)
+        self.setWindowTitle(APP_TITLE)
         self.resize(1320, 840)
         self.setMinimumSize(900, 640)
 
@@ -639,7 +636,7 @@ class MainWindow(QMainWindow):
         self.lbl_count.setStyleSheet("color: #666; padding: 0 8px;")
         self.statusbar.addPermanentWidget(self.lbl_count)
 
-        self.lbl_version = QLabel(f"v{self.APP_VERSION}")
+        self.lbl_version = QLabel(f"v{APP_VERSION}")
         self.lbl_version.setStyleSheet("color: #999; padding: 0 8px;")
         self.statusbar.addPermanentWidget(self.lbl_version)
 
@@ -682,118 +679,6 @@ class MainWindow(QMainWindow):
     # ==================================================================
     # 解析
     # ==================================================================
-
-    def _hex_to_lines(self, raw_text: str):
-        """智能拆分报文：支持日志格式、换行合并、批量解析"""
-        # 检测日志格式
-        if is_log_format(raw_text):
-            return self._parse_log_format(raw_text)
-
-        # 去除空白字符，提取纯十六进制
-        cleaned = ''.join(c for c in raw_text if c in '0123456789ABCDEFabcdef')
-
-        # 尝试将整个输入作为单条报文解析 (自动合并换行)
-        if cleaned and len(cleaned) % 2 == 0 and cleaned[:2].lower() == '68':
-            try:
-                raw_bytes = bytes.fromhex(cleaned)
-                if len(raw_bytes) >= 6 and raw_bytes[0] == 0x68:
-                    apdu_len = raw_bytes[1]
-                    if apdu_len + 2 == len(raw_bytes):
-                        return [cleaned]
-            except ValueError:
-                pass
-
-        # 回退：按行拆分 (批量解析模式)
-        lines = raw_text.strip().split("\n")
-        hex_lines = []
-        for line in lines:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            hex_lines.append(line)
-        return hex_lines
-
-    def _hex_to_lines_with_mapping(self, raw_text: str):
-        """拆分报文并返回每个报文对应的输入行号列表
-
-        Returns:
-            hex_lines: list[str]  - 每条报文的十六进制字符串
-            line_map: list[list[int]] - 每条报文对应的输入行号(0-based)
-        """
-        if is_log_format(raw_text):
-            return self._parse_log_format_with_mapping(raw_text)
-
-        cleaned = ''.join(c for c in raw_text if c in '0123456789ABCDEFabcdef')
-
-        # 单条合并报文
-        if cleaned and len(cleaned) % 2 == 0 and cleaned[:2].lower() == '68':
-            try:
-                raw_bytes = bytes.fromhex(cleaned)
-                if len(raw_bytes) >= 6 and raw_bytes[0] == 0x68:
-                    apdu_len = raw_bytes[1]
-                    if apdu_len + 2 == len(raw_bytes):
-                        all_lines = list(range(len(raw_text.strip().split("\n"))))
-                        return [cleaned], [all_lines]
-            except ValueError:
-                pass
-
-        # 按行拆分
-        all_lines = raw_text.strip().split("\n")
-        hex_lines = []
-        line_map = []
-        for i, line in enumerate(all_lines):
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            hex_lines.append(line)
-            line_map.append([i])
-        return hex_lines, line_map
-
-    def _parse_log_format_with_mapping(self, text: str):
-        """解析日志格式并返回行号映射（自动拆分拼接帧）"""
-        return parse_log_format_blocks(text)
-
-    def _parse_log_format(self, text: str) -> list:
-        """解析通信日志格式，返回十六进制报文列表（自动拆分拼接帧）"""
-        lines = text.strip().split('\n')
-        blocks = []      # 报文块列表
-        current_hex = [] # 当前块的十六进制行
-
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-
-            # 检测时间戳 + 方向头 (如: "13:25:00.692 RX:")
-            m = re.match(r'[\d:.\s]+(RX|TX):\s*$', line)
-            if m:
-                if current_hex:
-                    blocks.append(' '.join(current_hex))
-                    current_hex = []
-                continue
-
-            # 检测纯方向头 (如: "RX:" 或 "TX:")
-            m = re.match(r'^(RX|TX):\s*$', line)
-            if m:
-                if current_hex:
-                    blocks.append(' '.join(current_hex))
-                    current_hex = []
-                continue
-
-            # 十六进制数据行
-            if re.search(r'[0-9A-Fa-f]{2}', line):
-                current_hex.append(line)
-
-        # 最后一个块
-        if current_hex:
-            blocks.append(' '.join(current_hex))
-
-        # 拆分每个块中的拼接帧
-        result = []
-        for block in blocks:
-            frames = split_concatenated_frames(block)
-            result.extend(frames)
-        return result
 
     def _on_parse(self):
         """解析全部报文 - 使用后台线程避免UI阻塞"""
@@ -1044,32 +929,8 @@ class MainWindow(QMainWindow):
             self.statusbar.showMessage("已切换到浅色主题", 2000)
 
     def _apply_dark_theme(self):
-        """应用深色主题"""
-        dark_style = """
-            QMainWindow, QWidget { background-color: #2b2b2b; color: #e0e0e0; }
-            QGroupBox { border: 1px solid #555; border-radius: 4px; margin-top: 8px; padding-top: 16px; }
-            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
-            QPlainTextEdit, QTextEdit, QLineEdit { background-color: #1e1e1e; color: #d4d4d4; border: 1px solid #555; border-radius: 3px; }
-            QTableWidget { background-color: #1e1e1e; color: #d4d4d4; gridline-color: #404040; }
-            QTableWidget::item:selected { background-color: #264f78; }
-            QHeaderView::section { background-color: #333; color: #ccc; border: 1px solid #555; padding: 4px; }
-            QComboBox { background-color: #3c3c3c; color: #d4d4d4; border: 1px solid #555; border-radius: 3px; padding: 3px; }
-            QComboBox QAbstractItemView { background-color: #3c3c3c; color: #d4d4d4; selection-background-color: #264f78; }
-            QPushButton { background-color: #3c3c3c; color: #d4d4d4; border: 1px solid #555; border-radius: 4px; padding: 4px 12px; }
-            QPushButton:hover { background-color: #4a4a4a; }
-            QToolBar { background-color: #333; border-bottom: 1px solid #555; }
-            QTabWidget::pane { border: 1px solid #555; }
-            QTabBar::tab { background-color: #333; color: #ccc; padding: 6px 16px; border: 1px solid #555; border-bottom: none; }
-            QTabBar::tab:selected { background-color: #2b2b2b; color: #fff; }
-            QTreeWidget { background-color: #1e1e1e; color: #d4d4d4; }
-            QProgressBar { border: 1px solid #555; border-radius: 3px; text-align: center; }
-            QProgressBar::chunk { background-color: #2196F3; }
-            QMenuBar { background-color: #333; color: #e0e0e0; }
-            QMenuBar::item:selected { background-color: #4a4a4a; }
-            QMenu { background-color: #333; color: #e0e0e0; }
-            QMenu::item:selected { background-color: #264f78; }
-        """
-        self.setStyleSheet(dark_style)
+        """应用深色主题（样式表统一维护在 gui/style.py）"""
+        self.setStyleSheet(DARK_QSS)
         # 重新应用特殊按钮样式
         self.btn_parse.setStyleSheet(
             "QPushButton { background-color: #1976D2; color: white; "
@@ -1210,6 +1071,14 @@ class MainWindow(QMainWindow):
 
     # _on_import_file 已移至下方"多文件批量导入"区域
 
+    def _visible_frame_indices(self) -> list:
+        """当前表格中可见行的帧下标列表（过滤/搜索后）"""
+        visible = []
+        for i in range(self.table_widget.rowCount()):
+            if not self.table_widget.isRowHidden(i):
+                visible.append(self._frame_idx_at_row(i))
+        return visible
+
     def _on_export_csv(self):
         """导出CSV - 支持筛选后导出"""
         if not self._require_license():
@@ -1218,11 +1087,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "提示", "没有可导出的数据")
             return
 
-        visible_rows = []
-        for i in range(self.table_widget.rowCount()):
-            if not self.table_widget.isRowHidden(i):
-                visible_rows.append(self._frame_idx_at_row(i))
-
+        visible_rows = self._visible_frame_indices()
         if not visible_rows:
             QMessageBox.information(self, "提示", "没有可见的数据")
             return
@@ -1236,40 +1101,9 @@ class MainWindow(QMainWindow):
             return
         self._last_dir = os.path.dirname(path) or self._last_dir
         try:
+            content = export_csv(self.all_frames, visible_rows)
             with open(path, "w", newline="", encoding="utf-8-sig") as f:
-                writer = csv.writer(f)
-                writer.writerow(["序号", "原始时间戳", "方向", "信号类型", "帧类型", "类型标识", "类型描述",
-                                 "传送原因", "传送原因描述", "公共地址", "对象数",
-                                 "信息对象地址", "值", "时标", "错误"])
-                for row_idx in visible_rows:
-                    if row_idx < len(self.all_frames):
-                        frame = self.all_frames[row_idx]
-                        if frame.asdu and frame.asdu.information_elements:
-                            for elem in frame.asdu.information_elements:
-                                ts = elem.timestamp.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] \
-                                    if elem.timestamp else ""
-                                writer.writerow([
-                                    frame.index, frame.original_timestamp or "", frame.direction,
-                                    frame.signal_label,
-                                    frame.apci.frame_type if frame.apci else "",
-                                    frame.asdu.type_id,
-                                    TypeID.get_description(frame.asdu.type_id),
-                                    frame.asdu.cot_cause,
-                                    COT.get_description(frame.asdu.cot),
-                                    frame.asdu.common_address,
-                                    len(frame.asdu.information_elements),
-                                    f"0x{elem.ioa:06X}",
-                                    elem.value_desc, ts, frame.error
-                                ])
-                        else:
-                            writer.writerow([
-                                frame.index, frame.original_timestamp or "",
-                                frame.direction if frame.direction else "",
-                                "", frame.apci.frame_type if frame.apci else "",
-                                "", "", "", "", "", "",
-                                "", frame.description if frame.description else "",
-                                "", frame.error
-                            ])
+                f.write(content)
             export_count = len(visible_rows)
             total_count = len(self.all_frames)
             msg = f"已导出 {export_count}/{total_count} 条记录" if export_count < total_count else f"已导出 {export_count} 条记录"
@@ -1285,11 +1119,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "提示", "没有可导出的数据")
             return
 
-        visible_rows = []
-        for i in range(self.table_widget.rowCount()):
-            if not self.table_widget.isRowHidden(i):
-                visible_rows.append(self._frame_idx_at_row(i))
-
+        visible_rows = self._visible_frame_indices()
         if not visible_rows:
             QMessageBox.information(self, "提示", "没有可见的数据")
             return
@@ -1303,58 +1133,7 @@ class MainWindow(QMainWindow):
             return
         self._last_dir = os.path.dirname(path) or self._last_dir
         try:
-            data = []
-            for row_idx in visible_rows:
-                if row_idx < len(self.all_frames):
-                    frame = self.all_frames[row_idx]
-                    entry = {
-                        "index": frame.index,
-                        "raw_hex": frame.raw_hex,
-                        "direction": frame.direction,
-                        "send_role": frame.send_role,
-                        "recv_role": frame.recv_role,
-                        "signal_type": frame.signal_label,
-                        "description": frame.description,
-                        "error": frame.error,
-                        "apci": None,
-                        "asdu": None,
-                    }
-                    if frame.apci:
-                        entry["apci"] = {
-                            "frame_type": frame.apci.frame_type,
-                            "send_seq": frame.apci.send_seq,
-                            "recv_seq": frame.apci.recv_seq,
-                            "apdu_length": frame.apci.apdu_length,
-                        }
-                    if frame.asdu:
-                        entry["asdu"] = {
-                            "type_id": frame.asdu.type_id,
-                            "type_name": TypeID.get_name(frame.asdu.type_id),
-                            "type_desc": TypeID.get_description(frame.asdu.type_id),
-                            "signal_type": frame.asdu.signal_type.label,
-                            "vsq": frame.asdu.vsq,
-                            "object_count": frame.asdu.number_of_objects,
-                            "is_sequence": frame.asdu.is_sequence,
-                            "cot": frame.asdu.cot,
-                            "cot_cause": frame.asdu.cot_cause,
-                            "cot_desc": COT.get_description(frame.asdu.cot),
-                            "cot_test": frame.asdu.cot_test,
-                            "cot_pn": frame.asdu.cot_pn,
-                            "org": frame.asdu.org,
-                            "common_address": frame.asdu.common_address,
-                            "elements": []
-                        }
-                        for elem in frame.asdu.information_elements:
-                            entry["asdu"]["elements"].append({
-                                "ioa": f"0x{elem.ioa:06X}",
-                                "signal_type": elem.signal_type.label,
-                                "value": str(elem.value),
-                                "value_desc": elem.value_desc,
-                                "quality": str(elem.quality) if elem.quality else None,
-                                "timestamp": elem.timestamp.isoformat() if elem.timestamp else None,
-                            })
-                    data.append(entry)
-
+            data = export_json(self.all_frames, visible_rows)
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             export_count = len(visible_rows)
@@ -1372,11 +1151,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "提示", "没有可导出的数据")
             return
 
-        visible_rows = []
-        for i in range(self.table_widget.rowCount()):
-            if not self.table_widget.isRowHidden(i):
-                visible_rows.append(self._frame_idx_at_row(i))
-
+        visible_rows = self._visible_frame_indices()
         if not visible_rows:
             QMessageBox.information(self, "提示", "没有可见的数据")
             return
@@ -1392,43 +1167,9 @@ class MainWindow(QMainWindow):
         try:
             export_count = len(visible_rows)
             total_count = len(self.all_frames)
+            content = export_txt(self.all_frames, visible_rows)
             with open(path, "w", encoding="utf-8") as f:
-                f.write("=" * 80 + "\n")
-                f.write("IEC60870-5-104 报文解析报告\n")
-                f.write(f"解析时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"报文总数: {export_count}/{total_count}\n")
-                f.write("=" * 80 + "\n\n")
-
-                for row_idx in visible_rows:
-                    if row_idx < len(self.all_frames):
-                        frame = self.all_frames[row_idx]
-                        f.write(f"--- 报文 #{frame.index} ---\n")
-                        f.write(f"方向: {frame.direction}\n")
-                        if frame.signal_label:
-                            f.write(f"信号类型: {frame.signal_label}\n")
-                        f.write(f"原始数据: {frame.raw_hex}\n")
-                        if frame.error:
-                            f.write(f"错误: {frame.error}\n")
-                        elif frame.description:
-                            f.write(f"描述: {frame.description}\n")
-                        if frame.apci:
-                            f.write(f"帧类型: {frame.apci.frame_type}\n")
-                            f.write(f"发送序号SN: {frame.apci.send_seq}\n")
-                            f.write(f"接收序号RN: {frame.apci.recv_seq}\n")
-                        if frame.asdu:
-                            f.write(f"类型标识: {frame.asdu.type_id} "
-                                    f"({TypeID.get_description(frame.asdu.type_id)})\n")
-                            f.write(f"传送原因: {COT.get_description(frame.asdu.cot)}\n")
-                            f.write(f"公共地址: {frame.asdu.common_address}\n")
-                            f.write(f"信息对象数: {frame.asdu.number_of_objects}\n")
-                            for elem in frame.asdu.information_elements:
-                                f.write(f"  IOA=0x{elem.ioa:06X} [{elem.signal_type.label}]: "
-                                        f"{elem.value_desc}\n")
-                                if elem.quality:
-                                    f.write(f"    品质: {elem.quality}\n")
-                                if elem.timestamp:
-                                    f.write(f"    时标: {elem.timestamp}\n")
-                        f.write("\n")
+                f.write(content)
             msg = f"已导出 {export_count}/{total_count} 条记录" if export_count < total_count else f"已导出 {export_count} 条记录"
             self.statusbar.showMessage(f"{msg}: {os.path.basename(path)}", 3000)
         except Exception as e:
@@ -2980,7 +2721,7 @@ class MainWindow(QMainWindow):
 
     def _on_about(self):
         """版本信息对话框"""
-        dlg = AboutDialog(self.APP_TITLE, self.APP_VERSION)
+        dlg = AboutDialog(APP_TITLE, APP_VERSION)
         self._apply_theme_to_dialog(dlg)
         dlg.exec_()
 
@@ -2998,11 +2739,11 @@ class MainWindow(QMainWindow):
         self._license_days_remaining = status.get("days_remaining")
         self._license_expiry_date = status.get("expiry_date", "")
         if status["expired"]:
-            self.setWindowTitle(f"{self.APP_TITLE} [授权已到期 - 功能已锁定]")
+            self.setWindowTitle(f"{APP_TITLE} [授权已到期 - 功能已锁定]")
         elif not self._is_activated:
-            self.setWindowTitle(f"{self.APP_TITLE} [未激活 - 仅支持单条解析]")
+            self.setWindowTitle(f"{APP_TITLE} [未激活 - 仅支持单条解析]")
         else:
-            self.setWindowTitle(self.APP_TITLE)
+            self.setWindowTitle(APP_TITLE)
         self._update_license_label()
 
     def _update_license_label(self):
@@ -3088,7 +2829,7 @@ class MainWindow(QMainWindow):
         old_status = self._is_activated
         self._check_license()
         if self._is_activated and not old_status:
-            self.setWindowTitle(self.APP_TITLE)
+            self.setWindowTitle(APP_TITLE)
             QMessageBox.information(self, "激活成功", "软件已激活，所有功能已解锁！")
 
     def _open_history_manager(self):

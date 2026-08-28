@@ -1,12 +1,12 @@
 """
-全局样式常量 - 浅色主题基础 QSS
+全局样式常量 - 浅色/深色主题 QSS
 
 目的：不改变整体视觉语言，只做一致性统一——
   · 所有按钮统一圆角与内边距
   · 输入类控件统一边框/圆角/焦点高亮环
   · GroupBox、Tab、工具栏细节对齐深色主题已有的处理
-深色主题仍使用 main_window 内的完整样式表；子对话框通过
-MainWindow._apply_theme_to_dialog 继承当前主题表。
+深色主题样式表原内联于 main_window._apply_dark_theme，现提取到本文件统一维护；
+子对话框通过 MainWindow._apply_theme_to_dialog 继承当前主题表。
 """
 
 LIGHT_QSS = """
@@ -75,4 +75,30 @@ QToolTip {
     background-color: #FFFFFF;
     color: #333333;
 }
+"""
+
+
+DARK_QSS = """
+QMainWindow, QWidget { background-color: #2b2b2b; color: #e0e0e0; }
+QGroupBox { border: 1px solid #555; border-radius: 4px; margin-top: 8px; padding-top: 16px; }
+QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
+QPlainTextEdit, QTextEdit, QLineEdit { background-color: #1e1e1e; color: #d4d4d4; border: 1px solid #555; border-radius: 3px; }
+QTableWidget { background-color: #1e1e1e; color: #d4d4d4; gridline-color: #404040; }
+QTableWidget::item:selected { background-color: #264f78; }
+QHeaderView::section { background-color: #333; color: #ccc; border: 1px solid #555; padding: 4px; }
+QComboBox { background-color: #3c3c3c; color: #d4d4d4; border: 1px solid #555; border-radius: 3px; padding: 3px; }
+QComboBox QAbstractItemView { background-color: #3c3c3c; color: #d4d4d4; selection-background-color: #264f78; }
+QPushButton { background-color: #3c3c3c; color: #d4d4d4; border: 1px solid #555; border-radius: 4px; padding: 4px 12px; }
+QPushButton:hover { background-color: #4a4a4a; }
+QToolBar { background-color: #333; border-bottom: 1px solid #555; }
+QTabWidget::pane { border: 1px solid #555; }
+QTabBar::tab { background-color: #333; color: #ccc; padding: 6px 16px; border: 1px solid #555; border-bottom: none; }
+QTabBar::tab:selected { background-color: #2b2b2b; color: #fff; }
+QTreeWidget { background-color: #1e1e1e; color: #d4d4d4; }
+QProgressBar { border: 1px solid #555; border-radius: 3px; text-align: center; }
+QProgressBar::chunk { background-color: #2196F3; }
+QMenuBar { background-color: #333; color: #e0e0e0; }
+QMenuBar::item:selected { background-color: #4a4a4a; }
+QMenu { background-color: #333; color: #e0e0e0; }
+QMenu::item:selected { background-color: #264f78; }
 """
