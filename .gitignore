@@ -22,6 +22,7 @@ license.dat
 # ===== 本机文件（不入库） =====
 .agents/
 .claude/
+.codebuddy/
 *.doc
 ~$*
 
