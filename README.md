@@ -233,7 +233,9 @@ iec104_parser/
 ├── build.bat               # 打包脚本
 ├── gui/
 │   ├── __init__.py
-│   ├── main_window.py      # 主窗口
+│   ├── main_window.py      # 主窗口（UI 面板统筹）
+│   ├── parse_worker.py     # 后台解析/抓包工作线程
+│   ├── icons.py            # 程序图标绘制
 │   ├── about_dialog.py     # 关于/IOA说明
 │   ├── license_dialog.py   # 激活对话框
 │   ├── compare_dialog.py   # 报文对比
