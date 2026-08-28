@@ -58,21 +58,36 @@ def generate_i_frame(
         asdu.append(int(value) & 0xFF)
     elif type_id == 46:  # 双点命令
         asdu.append(int(value) & 0xFF)
-    elif type_id in (48, 49, 50):  # 设点命令(归一化/标度化/短浮点)带时标
+    elif type_id in (48, 49, 50):  # 设点命令(归一化/标度化/短浮点)，不带时标
         if type_id == 48:  # C_SE_NA_1 归一化
             val = int(value)
             asdu.append(val & 0xFF)
             asdu.append((val >> 8) & 0xFF)
-            asdu.append(0)  # QOI
+            asdu.append(0)  # QOS
         elif type_id == 49:  # C_SE_NB_1 标度化
             val = int(value)
             asdu.append(val & 0xFF)
             asdu.append((val >> 8) & 0xFF)
-            asdu.append(0)  # QOI
-        elif type_id == 50:  # C_SE_TA_1 短浮点
+            asdu.append(0)  # QOS
+        elif type_id == 50:  # C_SE_NC_1 短浮点
             float_bytes = struct.pack('<f', float(value))
             asdu.extend(float_bytes)
-            asdu.append(0)  # QOI
+            asdu.append(0)  # QOS
+    elif type_id in (61, 62, 63):  # 设点命令带时标（C_SE_TA_1/TB_1/TC_1）
+        if type_id == 61:  # C_SE_TA_1 归一化
+            val = int(value)
+            asdu.append(val & 0xFF)
+            asdu.append((val >> 8) & 0xFF)
+            asdu.append(0)  # QOS
+        elif type_id == 62:  # C_SE_TB_1 标度化
+            val = int(value)
+            asdu.append(val & 0xFF)
+            asdu.append((val >> 8) & 0xFF)
+            asdu.append(0)  # QOS
+        elif type_id == 63:  # C_SE_TC_1 短浮点
+            float_bytes = struct.pack('<f', float(value))
+            asdu.extend(float_bytes)
+            asdu.append(0)  # QOS
         asdu.extend(_generate_cp56time2a())
     elif type_id == 100:  # 总召唤
         asdu.append(int(value) & 0xFF)  # QOI
@@ -155,7 +170,10 @@ TYPE_INFO = {
     46: ("C_DC_NA_1", "双点命令"),
     48: ("C_SE_NA_1", "设点命令(归一化)"),
     49: ("C_SE_NB_1", "设点命令(标度化)"),
-    50: ("C_SE_TA_1", "设点命令(短浮点,带时标)"),
+    50: ("C_SE_NC_1", "设点命令(短浮点)"),
+    61: ("C_SE_TA_1", "设点命令(归一化,带时标)"),
+    62: ("C_SE_TB_1", "设点命令(标度化,带时标)"),
+    63: ("C_SE_TC_1", "设点命令(短浮点,带时标)"),
     100: ("C_IC_NA_1", "总召唤命令"),
     103: ("C_CS_NA_1", "时钟同步命令"),
 }
