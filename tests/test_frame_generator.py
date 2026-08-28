@@ -132,12 +132,24 @@ class TestM5TimedFix:
         assert f[15] == 20           # QOI = frame偏移15 (6+9)
         assert f[1] == 0x0E
 
+    def test_timed_measurement_types(self):
+        """带时标测量值 30/31/34/35/36 必须附加 7 字节 CP56Time2a"""
+        # ASDU = 9(头) + 值 + [QDS] + 7(时标)
+        expected = {30: 9 + 1 + 7, 31: 9 + 1 + 7, 34: 9 + 3 + 7,
+                    35: 9 + 3 + 7, 36: 9 + 5 + 7}
+        for tid, asdu_len in expected.items():
+            value = 1.5 if tid == 36 else 100
+            f = _frame_bytes(generate_i_frame(tid, 3, 1, 0x4001, value))
+            assert f[1] == asdu_len + 4, \
+                f"type {tid} APDU_LEN={f[1]:#x}, 期望 {asdu_len+4:#x}"
+            assert len(f) == 2 + asdu_len + 4
+
     def test_apdu_len_matches_frame(self):
         """任意生成帧：APDU 长度必须与实际长度一致（防止布局漂移）"""
         for tid, _ in TYPE_INFO.items():
             if tid == 103:
                 value = 0
-            elif tid in (13, 50, 63):
+            elif tid in (13, 36, 50, 63):
                 value = 1.5
             elif tid in (15,):
                 value = 1000

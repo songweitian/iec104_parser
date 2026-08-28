@@ -54,6 +54,20 @@ def generate_i_frame(
         val = int(value)
         asdu.extend(struct.pack('<I', val))
         asdu.append(0)  # QDS
+    elif type_id in (30, 31):  # 单点/双点信息(CP56Time2a)
+        asdu.append(int(value) & 0xFF)
+        asdu.extend(_generate_cp56time2a())
+    elif type_id in (34, 35):  # 归一化/标度化(CP56Time2a)
+        val = int(value)
+        asdu.append(val & 0xFF)
+        asdu.append((val >> 8) & 0xFF)
+        asdu.append(0)  # QDS
+        asdu.extend(_generate_cp56time2a())
+    elif type_id == 36:  # 短浮点(CP56Time2a)
+        float_bytes = struct.pack('<f', float(value))
+        asdu.extend(float_bytes)
+        asdu.append(0)  # QDS
+        asdu.extend(_generate_cp56time2a())
     elif type_id == 45:  # 单点命令
         asdu.append(int(value) & 0xFF)
     elif type_id == 46:  # 双点命令
