@@ -17,8 +17,14 @@ def generate_i_frame(
     recv_seq: int = 0,
     vsq: int = 1,
     origin_addr: int = 0,
+    select: bool = False,
 ) -> str:
-    """生成 I 格式帧"""
+    """生成 I 格式帧。
+
+    select: 仅对遥控/遥调命令（45/46/47/48/49/50/61/62/63）生效。
+        为 True 时置 S/E=0（选择/预制）；为 False 时置 S/E=1（执行）。
+        其它类型忽略该参数。
+    """
     # ASDU
     asdu = bytearray()
     asdu.append(type_id)
@@ -68,40 +74,44 @@ def generate_i_frame(
         asdu.extend(float_bytes)
         asdu.append(0)  # QDS
         asdu.extend(_generate_cp56time2a())
-    elif type_id == 45:  # 单点命令
-        asdu.append(int(value) & 0xFF)
-    elif type_id == 46:  # 双点命令
-        asdu.append(int(value) & 0xFF)
+    elif type_id in (45, 46, 47):  # 单点/双点/步调节命令 (遥控/遥调步)
+        sco = int(value) & 0xFF
+        # S/E 位 (bit7): select=True 置 0(选择)，否则置 1(执行)
+        sco = (sco & 0x7F) | (0x00 if select else 0x80)
+        asdu.append(sco)
     elif type_id in (48, 49, 50):  # 设点命令(归一化/标度化/短浮点)，不带时标
+        # QOS 的第4字节 bit7 为 S/E 位（48/49 在数据后，50 在浮点后）
+        qos = 0x80 if not select else 0x00
         if type_id == 48:  # C_SE_NA_1 归一化
             val = int(value)
             asdu.append(val & 0xFF)
             asdu.append((val >> 8) & 0xFF)
-            asdu.append(0)  # QOS
+            asdu.append(qos)  # QOS
         elif type_id == 49:  # C_SE_NB_1 标度化
             val = int(value)
             asdu.append(val & 0xFF)
             asdu.append((val >> 8) & 0xFF)
-            asdu.append(0)  # QOS
+            asdu.append(qos)  # QOS
         elif type_id == 50:  # C_SE_NC_1 短浮点
             float_bytes = struct.pack('<f', float(value))
             asdu.extend(float_bytes)
-            asdu.append(0)  # QOS
+            asdu.append(qos)  # QOS
     elif type_id in (61, 62, 63):  # 设点命令带时标（C_SE_TA_1/TB_1/TC_1）
+        qos = 0x80 if not select else 0x00
         if type_id == 61:  # C_SE_TA_1 归一化
             val = int(value)
             asdu.append(val & 0xFF)
             asdu.append((val >> 8) & 0xFF)
-            asdu.append(0)  # QOS
+            asdu.append(qos)  # QOS
         elif type_id == 62:  # C_SE_TB_1 标度化
             val = int(value)
             asdu.append(val & 0xFF)
             asdu.append((val >> 8) & 0xFF)
-            asdu.append(0)  # QOS
+            asdu.append(qos)  # QOS
         elif type_id == 63:  # C_SE_TC_1 短浮点
             float_bytes = struct.pack('<f', float(value))
             asdu.extend(float_bytes)
-            asdu.append(0)  # QOS
+            asdu.append(qos)  # QOS
         asdu.extend(_generate_cp56time2a())
     elif type_id == 100:  # 总召唤
         asdu.append(int(value) & 0xFF)  # QOI

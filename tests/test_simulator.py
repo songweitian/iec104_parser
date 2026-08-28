@@ -132,18 +132,67 @@ class TestSlaveAutoReply:
         # 无异常即可
         sim._handle_i_frame_received(frame)
 
-    def test_control_command_updates_point(self):
-        """单点命令(45) → 点位值更新（C_SC_NA_1 值解析为 SCS 字典）"""
+class TestSBOSelectBeforeOperate:
+    """SBO 预制流程：选择 → 执行；未预制拒绝；值不一致拒绝"""
+
+    def _receive(self, sim, tid, ioa, value, select):
+        """构造并下发一条控制命令帧"""
+        hex_str = generate_i_frame(tid, 6, 1, ioa, value,
+                                   send_seq=0, recv_seq=0, select=select)
+        frame = sim._parser.parse_hex(hex_str)
+        sim._handle_i_frame_received(frame)
+
+    def _sent_cots(self, sim, tid):
+        """统计发送帧中指定 type_id 的 COT 集合"""
+        cots = []
+        for hx in sim._sent:
+            b = bytes.fromhex(hx.replace(" ", ""))
+            if b[6] == tid:
+                # COT 在 ASDU 偏移 2（type/vsq 之后），即帧偏移 8
+                cots.append(b[8] & 0x3F)
+        return cots
+
+    def _make_slave(self):
         sim = _make(SimulatorRole.SLAVE)
         sim.points = create_default_points(yx_count=4, yc_count=0)
+        # 从站需处于数据传输状态才能回发确认帧
+        sim._set_state(ConnectionState.STARTED)
+        sim._sent = []
+        sim._send_raw = lambda h: (sim._sent.append(h), True)[1]
+        return sim
+
+    def test_full_sbo_flow(self):
+        """选择→确认→执行→确认→点位生效"""
+        sim = self._make_slave()
         ioa = sorted(sim.points.keys())[0]
-        cmd = sim._parser.parse_hex(generate_i_frame(45, 6, 1, ioa, 1,
-                                                     send_seq=0, recv_seq=0))
-        sim._handle_i_frame_received(cmd)
-        val = sim.points[ioa].value
-        # 单点命令信息体解析为 {'scs': 1, 'se': 0}，SCS=1 表示合位
-        assert isinstance(val, dict) and val.get("scs") == 1
-        assert sim.points[ioa].is_valid
+        # 选择(合)
+        self._receive(sim, 45, ioa, 1, select=True)
+        assert self._sent_cots(sim, 45) == [7], "选择应回 COT=7(选择确认)"
+        assert ioa in sim._select_locks
+        # 执行(合)
+        sim._sent.clear()
+        self._receive(sim, 45, ioa, 1, select=False)
+        assert self._sent_cots(sim, 45) == [7], "执行应回 COT=7(执行确认)"
+        assert ioa not in sim._select_locks, "执行后应清除预制锁"
+        assert sim.points[ioa].value & 0xFF == 1  # 合
+
+    def test_execute_without_select_rejected(self):
+        """未预制就执行 → 拒绝，回 COT=8(激活终止)"""
+        sim = self._make_slave()
+        ioa = sorted(sim.points.keys())[0]
+        self._receive(sim, 45, ioa, 1, select=False)
+        assert self._sent_cots(sim, 45) == [8], "未预制执行应回 COT=8"
+        assert ioa not in sim._select_locks
+
+    def test_mismatched_value_rejected(self):
+        """预制值(合)与执行值(分)不一致 → 拒绝"""
+        sim = self._make_slave()
+        ioa = sorted(sim.points.keys())[0]
+        self._receive(sim, 45, ioa, 1, select=True)  # 预制"合"
+        sim._sent.clear()
+        self._receive(sim, 45, ioa, 0, select=False)  # 执行"分"
+        assert self._sent_cots(sim, 45) == [8], "值不一致应回 COT=8"
+        assert ioa not in sim._select_locks
 
 
 class TestPoints:

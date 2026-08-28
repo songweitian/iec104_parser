@@ -158,3 +158,36 @@ class TestM5TimedFix:
             f = _frame_bytes(generate_i_frame(tid, 3, 1, 0x4001, value))
             assert f[1] == len(f) - 2, \
                 f"type {tid} APDU_LEN={f[1]:#x} != 实际 {len(f)-2:#x}"
+
+
+class TestSboSelectBit:
+    """遥控/设点命令 S/E（选择/执行）位编码（SBO 预制）"""
+
+    def test_single_point_select_execute(self):
+        """45 单点命令：select=True 置 S/E=0，False 置 S/E=1"""
+        # ASDU 值字节位于帧偏移 15（6 + 9头）
+        f_sel = _frame_bytes(generate_i_frame(45, 6, 1, 0x4001, 1, select=True))
+        assert f_sel[15] == 0x01, f"选择帧 SCO={f_sel[15]:#x}，期望 0x01(S/E=0)"
+        f_exec = _frame_bytes(generate_i_frame(45, 6, 1, 0x4001, 1, select=False))
+        assert f_exec[15] == 0x81, f"执行帧 SCO={f_exec[15]:#x}，期望 0x81(S/E=1)"
+
+    def test_double_point_select_execute(self):
+        """46 双点命令：value 为完整 SCO 字节（DCS=2 已编码在 bit2-3）"""
+        # DCS=2(合) 编码为 0x08（bit2-3），select 只改 S/E 位
+        f_sel = _frame_bytes(generate_i_frame(46, 6, 1, 0x4001, 0x08, select=True))
+        assert f_sel[15] == 0x08, f"选择帧 SCO={f_sel[15]:#x}"
+        f_exec = _frame_bytes(generate_i_frame(46, 6, 1, 0x4001, 0x08, select=False))
+        assert f_exec[15] == 0x88, f"执行帧 SCO={f_exec[15]:#x}"
+
+    def test_setpoint_qos_select_execute(self):
+        """48 设点命令：QOS 的 S/E 位（第 4 字节 bit7）"""
+        # 48: IOA后 2字节值 + 1字节QOS → QOS 在帧偏移 15+2=17
+        f_sel = _frame_bytes(generate_i_frame(48, 6, 1, 0x4001, 100, select=True))
+        assert f_sel[17] == 0x00, f"选择 QOS={f_sel[17]:#x}，期望 S/E=0"
+        f_exec = _frame_bytes(generate_i_frame(48, 6, 1, 0x4001, 100, select=False))
+        assert f_exec[17] == 0x80, f"执行 QOS={f_exec[17]:#x}，期望 S/E=1"
+
+    def test_select_param_ignored_for_plain_measurement(self):
+        """对非命令类型（如 9 测量值），select 参数不改变字节"""
+        f = _frame_bytes(generate_i_frame(9, 3, 1, 0x4001, 100, select=True))
+        assert f[11] == 0, "测量值 QDS 不应因 select 改变"

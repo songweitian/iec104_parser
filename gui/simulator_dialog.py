@@ -797,18 +797,25 @@ class SimulatorDialog(QDialog):
                 ops_layout = QHBoxLayout(ops)
                 ops_layout.setContentsMargins(4, 2, 4, 2)
                 ops_layout.setSpacing(6)
+                # SBO 预制模式选择：勾选=预制(选择)，取消=直接执行
+                chk = QCheckBox("预制")
+                chk.setToolTip("勾选后发送 SBO 选择命令；不勾选直接执行")
+                chk.setStyleSheet("QCheckBox { color: #e0e0e0; }")
                 btn_on = QPushButton("合")
                 btn_on.setStyleSheet(
                     "QPushButton { background-color: #4CAF50; color: white; padding: 3px 10px; border-radius: 3px; border: none; }"
                     "QPushButton:hover { background-color: #388E3C; }"
                 )
-                btn_on.clicked.connect(lambda _, ioa=pt.ioa: self._on_yk_command(ioa, 1))
+                btn_on.clicked.connect(
+                    lambda _, ioa=pt.ioa, c=chk: self._on_yk_command(ioa, 1, c.isChecked()))
                 btn_off = QPushButton("分")
                 btn_off.setStyleSheet(
                     "QPushButton { background-color: #9E9E9E; color: white; padding: 3px 10px; border-radius: 3px; border: none; }"
                     "QPushButton:hover { background-color: #757575; }"
                 )
-                btn_off.clicked.connect(lambda _, ioa=pt.ioa: self._on_yk_command(ioa, 0))
+                btn_off.clicked.connect(
+                    lambda _, ioa=pt.ioa, c=chk: self._on_yk_command(ioa, 0, c.isChecked()))
+                ops_layout.addWidget(chk)
                 ops_layout.addWidget(btn_on)
                 ops_layout.addWidget(btn_off)
                 ops_layout.addStretch()
@@ -910,13 +917,23 @@ class SimulatorDialog(QDialog):
         if self.simulator and old_val != value:
             self.simulator.set_point_value(ioa, value)
 
-    def _on_yk_command(self, ioa, value):
-        if self.simulator and self.simulator.is_connected:
-            self.simulator.send_i_frame(type_id=45, cot=6, common_addr=1, ioa=ioa, value=value)
+    def _on_yk_command(self, ioa, value, select=False):
+        """遥控命令（type 45 单点命令）
 
-    def _on_yt_command(self, ioa, value):
+        select: True=预制(选择)，False=直接执行
+        """
         if self.simulator and self.simulator.is_connected:
-            self.simulator.send_i_frame(type_id=50, cot=6, common_addr=1, ioa=ioa, value=value)
+            self.simulator.send_i_frame(
+                type_id=45, cot=6, common_addr=1, ioa=ioa, value=value, select=select)
+
+    def _on_yt_command(self, ioa, value, select=False):
+        """遥调命令（type 50 短浮点设点）
+
+        select: True=预制(选择)，False=直接执行
+        """
+        if self.simulator and self.simulator.is_connected:
+            self.simulator.send_i_frame(
+                type_id=50, cot=6, common_addr=1, ioa=ioa, value=value, select=select)
 
     def _on_auto_send_changed(self, state):
         if self.simulator:

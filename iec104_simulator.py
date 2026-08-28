@@ -144,6 +144,12 @@ class IEC104Simulator(QThread):
         # 接收计数器 (用于 W 窗口控制)
         self._rx_count_since_last_s = 0
 
+        # 发送窗口：已发出但尚未被确认的 I 帧序号（用于 K 窗口限制）
+        self._unacknowledged_i = 0
+
+        # SBO 预制状态：{ioa: (type_id, value)}，记录已选择待执行的遥控/遥调
+        self._select_locks: Dict[int, tuple] = {}
+
         # 协议参数
         self.t1 = DEFAULT_T1
         self.t2 = DEFAULT_T2
@@ -412,11 +418,17 @@ class IEC104Simulator(QThread):
         """处理收到的 S 帧 (通过 parser 解析)"""
         rn = frame.apci.recv_seq
         self.log_message.emit(f"[S帧] 确认序号 RN={rn}")
-        self._last_rx_time = time.time()
-        self._last_send_time = 0
+        self._handle_s_frame_received_raw(rn)
 
     def _handle_s_frame_received_raw(self, rn: int):
-        """处理收到的 S 帧 (直接使用序号)"""
+        """处理收到的 S 帧 (直接使用序号)
+
+        对方确认到序号 rn-1 为止的 I 帧，据此缩减未确认窗口（K 窗口）。
+        """
+        # 收到的 rn = 对方期望的下一个序号，即已确认 [0, rn-1]。
+        # 我方已发序号到 self._send_seq-1，未确认数为 send_seq - rn。
+        if rn <= self._send_seq:
+            self._unacknowledged_i = self._send_seq - rn
         self._last_rx_time = time.time()
         self._last_send_time = 0
 
@@ -475,18 +487,107 @@ class IEC104Simulator(QThread):
             self.log_message.emit("[从站] 收到时钟同步，回复确认")
             self.send_i_frame(type_id=103, cot=7, common_addr=ca, ioa=0, value=0)
 
-        elif tid in (13, 14, 45, 46, 47, 48, 49, 50) and cot == 6:
-            # 遥控/遥调/设点命令 → 更新点位 + 回复确认
-            ioa = frame.asdu.information_elements[0].ioa if frame.asdu.information_elements else 0
-            value = frame.asdu.information_elements[0].value if frame.asdu.information_elements else 0
-            if ioa in self.points:
-                self.points[ioa].value = value
-                self.points[ioa].timestamp = time.strftime("%H:%M:%S")
-                self.points[ioa].is_valid = True
-                self.point_updated.emit(ioa, self.points[ioa])
-            self.log_message.emit(f"[从站] 收到控制命令 TID={tid} IOA=0x{ioa:04X} 值={value}，回复确认")
-            # 回复：同类型标识，COT=7（激活确认），IOA 使用原命令的 IOA
-            self.send_i_frame(type_id=tid, cot=7, common_addr=ca, ioa=ioa, value=value)
+        elif tid in (13, 14, 45, 46, 47, 48, 49, 50, 61, 62, 63) and cot == 6:
+            # 遥控/遥调/设点命令 → 按 SBO 预制流程处理
+            self._handle_control_command(frame, tid, ca)
+
+    # 遥控/遥调命令是否要求 SBO 预制流程（需要先"选择"再"执行"）
+    _SBO_COMMAND_TIDS = {45, 46, 47, 48, 49, 50, 61, 62, 63}
+
+    def _extract_sco(self, frame, tid: int) -> int:
+        """从解析结果还原控制命令的 SCO/设点字节（含 S/E 位，bit7）
+
+        各类型信息元素 value 结构不同，需按类型还原命令字节：
+          - 45 C_SC:  {'scs':bit0, 'se':bit7}
+          - 46 C_DC:  {'dcs':bit2-3, 'se':bit7}
+          - 47 C_RC:  {'rca':bit1-6, 'se':bit7, 'step_dir'/'step_down'}
+          - 48/49/50/61/62/63 设点：parser 只给值，S/E 位在 QOS 未单独解析，
+            此处以 S/E=执行 还原（设点命令极少用 SBO，且此处仅用于校验）
+        """
+        if not frame.asdu or not frame.asdu.information_elements:
+            return 0
+        elem = frame.asdu.information_elements[0]
+        val = elem.value
+        if isinstance(val, dict):
+            se = val.get("se", 1)
+            if tid == 45:
+                body = val.get("scs", 0) & 0x01
+            elif tid == 46:
+                body = (val.get("dcs", 0) & 0x03) << 2
+            elif tid == 47:
+                rca = val.get("rca", 0) & 0x3F
+                body = (rca << 1)
+                if val.get("step_dir") == "升":
+                    body |= 0x01
+            else:
+                body = 0
+            return (se << 7) | (body & 0x7F)
+        if isinstance(val, int):
+            return val & 0xFF
+        return 0
+
+    def _handle_control_command(self, frame, tid: int, ca: int):
+        """按 SBO（select-before-operate）流程处理遥控/遥调/设点命令
+
+        流程（IEC 104 §5.4.2.2，SBO 要求）：
+          1. 收到 COT=6 + S/E=0(选择)  → 回 COT=7(选择确认)，记录预制锁
+          2. 收到 COT=6 + S/E=1(执行)  → 校验预制锁，执行并回 COT=7(执行确认) + 变化上送
+          3. 未预制就执行 / 预制后值不一致 / 预制后超时 → 回 COT=8(激活终止)
+        """
+        if not frame.asdu or not frame.asdu.information_elements:
+            return
+        ioa = frame.asdu.information_elements[0].ioa
+        sco = self._extract_sco(frame, tid)
+        se = (sco >> 7) & 1          # 0=选择(预制), 1=执行
+        value = sco & 0xFF
+
+        if se == 0:
+            # ===== 选择/预制 =====
+            self._select_locks[ioa] = (tid, value)
+            self.log_message.emit(
+                f"[从站] SBO选择 IOA=0x{ioa:04X} TID={tid}，回选择确认")
+            self.send_i_frame(type_id=tid, cot=7, common_addr=ca, ioa=ioa,
+                              value=value, select=True)
+            return
+
+        # ===== 执行 =====
+        lock = self._select_locks.get(ioa)
+        if lock is None or lock[0] != tid:
+            # 未预制就执行 → 拒绝，回激活终止
+            self.log_message.emit(
+                f"[从站] 拒绝未预制的执行 IOA=0x{ioa:04X} TID={tid}，回激活终止")
+            self.send_i_frame(type_id=tid, cot=8, common_addr=ca, ioa=ioa,
+                              value=value, select=False)
+            return
+        # 比较命令内容位（剔除 S/E 位），选择与执行的 body 必须一致
+        if lock[1] != (value & 0x7F):
+            # 预制值不一致 → 拒绝并清除预制锁（该选择已被尝试消耗）
+            self._select_locks.pop(ioa, None)
+            self.log_message.emit(
+                f"[从站] 执行值({value & 0x7F})与预制值({lock[1]})不一致，回激活终止")
+            self.send_i_frame(type_id=tid, cot=8, common_addr=ca, ioa=ioa,
+                              value=value, select=False)
+            return
+
+        # 校验通过，执行操作并清除预制锁
+        self._select_locks.pop(ioa, None)
+        self._apply_control_to_point(ioa, tid, value)
+        self.log_message.emit(f"[从站] SBO执行 IOA=0x{ioa:04X} TID={tid}，回执行确认")
+        self.send_i_frame(type_id=tid, cot=7, common_addr=ca, ioa=ioa,
+                          value=value, select=False)
+
+    def _apply_control_to_point(self, ioa: int, tid: int, value: int):
+        """把控制命令的作用结果应用到点位（剔除 S/E 位，仅存命令内容）"""
+        if ioa in self.points:
+            pt = self.points[ioa]
+            body = value & 0x7F
+            if tid in (45, 46, 47):
+                pt.value = body
+            elif tid in (48, 49, 50, 61, 62, 63):
+                pt.value = body
+            pt.timestamp = time.strftime("%H:%M:%S")
+            pt.is_valid = True
+            self.point_updated.emit(ioa, pt)
 
     def _send_all_points(self, common_addr: int, cot: int = 20):
         """上送所有点位数据"""
@@ -580,19 +681,29 @@ class IEC104Simulator(QThread):
         return self._send_raw(hex_str)
 
     def send_i_frame(self, type_id: int, cot: int, common_addr: int,
-                     ioa: int, value, vsq: int = 1):
-        """发送 I 帧"""
+                     ioa: int, value, vsq: int = 1, select: bool = False):
+        """发送 I 帧
+
+        select: 遥控/遥调命令（45/46/47/48/49/50/61/62/63）的预制标志。
+            为 True 表示"选择/预制"，为 False 表示"执行"。
+        """
         if self._state != ConnectionState.STARTED:
             self.error_occurred.emit("未进入数据传输状态，请先发送 STARTDT")
+            return False
+        # K 窗口：未确认 I 帧数达到上限时暂缓发送（IEC104 8.3 节）
+        if self._unacknowledged_i >= self.k:
+            self.log_message.emit(
+                f"[K窗口] 未确认I帧数已达 {self._unacknowledged_i}/{self.k}，暂缓发送")
             return False
         hex_str = generate_i_frame(
             type_id=type_id, cot=cot, common_addr=common_addr,
             ioa=ioa, value=value, send_seq=self._send_seq,
-            recv_seq=self._recv_seq, vsq=vsq
+            recv_seq=self._recv_seq, vsq=vsq, select=select
         )
         result = self._send_raw(hex_str)
         if result:
             self._send_seq = (self._send_seq + 1) % 32768
+            self._unacknowledged_i += 1
             self._last_send_time = time.time()
         return result
 
@@ -665,10 +776,12 @@ class IEC104Simulator(QThread):
                 self._last_activity_time = now
 
     def _reset_sequence_numbers(self):
-        """重置序列号"""
+        """重置序列号与连接态状态"""
         self._send_seq = 0
         self._recv_seq = 0
         self._rx_count_since_last_s = 0
+        self._unacknowledged_i = 0
+        self._select_locks.clear()
         self._last_send_time = 0
         self._last_rx_time = time.time()
         self._last_activity_time = time.time()
