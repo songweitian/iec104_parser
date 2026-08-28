@@ -20,7 +20,8 @@ from PyQt5.QtWidgets import (
     QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView,
     QCheckBox, QSpinBox, QProgressBar, QMenu, QMenuBar,
     QDialog, QListWidget, QListWidgetItem, QFrame, QPlainTextEdit,
-    QDialogButtonBox, QFormLayout, QInputDialog
+    QDialogButtonBox, QFormLayout, QInputDialog,
+    QStyledItemDelegate, QStyleOptionViewItem, QStyle
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QThread, QTimer, QSettings, QSize, QPoint
 from PyQt5.QtGui import (QFont, QColor, QTextCursor, QIcon, QPalette,
@@ -155,68 +156,50 @@ def _arrow_icon(rightward: bool) -> QIcon:
     return QIcon(pm)
 
 
-class SortableTableWidget(QTableWidget):
-    """支持数值排序的表格 - 通过 UserRole+1 数据排序"""
+class FrameCellDelegate(QStyledItemDelegate):
+    """报文列表虚拟绘制器。
 
-    def __init__(self, *args, **kwargs):
+    不再为每条/每列创建 QTableWidgetItem，而是在每个单元格绘制时实时从
+    MainWindow.all_frames 与 _view_order（视图行→帧索引）取值。
+    万帧级数据下填充开销从 O(N×12) 次 item 构造降至 O(1)，仅重绘可见区。
+    """
+
+    def __init__(self, window, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._sort_column = -1
-        self._sort_order = Qt.AscendingOrder
-        # 连接表头点击到自定义排序
-        self.horizontalHeader().sectionClicked.connect(self._on_header_clicked)
+        self._w = window
 
-    def _on_header_clicked(self, column):
-        """表头点击 → 切换排序方向并排序"""
-        if column == self._sort_column:
-            self._sort_order = (Qt.DescendingOrder if self._sort_order == Qt.AscendingOrder
-                                else Qt.AscendingOrder)
+    def paint(self, painter, option, index):
+        w = self._w
+        if w is None or not w.all_frames or not w._view_order:
+            return super().paint(painter, option, index)
+        vi = index.row()
+        if not (0 <= vi < len(w._view_order)):
+            return super().paint(painter, option, index)
+        fi = w._view_order[vi]
+        if not (0 <= fi < len(w.all_frames)):
+            return super().paint(painter, option, index)
+
+        cell = w._cell(vi, index.column())
+        painter.save()
+        rect = option.rect
+        if option.state & QStyle.State_Selected:
+            painter.fillRect(rect, option.palette.highlight())
         else:
-            self._sort_column = column
-            self._sort_order = Qt.AscendingOrder
-        # 先禁用自动排序，防止 setSortIndicator 触发 model 排序
-        self.setSortingEnabled(False)
-        self._do_sort(column, self._sort_order)
-        # 更新表头排序指示器（仅显示箭头，不触发排序）
-        self.horizontalHeader().setSortIndicator(column, self._sort_order)
+            painter.fillRect(rect, cell["bg"])
+        fg = cell.get("fg") or (
+            QColor("#E0E0E0") if w._dark_theme else QColor("#000000"))
+        painter.setPen(fg)
+        font = painter.font()
+        font.setBold(cell.get("bold", False))
+        painter.setFont(font)
+        painter.drawText(rect.adjusted(4, 0, -4, 0),
+                         int(cell.get("align", Qt.AlignLeft | Qt.AlignVCenter)),
+                         cell["text"])
+        painter.restore()
 
-    def sortItems(self, column, order=Qt.AscendingOrder):
-        """供外部调用的排序方法"""
-        self._sort_column = column
-        self._sort_order = order
-        self._do_sort(column, order)
-
-    def _do_sort(self, column, order):
-        """实际排序逻辑"""
-        row_count = self.rowCount()
-        col_count = self.columnCount()
-        if row_count <= 1:
-            return
-
-        # 收集每行的排序键和所有列数据
-        rows = []
-        for r in range(row_count):
-            item = self.item(r, column)
-            sort_val = item.data(Qt.UserRole + 1) if item else None
-            if sort_val is not None:
-                try:
-                    sort_val = float(sort_val)
-                except (ValueError, TypeError):
-                    sort_val = None
-            text_val = item.text() if item else ""
-            col_items = []
-            for c in range(col_count):
-                col_items.append(self.takeItem(r, c))
-            rows.append((sort_val, text_val, col_items))
-
-        # 排序：有数值的排前面，数值按大小排；无数值的按文本排
-        reverse = (order == Qt.DescendingOrder)
-        rows.sort(key=lambda x: (x[0] is not None, x[0] if x[0] is not None else 0, x[1]),
-                  reverse=reverse)
-
-        # 重新放入
-        for r, (_, _, col_items) in enumerate(rows):
-            for c in range(col_count):
-                self.setItem(r, c, col_items[c])
+    def sizeHint(self, option, index):
+        # 沿用默认行高；列宽由“估算/用户拖拽”决定，无需按内容精确量宽
+        return super().sizeHint(option, index)
 
 
 class CaptureWorker(QThread):
@@ -571,6 +554,15 @@ class MainWindow(QMainWindow):
         # 用户保存过的列宽偏好（关闭时采集，下次启动直接套用）
         self._saved_col_widths: Optional[list] = None
 
+        # 报文列表虚拟化状态（见 FrameCellDelegate / _cell / _on_header_sort）
+        self._view_order: list = []      # 视图行 → all_frames 索引（当前显示顺序）
+        self._frame_to_row: dict = {}    # all_frames 索引 → 视图行（0(1) 反查）
+        self._base_order: list = []      # 非搜索时的完整显示顺序（搜索快照用）
+        self._pre_search_order: list = []  # 发起搜索前保存，清空搜索时还原
+        self._sort_column: int = -1
+        self._sort_order: int = Qt.AscendingOrder
+        self._frame_intervals: list = []
+
         self.setWindowTitle(self.APP_TITLE)
         self.resize(1320, 840)
         self.setMinimumSize(900, 640)
@@ -814,7 +806,7 @@ class MainWindow(QMainWindow):
         search_layout.addWidget(self.lbl_search_count)
         table_layout.addLayout(search_layout)
 
-        self.table_widget = SortableTableWidget()
+        self.table_widget = QTableWidget()
         self.table_widget.setColumnCount(12)
         self.table_widget.setHorizontalHeaderLabels(
             ["序号", "原始时间", "方向", "信号类型", "类型标识", "传送原因", "公共地址", "对象数", "值", "描述", "输入行", "时间间隔"]
@@ -823,6 +815,11 @@ class MainWindow(QMainWindow):
         self.table_widget.setSelectionBehavior(QTableWidget.SelectRows)
         self.table_widget.horizontalHeader().setStretchLastSection(True)
         self.table_widget.setEditTriggers(QTableWidget.NoEditTriggers)
+        # 虚拟绘制：不创建单元格对象，由 FrameCellDelegate 实时绘制（万帧级性能）
+        self._cell_delegate = FrameCellDelegate(self)
+        self.table_widget.setItemDelegate(self._cell_delegate)
+        self.table_widget.horizontalHeader().sectionClicked.connect(
+            self._on_header_sort)
         self.table_widget.cellClicked.connect(self._on_table_click)
         self.table_widget.cellDoubleClicked.connect(self._on_table_double_click)
         self.table_widget.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -1888,139 +1885,22 @@ class MainWindow(QMainWindow):
             return QColor("#FFFFFF")
 
     def _populate_table(self):
-        """填充报文列表表格 - 优化大量数据性能"""
-        self.table_widget.setRowCount(0)
+        """填充报文列表表格 - 虚拟化：不创建单元格对象，仅更新映射与行数。
+
+        由 FrameCellDelegate 在绘制时实时调用 _cell() 取内容。
+        万帧级数据填充开销从 O(N×12) 降为 O(1)，仅重绘可见区域。
+        注：all_frames 恒为全量，_view_order 只描述“当前可见行”（过滤/搜索/
+        排序后仍可见的帧索引）——因此排序/搜索/点击/导出都经 _frame_idx_at_row 映射。
+        """
+        n = len(self.all_frames)
+        # 数据源(重新解析/换标签页)改变后，回到默认序号序并清空搜索快照
+        self._set_view(list(range(n)))
+        self._sort_column = -1
+        self.table_widget.horizontalHeader().setSortIndicator(-1, Qt.AscendingOrder)
 
         if not self.all_frames:
+            self.table_widget.viewport().update()
             return
-
-        line_map = getattr(self, '_frame_input_lines', [])
-
-        # 预分配行数（性能优化）
-        total_frames = len(self.all_frames)
-        self.table_widget.setRowCount(total_frames)
-
-        # 禁用排序和更新以提高性能
-        self.table_widget.setSortingEnabled(False)
-        self.table_widget.setUpdatesEnabled(False)
-
-        # 填充所有行
-        for i, frame in enumerate(self.all_frames):
-            row = i
-
-            # 行背景色
-            row_color = self._row_color_for_frame(frame)
-
-            # 序号（UserRole 存储帧索引，排序后仍可正确还原行→数据映射）
-            idx_item = QTableWidgetItem(str(frame.index))
-            idx_item.setBackground(row_color)
-            idx_item.setData(Qt.UserRole, i)
-            idx_item.setData(Qt.UserRole + 1, frame.index)
-            self.table_widget.setItem(row, 0, idx_item)
-
-            # 原始时间
-            ts_text = frame.original_timestamp if frame.original_timestamp else "-"
-            ts_sort = self._timestamp_to_sort_key(frame.original_timestamp)
-            self._set_table_item(row, 1, ts_text, row_color, sort_key=ts_sort)
-
-            # 方向
-            dir_text = frame.direction
-            if not dir_text and frame.original_direction:
-                dir_text = frame.original_direction.upper()
-            dir_item = QTableWidgetItem(dir_text)
-            if "主站→子站" in dir_text or "TX" in dir_text or "SEND" in dir_text:
-                dir_item.setForeground(QColor("#E91E63"))
-            elif "子站→主站" in dir_text or "RX" in dir_text or "RECV" in dir_text:
-                dir_item.setForeground(QColor("#2196F3"))
-            dir_item.setBackground(row_color)
-            self.table_widget.setItem(row, 2, dir_item)
-
-            # 信号类型
-            sig_item = QTableWidgetItem(frame.signal_label if frame.signal_label else "-")
-            if frame.signal_type != SignalType.OTHER:
-                sig_item.setForeground(QColor(frame.signal_type.color_hex))
-                sig_item.setFont(QFont(self.font().family(), self.font().pointSize(), QFont.Bold))
-            sig_item.setBackground(row_color)
-            self.table_widget.setItem(row, 3, sig_item)
-
-            # 类型标识
-            if frame.asdu:
-                tid_text = f"{frame.asdu.type_id}: {TypeID.get_description(frame.asdu.type_id)}"
-            else:
-                tid_text = frame.apci.frame_type if frame.apci else "-"
-            self._set_table_item(row, 4, tid_text, row_color)
-
-            # 传送原因
-            if frame.asdu:
-                cot_text = f"({frame.asdu.cot_cause}) {COT.get_description(frame.asdu.cot)}"
-            else:
-                cot_text = "-"
-            self._set_table_item(row, 5, cot_text, row_color)
-
-            # 公共地址
-            ca_text = f"0x{frame.asdu.common_address:04X}" if frame.asdu else "-"
-            self._set_table_item(row, 6, ca_text, row_color)
-
-            # 对象数
-            obj_text = str(frame.asdu.number_of_objects) if frame.asdu else "-"
-            obj_count = frame.asdu.number_of_objects if frame.asdu else 0
-            self._set_table_item(row, 7, obj_text, row_color, sort_key=obj_count)
-
-            # 值 (汇总)
-            if frame.asdu and frame.asdu.information_elements:
-                vals = []
-                for elem in frame.asdu.information_elements:
-                    alias = get_alias(elem.ioa, frame.asdu.common_address)
-                    prefix = f"[{alias}] " if alias else ""
-                    vals.append(f"{prefix}{elem.value_desc}")
-                self._set_table_item(row, 8, " | ".join(vals), row_color)
-            else:
-                self._set_table_item(row, 8, "-", row_color)
-
-            # 描述
-            desc = frame.description if frame.description else (frame.error if frame.error else "")
-            if frame.error:
-                desc = f"❌ {desc}"
-            self._set_table_item(row, 9, desc, row_color)
-
-            # 输入行号
-            fidx = frame.index - 1
-            if fidx < len(line_map) and line_map[fidx]:
-                src_lines = line_map[fidx]
-                line_text = ", ".join(str(n + 1) for n in src_lines)
-                line_sort = src_lines[0] if src_lines else 0
-            else:
-                line_text = "-"
-                line_sort = 0
-            self._set_table_item(row, 10, line_text, row_color, sort_key=line_sort)
-
-            # 时间间隔 (ms)
-            if hasattr(self, '_frame_intervals') and i < len(self._frame_intervals):
-                interval = self._frame_intervals[i]
-                if interval is not None:
-                    interval_text = f"{interval:.0f}ms" if interval > 0 else "-"
-                    interval_item = QTableWidgetItem(interval_text)
-                    if interval > 1000:
-                        interval_item.setForeground(QColor("#F44336"))
-                    elif interval > 500:
-                        interval_item.setForeground(QColor("#FF9800"))
-                    interval_item.setData(Qt.UserRole + 1, interval if interval > 0 else -1)
-                    self.table_widget.setItem(row, 11, interval_item)
-                else:
-                    self._set_table_item(row, 11, "-", row_color)
-            else:
-                self._set_table_item(row, 11, "-", row_color)
-
-        # 恢复更新（排序由 SortableTableWidget 的表头点击处理）
-        self.table_widget.setUpdatesEnabled(True)
-
-        # 恢复书签标记（书签以帧索引存储）
-        if self._bookmarks:
-            for r in range(total_frames):
-                item = self.table_widget.item(r, 0)
-                d = item.data(Qt.UserRole) if item else None
-                if isinstance(d, int) and d in self._bookmarks:
-                    self._update_bookmark_visual(r)
 
         # 调整列宽：优先套用用户上次的列宽（同时避免大表全量自适应卡顿），
         # 没有则按前 300 行采样估算
@@ -2033,20 +1913,188 @@ class MainWindow(QMainWindow):
                 self.table_widget.setColumnWidth(c, wd)
 
         # 自动选中第一条报文
-        if self.all_frames and self.table_widget.rowCount() > 0:
-            self._current_frame_idx = 0
+        self._current_frame_idx = 0
+        if n > 0:
             self.table_widget.selectRow(0)
             self._populate_tree(0)
+        self.table_widget.viewport().update()
 
-    def _set_table_item(self, row: int, col: int, text: str, bg: QColor = None,
-                         sort_key=None):
-        item = QTableWidgetItem(text)
-        if bg:
-            item.setBackground(bg)
-        # 设置自定义排序键（数值列用数值排序）
-        if sort_key is not None:
-            item.setData(Qt.UserRole + 1, sort_key)
-        self.table_widget.setItem(row, col, item)
+    def _set_view(self, display_indices: list):
+        """把表格显示行设为 display_indices（all_frames 的索引序列）。
+
+        统一供填充/过滤/搜索/重置使用：重建 _view_order 与反查表、重设行数、
+        清除上一轮的行隐藏标记，随后整体重绘可见区。
+        """
+        self._view_order = [int(x) for x in display_indices]
+        self._frame_to_row = {fi: vi for vi, fi in enumerate(self._view_order)}
+        self._base_order = list(self._view_order)
+        self._pre_search_order = []
+        self.table_widget.setRowCount(0)
+        self.table_widget.setRowCount(len(self._view_order))
+        for r in range(len(self._view_order)):
+            self.table_widget.setRowHidden(r, False)
+        self.table_widget.viewport().update()
+
+    def _cell(self, vi: int, col: int) -> dict:
+        """视图行 vi、列 col 的单元格内容（FrameCellDelegate 绘制时调用）。"""
+        if not (0 <= vi < len(self._view_order)):
+            return self._frame_cell(-1, col)
+        fi = self._view_order[vi]
+        if not (0 <= fi < len(self.all_frames)):
+            return self._frame_cell(-1, col)
+        return self._frame_cell(fi, col)
+
+    def _frame_cell(self, fi: int, col: int) -> dict:
+        """帧索引 fi、列 col 的单元格内容（供 _cell 与搜索匹配复用）。
+
+        返回 dict：text / bg / fg / bold / align 以及 sort 排序键。
+        """
+        empty = {"text": "-", "bg": QColor("#FFFFFF"), "fg": None,
+                 "bold": False, "align": Qt.AlignLeft | Qt.AlignVCenter,
+                 "sort": None}
+        if not (0 <= fi < len(self.all_frames)):
+            return empty
+        frame = self.all_frames[fi]
+        row_color = self._row_color_for_frame(frame)
+        i = fi
+        line_map = getattr(self, '_frame_input_lines', [])
+
+        # 序号（书签帧在行首以 📌 标记）
+        text = str(frame.index)
+        if frame.index - 1 in self._bookmarks:
+            text = "📌 " + text
+        if col == 0:
+            return {"text": text, "bg": row_color, "fg": None, "bold": False,
+                    "align": Qt.AlignLeft | Qt.AlignVCenter, "sort": frame.index}
+
+        if col == 1:  # 原始时间
+            ts_text = frame.original_timestamp if frame.original_timestamp else "-"
+            return {"text": ts_text, "bg": row_color,
+                    "sort": self._timestamp_to_sort_key(frame.original_timestamp)}
+
+        if col == 2:  # 方向
+            dir_text = frame.direction
+            if not dir_text and frame.original_direction:
+                dir_text = frame.original_direction.upper()
+            fg = None
+            if "主站→子站" in dir_text or "TX" in dir_text or "SEND" in dir_text:
+                fg = QColor("#E91E63")
+            elif "子站→主站" in dir_text or "RX" in dir_text or "RECV" in dir_text:
+                fg = QColor("#2196F3")
+            return {"text": dir_text, "bg": row_color, "fg": fg, "sort": None}
+
+        if col == 3:  # 信号类型
+            label = frame.signal_label if frame.signal_label else "-"
+            is_sig = frame.signal_type != SignalType.OTHER
+            return {"text": label, "bg": row_color,
+                    "fg": QColor(frame.signal_type.color_hex) if is_sig else None,
+                    "bold": is_sig, "sort": None}
+
+        if col == 4:  # 类型标识
+            tid_text = (f"{frame.asdu.type_id}: "
+                        f"{TypeID.get_description(frame.asdu.type_id)}"
+                        if frame.asdu else
+                        (frame.apci.frame_type if frame.apci else "-"))
+            return {"text": tid_text, "bg": row_color, "sort": None}
+
+        if col == 5:  # 传送原因
+            cot_text = (f"({frame.asdu.cot_cause}) "
+                        f"{COT.get_description(frame.asdu.cot)}"
+                        if frame.asdu else "-")
+            return {"text": cot_text, "bg": row_color, "sort": None}
+
+        if col == 6:  # 公共地址
+            ca_text = f"0x{frame.asdu.common_address:04X}" if frame.asdu else "-"
+            return {"text": ca_text, "bg": row_color, "sort": None}
+
+        if col == 7:  # 对象数
+            obj_text = str(frame.asdu.number_of_objects) if frame.asdu else "-"
+            obj_count = frame.asdu.number_of_objects if frame.asdu else 0
+            return {"text": obj_text, "bg": row_color, "sort": obj_count}
+
+        if col == 8:  # 值（汇总）
+            if frame.asdu and frame.asdu.information_elements:
+                vals = []
+                for elem in frame.asdu.information_elements:
+                    alias = get_alias(elem.ioa, frame.asdu.common_address)
+                    prefix = f"[{alias}] " if alias else ""
+                    vals.append(f"{prefix}{elem.value_desc}")
+                text = " | ".join(vals)
+            else:
+                text = "-"
+            return {"text": text, "bg": row_color, "sort": None}
+
+        if col == 9:  # 描述
+            desc = frame.description if frame.description else (
+                frame.error if frame.error else "")
+            if frame.error:
+                desc = f"❌ {desc}"
+            return {"text": desc, "bg": row_color, "sort": None}
+
+        if col == 10:  # 输入行号
+            fidx = frame.index - 1
+            if fidx < len(line_map) and line_map[fidx]:
+                src_lines = line_map[fidx]
+                line_text = ", ".join(str(n + 1) for n in src_lines)
+                line_sort = src_lines[0] if src_lines else 0
+            else:
+                line_text = "-"
+                line_sort = 0
+            return {"text": line_text, "bg": row_color, "sort": line_sort}
+
+        if col == 11:  # 时间间隔 (ms)
+            if i < len(self._frame_intervals):
+                interval = self._frame_intervals[i]
+                if interval is not None:
+                    text = f"{interval:.0f}ms" if interval > 0 else "-"
+                    fg = None
+                    if interval > 1000:
+                        fg = QColor("#F44336")
+                    elif interval > 500:
+                        fg = QColor("#FF9800")
+                    return {"text": text, "bg": row_color, "fg": fg,
+                            "sort": interval if interval > 0 else -1}
+            return {"text": "-", "bg": row_color, "sort": -1}
+
+        return empty
+
+    def _on_header_sort(self, col: int):
+        """表头点击 → 按该列对 _view_order 排序（数值优先，文本回退）"""
+        # 排序会重排各行内容，先清除搜索隐藏，避免“隐藏行显示错位”
+        self._clear_search_rows()
+        if self._sort_column == col:
+            self._sort_order = (Qt.DescendingOrder
+                                if self._sort_order == Qt.AscendingOrder
+                                else Qt.AscendingOrder)
+        else:
+            self._sort_column = col
+            self._sort_order = Qt.AscendingOrder
+
+        self._sort_view_by(col, self._sort_order)
+        self.table_widget.horizontalHeader().setSortIndicator(
+            col, self._sort_order)
+        self.table_widget.viewport().update()
+
+    def _sort_view_by(self, col: int, order: int):
+        """按列排序 _view_order，采用与旧版一致的“数值优先/文本回退”规则"""
+        if not self._view_order:
+            return
+
+        def key_of(vi):
+            cell = self._cell(vi, col)
+            sk = cell.get("sort")
+            if sk is None:
+                # 无数值：按显示文本兜底，排在有数值行之后
+                return (False, 0, cell["text"])
+            if isinstance(sk, bool):
+                return (True, float(sk), cell["text"])
+            try:
+                return (True, float(sk), cell["text"])
+            except (TypeError, ValueError):
+                return (False, 0, cell["text"])
+
+        self._view_order.sort(key=key_of, reverse=(order == Qt.DescendingOrder))
+        self._frame_to_row = {fi: vi for vi, fi in enumerate(self._view_order)}
 
     def _populate_tree(self, frame_index: int):
         """填充解析树"""
@@ -2283,21 +2331,14 @@ class MainWindow(QMainWindow):
     # ==================================================================
 
     def _frame_idx_at_row(self, row: int) -> int:
-        """视图行号 -> all_frames 索引（表头排序后行序会变，需经此转换）"""
-        item = self.table_widget.item(row, 0)
-        if item is not None:
-            data = item.data(Qt.UserRole)
-            if isinstance(data, int):
-                return data
+        """视图行号 -> all_frames 索引（经 _view_order 映射，排序/搜索后仍正确）"""
+        if 0 <= row < len(self._view_order):
+            return self._view_order[row]
         return row
 
     def _row_of_frame(self, frame_idx: int) -> int:
         """all_frames 索引 -> 视图行号；找不到返回 -1"""
-        for r in range(self.table_widget.rowCount()):
-            item = self.table_widget.item(r, 0)
-            if item is not None and item.data(Qt.UserRole) == frame_idx:
-                return r
-        return -1
+        return self._frame_to_row.get(frame_idx, -1)
 
     def _on_table_click(self, row: int, col: int):
         """表格行单击 -> 更新解析详情（不切换标签页）"""
@@ -2716,11 +2757,12 @@ class MainWindow(QMainWindow):
 
     def _current_frame_index(self) -> int:
         """获取当前展示的报文索引"""
-        for i in range(self.table_widget.rowCount()):
-            item = self.table_widget.item(i, 0)
-            if item and item.isSelected():
-                return i
-        return 0
+        sel = self.table_widget.selectionModel()
+        if sel and sel.hasSelection():
+            rows = sel.selectedRows()
+            if rows:
+                return self._frame_idx_at_row(rows[0].row())
+        return self._frame_idx_at_row(self.table_widget.currentRow())
 
     # ==================================================================
     # 拖放文件支持
@@ -2845,18 +2887,21 @@ class MainWindow(QMainWindow):
         self._search_timer.stop()
         if not text:
             # 空内容立即清除过滤，不等防抖
-            for i in range(self.table_widget.rowCount()):
-                self.table_widget.setRowHidden(i, False)
+            self._clear_search_rows()
             self.lbl_search_count.setText("")
             return
         self._search_timer.start()
+
+    def _clear_search_rows(self):
+        """取消所有行的搜索隐藏状态"""
+        for i in range(self.table_widget.rowCount()):
+            self.table_widget.setRowHidden(i, False)
 
     def _do_search(self):
         """实际执行搜索（防抖后触发）"""
         text = self.search_input.text()
         if not text:
-            for i in range(self.table_widget.rowCount()):
-                self.table_widget.setRowHidden(i, False)
+            self._clear_search_rows()
             self.lbl_search_count.setText("")
             return
 
@@ -2866,14 +2911,13 @@ class MainWindow(QMainWindow):
             pattern = re.compile(re.escape(text), re.IGNORECASE)
 
         match_count = 0
-        for i in range(self.table_widget.rowCount()):
+        for vi in range(self.table_widget.rowCount()):
             row_match = False
-            for j in range(self.table_widget.columnCount()):
-                item = self.table_widget.item(i, j)
-                if item and pattern.search(item.text()):
+            for j in range(12):
+                if pattern.search(self._cell(vi, j)["text"]):
                     row_match = True
                     break
-            self.table_widget.setRowHidden(i, not row_match)
+            self.table_widget.setRowHidden(vi, not row_match)
             if row_match:
                 match_count += 1
 
@@ -3176,16 +3220,8 @@ class MainWindow(QMainWindow):
             self._update_bookmark_visual(target_row)
 
     def _update_bookmark_visual(self, row: int):
-        """更新书签行的视觉效果（row 为视图行号）"""
-        item = self.table_widget.item(row, 0)
-        if not item:
-            return
-        idx_val = item.data(Qt.UserRole + 1)
-        base_text = str(idx_val) if isinstance(idx_val, int) else str(row + 1)
-        if self._frame_idx_at_row(row) in self._bookmarks:
-            item.setText(f"📌 {base_text}")
-        else:
-            item.setText(base_text)
+        """更新书签行的视觉效果——刷新该行，由 _cell(列0) 依据书签集合画 📌 前缀"""
+        self.table_widget.viewport().update()
 
     def _select_bookmark_row(self, frame_idx: int):
         """按帧索引选中对应表格行并刷新详情"""
@@ -3332,11 +3368,9 @@ class MainWindow(QMainWindow):
         max_w = [40] * cols
         for r in range(rows):
             for c in range(cols):
-                item = self.table_widget.item(r, c)
-                if item:
-                    w = fm.horizontalAdvance(item.text()) + 28
-                    if w > max_w[c]:
-                        max_w[c] = w
+                w = fm.horizontalAdvance(self._cell(r, c)["text"]) + 28
+                if w > max_w[c]:
+                    max_w[c] = w
         return [min(w, 420) for w in max_w]
 
     def _on_about(self):
@@ -3577,13 +3611,21 @@ class MainWindow(QMainWindow):
         self._filter_active = has_criteria
         self._filter_counts = (len(filtered), total_count) if has_criteria else None
 
-        saved = self.all_frames
-        try:
-            self.all_frames = filtered
-            self._populate_table()
-            self._update_status_stats()
-        finally:
-            self.all_frames = saved
+        # 显示子集：用匹配帧在 all_frames 中的索引重建 _view_order。
+        # all_frames 恒为全量，点击/导出经 _frame_idx_at_row 映射到正确帧（修复旧实现
+        # 在过滤后点击/导出错位的隐患）。
+        if has_criteria:
+            frame_to_idx = {id(f): i for i, f in enumerate(self.all_frames)}
+            display = [frame_to_idx[id(f)] for f in filtered]
+            self._set_view(display)
+        else:
+            self._set_view(list(range(total_count)))
+        self._update_status_stats()
+        # 过滤后自动选中首行并刷新解析详情（与旧 _populate_table 行为一致）
+        if self._view_order:
+            self._current_frame_idx = 0
+            self.table_widget.selectRow(0)
+            self._populate_tree(0)
 
         self.filter_btn.setStyleSheet(
             FILTER_BTN_STYLE_ACTIVE if has_criteria else FILTER_BTN_STYLE_IDLE)
