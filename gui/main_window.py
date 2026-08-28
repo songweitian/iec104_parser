@@ -2080,8 +2080,11 @@ class MainWindow(QMainWindow):
         if not self._view_order:
             return
 
-        def key_of(vi):
-            cell = self._cell(vi, col)
+        def key_of(fi):
+            # sort 传递给 key_of 的是 _view_order 的元素——即“帧索引”fi，
+            # 因此直接用 _frame_cell(fi, col) 取键；若用 _cell(vi, col) 会把
+            # fi 当成视图行再做一层 _view_order 反查，非恒等视图时键会错乱。
+            cell = self._frame_cell(fi, col)
             sk = cell.get("sort")
             if sk is None:
                 # 无数值：按显示文本兜底，排在有数值行之后
