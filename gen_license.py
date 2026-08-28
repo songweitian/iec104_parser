@@ -48,10 +48,14 @@ def generate_keypair(force: bool = False):
 
     with open(KEY_FILE, "w") as f:
         f.write(priv.private_bytes_raw().hex())
-    try:
-        os.chmod(KEY_FILE, 0o600)
-    except OSError:
-        pass  # Windows 某些文件系统不支持 chmod，忽略
+    if os.name != "nt":
+        # 仅 POSIX 下收紧权限；Windows 无 POSIX 权限位，chmod 无效
+        try:
+            os.chmod(KEY_FILE, 0o600)
+        except OSError:
+            pass
+    else:
+        print("  提示: Windows 下无法设置 POSIX 文件权限，请确保私钥目录不被他人访问")
 
     print(f"已生成密钥对:")
     print(f"  私钥文件: {KEY_FILE}")

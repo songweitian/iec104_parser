@@ -32,6 +32,8 @@ _PERMANENT_TOKEN = "0"
 
 # 旧版（HMAC 对称签名）激活码格式：32 hex（4×4 带横线或无横线），可选日期后缀。
 # 仅供参考换码提示用，识别宽松些（新 Ed25519 码为 86 字符 base64url，不会误判）。
+# TODO(下版本): 旧激活体系已停用数月，若确认无存量用户使用旧码，
+# 可移除本段（_LEGACY_CODE_RE / is_legacy_code 及其在 activate 中的换码提示）。
 _LEGACY_CODE_RE = re.compile(
     r'^([0-9A-F]{4}(?:-[0-9A-F]{4}){3}|[0-9A-F]{32})(?:-\d{4}-\d{2}-\d{2})?$')
 

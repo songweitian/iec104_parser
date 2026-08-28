@@ -14,18 +14,20 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM 检测依赖
-python -c "import PyQt5" >nul 2>&1
+REM 校验 Python 主版本 >= 3.8（L4 修复）
+python -c "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)" >nul 2>&1
 if errorlevel 1 (
-    echo [安装] 正在安装依赖...
-    pip install PyQt5 -i https://pypi.tuna.tsinghua.edu.cn/simple
+    echo [错误] Python 版本过低，本项目需要 Python 3.8+（当前版本见下方）
+    python --version
+    pause
+    exit /b 1
 )
 
-REM 检测cryptography依赖（Ed25519 激活码验签需要）
-python -c "import cryptography" >nul 2>&1
+REM 检测并安装依赖（统一按 requirements.txt 安装，避免版本漂移）
+python -c "import PyQt5, cryptography" >nul 2>&1
 if errorlevel 1 (
-    echo [安装] 正在安装 cryptography 依赖...
-    pip install cryptography -i https://pypi.tuna.tsinghua.edu.cn/simple
+    echo [安装] 正在安装依赖（PyQt5 / cryptography）...
+    pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 )
 
 REM 检测PyInstaller

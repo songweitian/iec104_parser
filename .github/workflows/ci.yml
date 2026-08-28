@@ -1,0 +1,65 @@
+# 持续集成：Windows 全流程（测试 + 打包冒烟验证）
+# 触发：main 分支 push / PR / 手动 workflow_dispatch
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: pytest (${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.8", "3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+
+      - name: 运行测试
+        run: python -m pytest tests/ -q -p no:cacheprovider
+
+  build:
+    name: Windows 打包验证
+    runs-on: windows-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: 安装依赖与 PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest pyinstaller
+
+      - name: 运行测试
+        run: python -m pytest tests/ -q -p no:cacheprovider
+
+      - name: 打包
+        run: python -m PyInstaller --name="IEC104_Parser" --onedir --windowed --icon=assets\app.ico --exclude-module gen_license --noconfirm --clean main.py
+
+      - name: 验证产物不含签码工具与私钥
+        run: |
+          python -c "import os; root='dist/IEC104_Parser'; assert os.path.exists(os.path.join(root,'IEC104_Parser.exe')), 'exe not found'; files='\n'.join(os.listdir(root)); assert 'gen_license' not in files and 'license_ed25519.key' not in files, 'dangerous file leaked!'; print('OK: 产物安全, 共', len(files), '项')"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: IEC104_Parser-windows
+          path: dist/IEC104_Parser

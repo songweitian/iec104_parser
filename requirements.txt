@@ -1,2 +1,4 @@
-PyQt5>=5.15.0
-cryptography>=42
+# 运行时依赖（L4 依赖锁定）
+# PyQt5 5.15 为最后一代 PyQt5；cryptography 42 起要求 Python>=3.7（项目要求 3.8+）
+PyQt5>=5.15.0,<5.16
+cryptography>=42,<47
