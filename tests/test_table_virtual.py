@@ -8,18 +8,21 @@ D6 重构把报文列表从“每帧创建 12 个 QTableWidgetItem”改为 QSty
 _cell() 内容也必须与原逐帧填充语义一致。
 
 依赖 PyQt5；离屏平台不渲染文字，但 _cell() 取值与映射逻辑不依赖渲染，可正常断言。
+
+注意：路径注入 / 离屏平台 / 授权文件隔离已在 tests/conftest.py 统一处理，
+本文件若独立运行仍需下列等价设置（pytest 下会被 conftest 覆盖为相同值）。
 """
 import os
 import sys
 
-# 必须在创建 QApplication 前指定离屏平台，避免弹出真实窗口
+# 独立运行兼容：确保 sys.path 与授权隔离与 conftest 一致（pytest 下已设置，重复无害）
+if os.path.dirname(os.path.dirname(os.path.abspath(__file__))) not in sys.path:
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-# 隔离真实授权文件，避免测试受本机激活状态影响
 import license as L
-L.LICENSE_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                              "config", "__test_no_license__.dat")
+if not L.LICENSE_FILE.endswith("__test_no_license__.dat"):
+    L.LICENSE_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                  "config", "__test_no_license__.dat")
 
 from PyQt5.QtWidgets import QApplication
 
