@@ -55,6 +55,9 @@ class SimulatorDialog(QDialog):
         self._current_points = {}
         self._yc_edit_timers = {}
         self._block_cell_changed = False  # 阻止 cellChanged 信号
+        # 遥控/遥调操作控件引用：{ioa: {"btn_on":.., "btn_off":.., "btn_set":.., "btn_select":..}}
+        self._yk_ops = {}
+        self._yt_ops = {}
         # 角色切换确认状态（记录上次角色，切换被拒时回退下拉框）
         self._last_role_index = 0
         self._suppress_role_confirm = False
@@ -133,6 +136,15 @@ class SimulatorDialog(QDialog):
         )
         self.btn_stop.clicked.connect(self._on_stop)
         conn_layout.addWidget(self.btn_stop)
+
+        # SBO 预制总开关（主站遥控/遥调：开启时需先"预制"才能执行）
+        self.chk_sbo = QCheckBox("启用预制")
+        self.chk_sbo.setChecked(True)
+        self.chk_sbo.setToolTip(
+            "开启：遥控/遥调需先点\"预制\"，预制确认后方可执行（SBO 安全流程）\n"
+            "关闭：点击合/分/设定直接执行")
+        self.chk_sbo.stateChanged.connect(self._on_sbo_toggled)
+        conn_layout.addWidget(self.chk_sbo)
 
         # 分隔
         conn_layout.addStretch()
@@ -467,6 +479,7 @@ class SimulatorDialog(QDialog):
         self.simulator.connection_established.connect(self._on_connected)
         self.simulator.connection_lost.connect(self._on_disconnected)
         self.simulator.point_updated.connect(self._on_point_updated)
+        self.simulator.control_ack.connect(self._on_control_ack)
 
         if role == SimulatorRole.SLAVE:
             self.simulator.start_server(host, port)
@@ -792,34 +805,48 @@ class SimulatorDialog(QDialog):
 
             if is_slave:
                 self.yk_table.setItem(i, 5, QTableWidgetItem("(等待主站遥控)"))
+                self._yk_ops.pop(pt.ioa, None)
             else:
                 ops = QWidget()
                 ops_layout = QHBoxLayout(ops)
                 ops_layout.setContentsMargins(4, 2, 4, 2)
                 ops_layout.setSpacing(6)
-                # SBO 预制模式选择：勾选=预制(选择)，取消=直接执行
-                chk = QCheckBox("预制")
-                chk.setToolTip("勾选后发送 SBO 选择命令；不勾选直接执行")
-                chk.setStyleSheet("QCheckBox { color: #e0e0e0; }")
+                # 独立预制按钮：发送 SBO 选择命令，确认后点亮合/分
+                btn_select = QPushButton("预制")
+                btn_select.setStyleSheet(
+                    "QPushButton { background-color: #FF9800; color: white; padding: 3px 10px; border-radius: 3px; border: none; }"
+                    "QPushButton:hover { background-color: #F57C00; }"
+                )
+                btn_select.clicked.connect(
+                    lambda _, ioa=pt.ioa: self._on_yk_select(ioa))
                 btn_on = QPushButton("合")
                 btn_on.setStyleSheet(
                     "QPushButton { background-color: #4CAF50; color: white; padding: 3px 10px; border-radius: 3px; border: none; }"
                     "QPushButton:hover { background-color: #388E3C; }"
                 )
                 btn_on.clicked.connect(
-                    lambda _, ioa=pt.ioa, c=chk: self._on_yk_command(ioa, 1, c.isChecked()))
+                    lambda _, ioa=pt.ioa: self._on_yk_command(ioa, 1))
                 btn_off = QPushButton("分")
                 btn_off.setStyleSheet(
                     "QPushButton { background-color: #9E9E9E; color: white; padding: 3px 10px; border-radius: 3px; border: none; }"
                     "QPushButton:hover { background-color: #757575; }"
                 )
                 btn_off.clicked.connect(
-                    lambda _, ioa=pt.ioa, c=chk: self._on_yk_command(ioa, 0, c.isChecked()))
-                ops_layout.addWidget(chk)
+                    lambda _, ioa=pt.ioa: self._on_yk_command(ioa, 0))
+                # 启用预制时合/分初始禁用，等待预制确认后点亮
+                sbo_on = self.chk_sbo.isChecked()
+                btn_on.setEnabled(not sbo_on)
+                btn_off.setEnabled(not sbo_on)
+                btn_select.setEnabled(sbo_on)
+                ops_layout.addWidget(btn_select)
                 ops_layout.addWidget(btn_on)
                 ops_layout.addWidget(btn_off)
                 ops_layout.addStretch()
                 self.yk_table.setCellWidget(i, 5, ops)
+                self._yk_ops[pt.ioa] = {
+                    "btn_on": btn_on, "btn_off": btn_off,
+                    "btn_select": btn_select, "selected": False,
+                }
 
     def _refresh_yt_table(self):
         """刷新遥调表格"""
@@ -841,26 +868,44 @@ class SimulatorDialog(QDialog):
 
             if is_slave:
                 self.yt_table.setItem(i, 5, QTableWidgetItem("(等待主站遥调)"))
+                self._yt_ops.pop(pt.ioa, None)
             else:
                 ops = QWidget()
                 ops_layout = QHBoxLayout(ops)
                 ops_layout.setContentsMargins(4, 2, 4, 2)
                 ops_layout.setSpacing(6)
+                # 独立预制按钮：发送 SBO 选择命令，确认后点亮设定
+                btn_select = QPushButton("预制")
+                btn_select.setStyleSheet(
+                    "QPushButton { background-color: #FF9800; color: white; padding: 3px 10px; border-radius: 3px; border: none; }"
+                    "QPushButton:hover { background-color: #F57C00; }"
+                )
+                btn_select.clicked.connect(
+                    lambda _, ioa=pt.ioa: self._on_yt_select(ioa))
                 spin = QDoubleSpinBox()
                 spin.setRange(-999999, 999999)
                 spin.setDecimals(2)
                 spin.setValue(float(pt.value) if pt.value is not None else 0)
                 spin.setMaximumWidth(100)
+                ops_layout.addWidget(btn_select)
                 ops_layout.addWidget(spin)
                 btn_set = QPushButton("设定")
                 btn_set.setStyleSheet(
                     "QPushButton { background-color: #2196F3; color: white; padding: 3px 10px; border-radius: 3px; border: none; }"
                     "QPushButton:hover { background-color: #1565C0; }"
                 )
-                btn_set.clicked.connect(lambda _, ioa=pt.ioa, s=spin: self._on_yt_command(ioa, s.value()))
+                btn_set.clicked.connect(
+                    lambda _, ioa=pt.ioa, s=spin: self._on_yt_command(ioa, s.value()))
+                sbo_on = self.chk_sbo.isChecked()
+                btn_set.setEnabled(not sbo_on)
+                btn_select.setEnabled(sbo_on)
                 ops_layout.addWidget(btn_set)
                 ops_layout.addStretch()
                 self.yt_table.setCellWidget(i, 5, ops)
+                self._yt_ops[pt.ioa] = {
+                    "btn_set": btn_set, "btn_select": btn_select,
+                    "spin": spin, "selected": False,
+                }
 
     # ==================================================================
     # 主站操作
@@ -917,23 +962,125 @@ class SimulatorDialog(QDialog):
         if self.simulator and old_val != value:
             self.simulator.set_point_value(ioa, value)
 
-    def _on_yk_command(self, ioa, value, select=False):
-        """遥控命令（type 45 单点命令）
+    # ==================================================================
+    # SBO 预制（遥控/遥调）
+    # ==================================================================
 
-        select: True=预制(选择)，False=直接执行
+    def _on_sbo_toggled(self):
+        """启用预制总开关切换：更新所有遥控/遥调控件可用状态
+
+        启用预制：合/分/设定需先"预制"确认后才能用；
+        关闭预制：合/分/设定直接可用（跳过 SBO）。
         """
-        if self.simulator and self.simulator.is_connected:
-            self.simulator.send_i_frame(
-                type_id=45, cot=6, common_addr=1, ioa=ioa, value=value, select=select)
+        sbo_on = self.chk_sbo.isChecked()
+        for ops in self._yk_ops.values():
+            ops["btn_on"].setEnabled(not sbo_on or ops["selected"])
+            ops["btn_off"].setEnabled(not sbo_on or ops["selected"])
+            ops["btn_select"].setEnabled(sbo_on)
+            if not sbo_on:
+                ops["selected"] = False
+                ops["btn_select"].setText("预制")
+        for ops in self._yt_ops.values():
+            ops["btn_set"].setEnabled(not sbo_on or ops["selected"])
+            ops["btn_select"].setEnabled(sbo_on)
+            if not sbo_on:
+                ops["selected"] = False
+                ops["btn_select"].setText("预制")
+        self._append_log(
+            f"[SBO] {'启用' if sbo_on else '关闭'}预制流程："
+            f"{'遥控/遥调需先预制后执行' if sbo_on else '遥控/遥调直接执行'}")
 
-    def _on_yt_command(self, ioa, value, select=False):
-        """遥调命令（type 50 短浮点设点）
+    def _on_yk_select(self, ioa):
+        """遥控预制：发送 SBO 选择命令"""
+        if not self.simulator or not self.simulator.is_connected:
+            QMessageBox.warning(self, "提示", "请先启动连接")
+            return
+        self.simulator.send_i_frame(
+            type_id=45, cot=6, common_addr=1, ioa=ioa, value=1, select=True)
+        self._append_log(f"[主站] 发送遥控预制 IOA=0x{ioa:04X}，等待确认...")
 
-        select: True=预制(选择)，False=直接执行
+    def _on_yt_select(self, ioa):
+        """遥调预制：发送 SBO 选择命令（设点短浮点）"""
+        if not self.simulator or not self.simulator.is_connected:
+            QMessageBox.warning(self, "提示", "请先启动连接")
+            return
+        ops = self._yt_ops.get(ioa)
+        spin = ops.get("spin") if ops else None
+        value = spin.value() if spin else 0.0
+        self.simulator.send_i_frame(
+            type_id=50, cot=6, common_addr=1, ioa=ioa, value=value, select=True)
+        self._append_log(f"[主站] 发送遥调预制 IOA=0x{ioa:04X} 值={value}，等待确认...")
+
+    def _on_control_ack(self, ioa, cot, tid):
+        """收到从站控制命令确认（COT=7 确认 / COT=8 终止）"""
+        if cot == 7:
+            # 选择确认 → 点亮该点位的执行按钮
+            if tid == 45:
+                ops = self._yk_ops.get(ioa)
+                if ops:
+                    ops["selected"] = True
+                    ops["btn_on"].setEnabled(True)
+                    ops["btn_off"].setEnabled(True)
+                    ops["btn_select"].setText("已预制")
+            elif tid == 50:
+                ops = self._yt_ops.get(ioa)
+                if ops:
+                    ops["selected"] = True
+                    ops["btn_set"].setEnabled(True)
+                    ops["btn_select"].setText("已预制")
+            self._append_log(f"[主站] 预制确认成功 IOA=0x{ioa:04X}，可执行")
+        elif cot == 8:
+            self._reset_select(ioa, tid)
+            self._append_log(f"[主站] 预制失败 IOA=0x{ioa:04X} (COT=8 激活终止)")
+
+    def _reset_select(self, ioa, tid):
+        """重置某点位的预制状态（执行后或预制失败后）"""
+        ops = self._yk_ops.get(ioa) if tid == 45 else self._yt_ops.get(ioa)
+        if not ops:
+            return
+        ops["selected"] = False
+        sbo_on = self.chk_sbo.isChecked()
+        if "btn_on" in ops:
+            ops["btn_on"].setEnabled(False)
+            ops["btn_off"].setEnabled(False)
+        else:
+            ops["btn_set"].setEnabled(False)
+        ops["btn_select"].setEnabled(sbo_on)
+        ops["btn_select"].setText("预制")
+
+    def _on_yk_command(self, ioa, value):
+        """遥控执行（type 45 单点命令）
+
+        启用预制时：仅已预制成功的点位可执行；执行后重置预制状态。
+        关闭预制时：直接执行。
         """
-        if self.simulator and self.simulator.is_connected:
-            self.simulator.send_i_frame(
-                type_id=50, cot=6, common_addr=1, ioa=ioa, value=value, select=select)
+        if not self.simulator or not self.simulator.is_connected:
+            QMessageBox.warning(self, "提示", "请先启动连接")
+            return
+        if self.chk_sbo.isChecked():
+            ops = self._yk_ops.get(ioa)
+            if not ops or not ops["selected"]:
+                QMessageBox.warning(self, "提示", "请先预制该点位，预制确认后方可执行")
+                return
+        self.simulator.send_i_frame(
+            type_id=45, cot=6, common_addr=1, ioa=ioa, value=value, select=False)
+        self._append_log(f"[主站] 执行遥控 IOA=0x{ioa:04X} 值={value}")
+        self._reset_select(ioa, 45)
+
+    def _on_yt_command(self, ioa, value):
+        """遥调执行（type 50 短浮点设点）"""
+        if not self.simulator or not self.simulator.is_connected:
+            QMessageBox.warning(self, "提示", "请先启动连接")
+            return
+        if self.chk_sbo.isChecked():
+            ops = self._yt_ops.get(ioa)
+            if not ops or not ops["selected"]:
+                QMessageBox.warning(self, "提示", "请先预制该点位，预制确认后方可执行")
+                return
+        self.simulator.send_i_frame(
+            type_id=50, cot=6, common_addr=1, ioa=ioa, value=value, select=False)
+        self._append_log(f"[主站] 执行遥调 IOA=0x{ioa:04X} 值={value}")
+        self._reset_select(ioa, 50)
 
     def _on_auto_send_changed(self, state):
         if self.simulator:
@@ -1043,6 +1190,10 @@ class SimulatorDialog(QDialog):
                 self.lbl_status.setText("● 连接失败")
                 self.lbl_status.setStyleSheet("color: #f44336; font-weight: bold;")
                 self.lbl_status.setToolTip(msg[:200])
+
+    def _append_log(self, msg):
+        """本地操作日志（非协议收发）"""
+        self._add_log_row("", "本地", msg)
 
     def _on_log(self, msg):
         direction = "收" if "[收]" in msg else ("发" if "[发]" in msg else "")

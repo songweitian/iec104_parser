@@ -195,6 +195,51 @@ class TestSBOSelectBeforeOperate:
         assert ioa not in sim._select_locks
 
 
+class TestControlAckSignal:
+    """主站收到从站控制确认帧时发出 control_ack 信号（GUI 依赖此点亮按钮）"""
+
+    def _make_master(self):
+        sim = _make(SimulatorRole.MASTER)
+        sim._set_state(ConnectionState.STARTED)
+        sim.points = create_default_points(yx_count=2, yc_count=0)
+        sim._sent = []
+        sim._send_raw = lambda h: (sim._sent.append(h), True)[1]
+        return sim
+
+    def test_select_confirm_emits_ack(self):
+        """从站回 COT=7(选择确认) → 主站发出 (ioa, 7, 45)"""
+        sim = self._make_master()
+        acks = []
+        sim.control_ack.connect(lambda i, c, t: acks.append((i, c, t)))
+        ioa = sorted(sim.points.keys())[0]
+        # 从站选择确认帧: type 45, COT=7, S/E=0
+        hex_str = generate_i_frame(45, 7, 1, ioa, 0x01,
+                                   send_seq=0, recv_seq=0, select=True)
+        sim._handle_i_frame_received(sim._parser.parse_hex(hex_str))
+        assert acks == [(ioa, 7, 45)]
+
+    def test_activation_termination_emits_ack(self):
+        """从站回 COT=8(激活终止) → 主站发出 (ioa, 8, 45)"""
+        sim = self._make_master()
+        acks = []
+        sim.control_ack.connect(lambda i, c, t: acks.append((i, c, t)))
+        ioa = sorted(sim.points.keys())[0]
+        hex_str = generate_i_frame(45, 8, 1, ioa, 0x81,
+                                   send_seq=0, recv_seq=0, select=False)
+        sim._handle_i_frame_received(sim._parser.parse_hex(hex_str))
+        assert acks == [(ioa, 8, 45)]
+
+    def test_data_frame_no_ack(self):
+        """普通测量数据帧不应触发 control_ack"""
+        sim = self._make_master()
+        acks = []
+        sim.control_ack.connect(lambda i, c, t: acks.append((i, c, t)))
+        hex_str = generate_i_frame(9, 3, 1, 0x4001, 100,
+                                   send_seq=0, recv_seq=0)
+        sim._handle_i_frame_received(sim._parser.parse_hex(hex_str))
+        assert acks == []
+
+
 class TestPoints:
     def test_create_default_points(self):
         pts = create_default_points(yx_count=3, yc_count=2)

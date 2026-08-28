@@ -120,6 +120,7 @@ class IEC104Simulator(QThread):
     connection_established = pyqtSignal()  # 连接建立
     connection_lost = pyqtSignal()         # 连接断开
     point_updated = pyqtSignal(int, object)  # 点位更新 (ioa, PointData)
+    control_ack = pyqtSignal(int, int, int)  # 控制命令确认 (ioa, cot_cause, tid)
 
     def __init__(self, role: SimulatorRole = SimulatorRole.MASTER, parent=None):
         super().__init__(parent)
@@ -637,10 +638,19 @@ class IEC104Simulator(QThread):
                 pt.quality = elem.quality.raw
             self.point_updated.emit(ioa, pt)
 
+    _CONTROL_TIDS = {13, 14, 45, 46, 47, 48, 49, 50, 61, 62, 63}
+
     def _auto_reply_master(self, frame):
         """主站自动回复逻辑"""
         if not frame.asdu:
             return
+        # 识别从站返回的控制命令确认/终止（COT=7/8/9/10）
+        tid = frame.asdu.type_id
+        cot = frame.asdu.cot_cause
+        if tid in self._CONTROL_TIDS and cot in (7, 8, 9, 10) \
+                and frame.asdu.information_elements:
+            ioa = frame.asdu.information_elements[0].ioa
+            self.control_ack.emit(ioa, cot, tid)
         # 更新点位数据
         self._update_point_from_frame(frame)
 
