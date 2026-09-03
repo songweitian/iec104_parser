@@ -17,7 +17,7 @@ from PyQt5.QtWidgets import QApplication
 _APP = QApplication.instance() or QApplication([])
 
 from iec104_parser import IEC104Parser, ParseMode, split_concatenated_frames
-from gui.parse_worker import ParseWorker
+from gui.parse_worker import ParseWorker, parse_text_sync
 
 
 # ---------------------------------------------------------------
@@ -221,6 +221,40 @@ class TestFrameLimit:
         frames = _run_sync(w)
         assert len(frames) == 1
         assert w.hit_frame_limit is True
+
+
+class TestParseTextSync:
+    """同步解析入口：对比对话框等场景与主界面共用的唯一解析路径。
+
+    回归：此前对比对话框走 IEC104Parser.parse_from_text 第二套并行实现，
+    解析修复需要改两处才能同步（审查⑧已合并为 parse_text_sync）。
+    """
+
+    def test_normal_multi_lines(self):
+        frames = parse_text_sync(I_FRAME + "\n" + S_FRAME)
+        assert len(frames) == 2
+        assert all(not f.error for f in frames)
+
+    def test_log_format_autodetect(self):
+        text = "12:00:00.000 RX:\n68 04 01 00 0E 00\n"
+        frames = parse_text_sync(text)
+        assert len(frames) == 1
+        assert frames[0].apci.frame_type == "S-format"
+
+    def test_xn3000_with_direction_metadata(self):
+        text = (
+            "13:25:00.692 RX:\n"
+            "68 04 01 00 0E 00\n"
+            "13:25:00.693 TX:\n"
+            "68 04 02 00 0A 00\n"
+        )
+        frames = parse_text_sync(text, ParseMode.XN3000)
+        assert len(frames) == 2
+        assert frames[0].original_direction == "RX"
+        assert frames[1].original_direction == "TX"
+
+    def test_empty_text_returns_empty(self):
+        assert parse_text_sync("   \n# only comment\n") == []
 
 
 if __name__ == "__main__":

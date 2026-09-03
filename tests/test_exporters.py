@@ -12,7 +12,8 @@ import csv
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from iec104_parser import IEC104Parser, ParseMode
+from iec104_parser import ParseMode
+from gui.parse_worker import parse_text_sync
 from gui.exporters import export_csv, export_json, export_txt, CSV_HEADER
 
 
@@ -22,8 +23,7 @@ def _parse_frames():
         "68 0E 04 00 14 00 09 01 03 00 01 00 01 40 00 46 02 00\n"
         "68 0E 04 00 14 00 09 01 03 00 01 00 02 40 00 47 02 00\n"
     )
-    parser = IEC104Parser(ParseMode.NORMAL)
-    return parser.parse_from_text(text)
+    return parse_text_sync(text, ParseMode.NORMAL)
 
 
 class TestExportCsv:

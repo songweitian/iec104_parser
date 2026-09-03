@@ -17,6 +17,20 @@ from iec104_parser import (
 )
 
 
+def parse_text_sync(raw_text: str, parse_mode: ParseMode = ParseMode.NORMAL) -> list:
+    """同步解析文本，返回帧列表。
+
+    供对比等不需要后台线程的场景复用——与主界面解析走同一条 ParseWorker
+    路径（此前对比对话框走 IEC104Parser.parse_from_text，是第二套并行实现，
+    解析修复需要改两处才能同步）。
+    """
+    worker = ParseWorker(None, raw_text, parse_mode)
+    out = []
+    worker.parse_finished.connect(out.append)
+    worker.run()
+    return out[0] if out else []
+
+
 class ParseWorker(QThread):
     """后台解析工作线程 - 避免UI阻塞"""
     progress_updated = pyqtSignal(int, int)  # 当前进度, 总数

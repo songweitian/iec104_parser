@@ -14,7 +14,7 @@ from PyQt5.QtGui import QFont, QColor
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from iec104_parser import IEC104Parser, TypeID, COT, SignalType, ParseMode
+from gui.parse_worker import parse_text_sync
 
 
 class CompareDialog(QDialog):
@@ -25,8 +25,6 @@ class CompareDialog(QDialog):
         self.setWindowTitle("报文对比")
         self.setMinimumSize(1000, 650)
         self.resize(1100, 700)
-        self.parser_a = IEC104Parser()
-        self.parser_b = IEC104Parser()
         self.frames_a = []
         self.frames_b = []
         self._setup_ui()
@@ -118,9 +116,9 @@ class CompareDialog(QDialog):
             QMessageBox.warning(self, "提示", "请输入两组报文")
             return
 
-        # Parse both
-        self.frames_a = self.parser_a.parse_from_text(text_a)
-        self.frames_b = self.parser_b.parse_from_text(text_b)
+        # Parse both（与主界面共用 ParseWorker 解析路径）
+        self.frames_a = parse_text_sync(text_a)
+        self.frames_b = parse_text_sync(text_b)
 
         # Compare by IOA
         map_a = {}

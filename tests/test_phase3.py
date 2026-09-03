@@ -382,9 +382,9 @@ class TestInputFormats:
         assert frame.apci is not None
 
     def test_comment_lines_ignored(self):
-        parser = IEC104Parser()
+        from gui.parse_worker import parse_text_sync
         text = "# comment\n68 04 01 00 0E 00"
-        frames = parser.parse_from_text(text)
+        frames = parse_text_sync(text)
         assert len(frames) == 1
 
 
