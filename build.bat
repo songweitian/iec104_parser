@@ -42,7 +42,7 @@ echo [构建] 正在创建可执行文件...
 REM 注意：不要用 --add-data 打包源码目录（会把 gen_license.py 签码密钥等带进发行包）
 python -m PyInstaller ^
     --name="IEC104_Parser" ^
-    --onedir ^
+    --onefile ^
     --windowed ^
     --icon=assets\app.ico ^
     --exclude-module gen_license ^
@@ -61,7 +61,7 @@ echo.
 echo =====================================
 echo  构建完成！
 echo  可执行文件位置:
-echo  dist\IEC104_Parser\IEC104_Parser.exe
+echo  dist\IEC104_Parser.exe
 echo =====================================
 echo.
 echo 按任意键打开输出目录...
