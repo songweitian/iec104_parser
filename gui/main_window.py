@@ -99,12 +99,23 @@ class FrameCellDelegate(QStyledItemDelegate):
         cell = w._cell(vi, index.column())
         painter.save()
         rect = option.rect
-        if option.state & QStyle.State_Selected:
-            painter.fillRect(rect, option.palette.highlight())
+        # 选中判定：优先查 selectionModel。部分环境下 hover 重绘时
+        # option.state 的 Selected 位不稳定，会导致选中行配色错乱、文字看不清。
+        selected = bool(option.state & QStyle.State_Selected)
+        try:
+            sm = w.table_widget.selectionModel()
+            if sm is not None:
+                selected = sm.isSelected(index)
+        except Exception:
+            pass
+        if selected:
+            # 选中行：固定深蓝背景 + 白色文字（不依赖系统高亮色，保证可读性）
+            painter.fillRect(rect, QColor("#2196F3"))
+            fg = QColor("#FFFFFF")
         else:
             painter.fillRect(rect, cell["bg"])
-        fg = cell.get("fg") or (
-            QColor("#E0E0E0") if w._dark_theme else QColor("#000000"))
+            fg = cell.get("fg") or (
+                QColor("#E0E0E0") if w._dark_theme else QColor("#000000"))
         painter.setPen(fg)
         font = painter.font()
         font.setBold(cell.get("bold", False))
@@ -179,12 +190,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self._may_prompt_expired)
         self._update_status_stats()
 
-        self.hex_input.setPlainText(
-            "# 在此粘贴 IEC104 十六进制报文\n"
-            "# 支持格式: 68 04 01 00 0E 00  或  680401000E00\n"
-            "# 每行一条报文，以 # 开头的行为注释\n\n"
-        )
-
+        # 提示文字通过 placeholder 显示（输入内容后自动消失），不再写入实际内容
         # 恢复上次关闭时的界面状态（窗口大小/分栏/主题/列宽/目录）
         self._load_ui_settings()
 
@@ -691,7 +697,7 @@ class MainWindow(QMainWindow):
         """解析全部报文 - 使用后台线程避免UI阻塞"""
         raw_text = self.hex_input.toPlainText()
 
-        if not raw_text.strip() or raw_text.strip().startswith("# 在此粘贴"):
+        if not raw_text.strip():
             QMessageBox.information(self, "提示", "请输入十六进制报文数据")
             return
 
@@ -1009,7 +1015,11 @@ class MainWindow(QMainWindow):
         tab_layout.setContentsMargins(0, 0, 0, 0)
 
         hex_input = QPlainTextEdit()
-        hex_input.setPlaceholderText("粘贴十六进制报文...")
+        hex_input.setPlaceholderText(
+            "# 在此粘贴 IEC104 十六进制报文\n"
+            "# 支持格式: 68 04 01 00 0E 00  或  680401000E00\n"
+            "# 每行一条报文，以 # 开头的行为注释"
+        )
         hex_input.setFont(QFont("Consolas", 11))
         hex_input.setLineWrapMode(QPlainTextEdit.NoWrap)
         hex_input.setAcceptDrops(False)
@@ -2755,10 +2765,13 @@ class MainWindow(QMainWindow):
             if splitter_state is not None:
                 self.splitter.restoreState(splitter_state)
 
-            dark = s.value("ui/dark_theme", False, type=bool)
-            if dark and not self._dark_theme:
-                self._dark_theme = True
-                self._apply_dark_theme()
+            # 主题不再持久化，始终以浅色主题启动（深色仅当前会话手动切换）
+            # 清除旧版遗留的深色主题记录，避免界面意外变黑
+            if s.contains("ui/dark_theme"):
+                s.remove("ui/dark_theme")
+            if self._dark_theme:
+                self._dark_theme = False
+                self._apply_light_theme()
 
             widths = s.value("ui/col_widths")
             if isinstance(widths, (list, tuple)) and widths:
@@ -2781,7 +2794,6 @@ class MainWindow(QMainWindow):
             s = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
             s.setValue("ui/geometry", self.saveGeometry())
             s.setValue("ui/splitter", self.splitter.saveState())
-            s.setValue("ui/dark_theme", self._dark_theme)
             s.setValue("ui/last_dir", self._last_dir)
             widths = [self.table_widget.columnWidth(c)
                       for c in range(self.table_widget.columnCount())]

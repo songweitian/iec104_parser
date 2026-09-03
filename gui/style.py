@@ -63,6 +63,8 @@ QTabBar::tab:selected { border-bottom: 2px solid #2196F3; color: #1565C0; font-w
 
 QTreeWidget::item { padding: 2px 2px; }
 QTreeWidget::item:hover { background: rgba(33,150,243,0.08); }
+QTreeWidget::item:selected { background-color: #2196F3; color: white; }
+QTreeWidget::item:selected:hover { background-color: #1976D2; color: white; }
 
 QToolBar {
     border-bottom: 1px solid #DDDDDD;
@@ -123,7 +125,8 @@ QTabBar::tab:selected { background-color: #2b2b2b; color: #fff; }
 QTabBar::tab:hover:!selected { background-color: #3a3a3a; }
 QTreeWidget { background-color: #1e1e1e; color: #d4d4d4; }
 QTreeWidget::item { padding: 2px 2px; }
-QTreeWidget::item:selected { background-color: #264f78; }
+QTreeWidget::item:selected { background-color: #1976D2; color: white; }
+QTreeWidget::item:selected:hover { background-color: #1565C0; color: white; }
 QTreeWidget::item:hover { background-color: #2a3f55; }
 QProgressBar { border: 1px solid #555; border-radius: 3px; text-align: center; }
 QProgressBar::chunk { background-color: #2196F3; }
