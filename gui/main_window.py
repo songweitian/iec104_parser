@@ -165,8 +165,7 @@ class MainWindow(QMainWindow):
         # 报文列表虚拟化状态（见 FrameCellDelegate / _cell / _on_header_sort）
         self._view_order: list = []      # 视图行 → all_frames 索引（当前显示顺序）
         self._frame_to_row: dict = {}    # all_frames 索引 → 视图行（0(1) 反查）
-        self._base_order: list = []      # 非搜索时的完整显示顺序（搜索快照用）
-        self._pre_search_order: list = []  # 发起搜索前保存，清空搜索时还原
+        self._pre_search_view: Optional[list] = None  # 搜索激活前的视图快照（None=非搜索态）
         self._sort_column: int = -1
         self._sort_order: int = Qt.AscendingOrder
         self._frame_intervals: list = []
@@ -1127,12 +1126,8 @@ class MainWindow(QMainWindow):
     # _on_import_file 已移至下方"多文件批量导入"区域
 
     def _visible_frame_indices(self) -> list:
-        """当前表格中可见行的帧下标列表（过滤/搜索后）"""
-        visible = []
-        for i in range(self.table_widget.rowCount()):
-            if not self.table_widget.isRowHidden(i):
-                visible.append(self._frame_idx_at_row(i))
-        return visible
+        """当前视图中的帧下标列表（过滤/搜索后），按显示顺序"""
+        return [fi for fi in self._view_order if fi >= 0]
 
     def _on_export_csv(self):
         """导出CSV - 支持筛选后导出"""
@@ -1317,26 +1312,29 @@ class MainWindow(QMainWindow):
             self._populate_tree(0)
         self.table_widget.viewport().update()
 
-    def _set_view(self, display_indices: list):
+    def _set_view(self, display_indices: list, from_search: bool = False):
         """把表格显示行设为 display_indices（all_frames 的索引序列）。
 
-        统一供填充/过滤/搜索/重置使用：重建 _view_order 与反查表、重设行数、
-        清除上一轮的行隐藏标记，随后整体重绘可见区。
+        统一供填充/过滤/搜索/重置使用：重建 _view_order 与反查表、重设行数，
+        随后整体重绘可见区。搜索路径传 from_search=True 以保留搜索快照；
+        其余调用（重新解析/过滤/换标签页）都会取消活跃搜索。
 
         无可见数据时保留一行空态占位（delegate 绘制引导文字）。
         """
         self._view_order = [int(x) for x in display_indices]
         self._frame_to_row = {fi: vi for vi, fi in enumerate(self._view_order)}
-        self._base_order = list(self._view_order)
-        self._pre_search_order = []
+        if not from_search and self._pre_search_view is not None:
+            # 视图被数据源/过滤重建，活跃搜索随之取消
+            self._pre_search_view = None
+            lbl = getattr(self, "lbl_search_count", None)
+            if lbl is not None:
+                lbl.setText("")
         self.table_widget.setRowCount(0)
         if not self._view_order:
             # 空态：一行占位，delegate 据此绘制引导提示
             self._view_order = [-1]
             self._frame_to_row = {}
         self.table_widget.setRowCount(len(self._view_order))
-        for r in range(len(self._view_order)):
-            self.table_widget.setRowHidden(r, False)
         self.table_widget.viewport().update()
 
     def _cell(self, vi: int, col: int) -> dict:
@@ -1346,7 +1344,10 @@ class MainWindow(QMainWindow):
         fi = self._view_order[vi]
         if fi == -1:
             # 空态占位行：第0列显示引导，其余列为空
-            text = "无报文可显示 — 请先在左侧粘贴/导入报文后点击「解析报文」" if col == 0 else ""
+            if self._pre_search_view is not None:
+                text = "无匹配报文 — 请调整搜索关键字或清空搜索框" if col == 0 else ""
+            else:
+                text = "无报文可显示 — 请先在左侧粘贴/导入报文后点击「解析报文」" if col == 0 else ""
             return {"text": text, "bg": self._empty_bg(), "fg": self._empty_fg(),
                     "bold": False, "align": Qt.AlignLeft | Qt.AlignVCenter,
                     "sort": None}
@@ -1476,8 +1477,6 @@ class MainWindow(QMainWindow):
 
     def _on_header_sort(self, col: int):
         """表头点击 → 按该列对 _view_order 排序（数值优先，文本回退）"""
-        # 排序会重排各行内容，先清除搜索隐藏，避免“隐藏行显示错位”
-        self._clear_search_rows()
         if self._sort_column == col:
             self._sort_order = (Qt.DescendingOrder
                                 if self._sort_order == Qt.AscendingOrder
@@ -1513,6 +1512,9 @@ class MainWindow(QMainWindow):
                 return (False, 0, cell["text"])
 
         self._view_order.sort(key=key_of, reverse=(order == Qt.DescendingOrder))
+        if self._pre_search_view:
+            # 搜索激活中排序：快照与视图同步排序，后续输入的匹配范围不回退到旧顺序
+            self._pre_search_view.sort(key=key_of, reverse=(order == Qt.DescendingOrder))
         self._frame_to_row = {fi: vi for vi, fi in enumerate(self._view_order)}
 
     def _populate_tree(self, frame_index: int):
@@ -2339,23 +2341,40 @@ class MainWindow(QMainWindow):
         """搜索输入变化时启动防抖定时器"""
         self._search_timer.stop()
         if not text:
-            # 空内容立即清除过滤，不等防抖
-            self._clear_search_rows()
-            self.lbl_search_count.setText("")
+            # 空内容立即还原搜索前视图，不等防抖
+            self._end_search()
             return
+        if self._pre_search_view is None:
+            # 首次进入搜索态：快照当前视图作为匹配范围
+            self._pre_search_view = list(self._view_order)
         self._search_timer.start()
 
-    def _clear_search_rows(self):
-        """取消所有行的搜索隐藏状态"""
-        for i in range(self.table_widget.rowCount()):
-            self.table_widget.setRowHidden(i, False)
+    def _end_search(self):
+        """清空搜索：还原发起搜索前的视图并复位状态"""
+        if self._pre_search_view is None:
+            self.lbl_search_count.setText("")
+            return
+        snapshot = self._pre_search_view
+        self._pre_search_view = None
+        self._set_view(snapshot)
+        self.lbl_search_count.setText("")
+        if self._view_order and self._view_order[0] >= 0:
+            self._current_frame_idx = self._view_order[0]
+            self.table_widget.selectRow(0)
+            self._populate_tree(self._view_order[0])
+        self.table_widget.viewport().update()
 
     def _do_search(self):
-        """实际执行搜索（防抖后触发）"""
+        """实际执行搜索（防抖后触发）：与过滤同构，经 _set_view 重建可见行。
+
+        匹配范围恒为发起搜索前的视图快照（_pre_search_view）——若直接在当前
+        _view_order 上匹配，逐字输入会在上一轮结果上递归收窄（如搜 "5" 后
+        再搜 "[0-9]" 只剩之前含 5 的行）。此前实现逐行 setRowHidden 并为每行
+        构建 12 列单元格（O(N×12)），且行隐藏与过滤/排序互相干扰。
+        """
         text = self.search_input.text()
         if not text:
-            self._clear_search_rows()
-            self.lbl_search_count.setText("")
+            self._end_search()
             return
 
         try:
@@ -2363,18 +2382,32 @@ class MainWindow(QMainWindow):
         except re.error:
             pattern = re.compile(re.escape(text), re.IGNORECASE)
 
-        match_count = 0
-        for vi in range(self.table_widget.rowCount()):
-            row_match = False
-            for j in range(12):
-                if pattern.search(self._cell(vi, j)["text"]):
-                    row_match = True
-                    break
-            self.table_widget.setRowHidden(vi, not row_match)
-            if row_match:
-                match_count += 1
+        domain = self._pre_search_view
+        if domain is None:
+            domain = list(self._view_order)
+            self._pre_search_view = list(domain)
 
-        self.lbl_search_count.setText(f"找到 {match_count} 条")
+        ncols = self.table_widget.columnCount()
+        display = []
+        for fi in domain:
+            if fi < 0:
+                continue
+            if any(pattern.search(self._frame_cell(fi, j)["text"])
+                   for j in range(ncols)):
+                display.append(fi)
+
+        self._set_view(display, from_search=True)
+        self.lbl_search_count.setText(f"找到 {len(display)} 条")
+
+        # 行序已变：原选中帧仍在结果中则重映射选中，否则选中首个匹配
+        if display:
+            if self._current_frame_idx in self._frame_to_row:
+                self.table_widget.selectRow(self._frame_to_row[self._current_frame_idx])
+            else:
+                self._current_frame_idx = display[0]
+                self.table_widget.selectRow(0)
+                self._populate_tree(display[0])
+        self.table_widget.viewport().update()
 
     # ==================================================================
     # 序号连续性检查
@@ -3076,11 +3109,13 @@ class MainWindow(QMainWindow):
         else:
             self._set_view(list(range(total_count)))
         self._update_status_stats()
-        # 过滤后自动选中首行并刷新解析详情（与旧 _populate_table 行为一致）
-        if self._view_order:
-            self._current_frame_idx = 0
+        # 过滤后自动选中首行并刷新解析详情；行 0 显示的是 _view_order[0]，
+        # 树必须取同一帧（此前写死 0，非恒等视图下详情与选中行错位）
+        if self._view_order and self._view_order[0] >= 0:
+            first_fi = self._view_order[0]
+            self._current_frame_idx = first_fi
             self.table_widget.selectRow(0)
-            self._populate_tree(0)
+            self._populate_tree(first_fi)
 
         self.filter_btn.setStyleSheet(
             FILTER_BTN_STYLE_ACTIVE if has_criteria else FILTER_BTN_STYLE_IDLE)
