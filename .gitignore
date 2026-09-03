@@ -15,6 +15,7 @@ sessions/
 
 # ===== 授权文件（含真实激活码，绝不入库） =====
 license.dat
+.lic_hwm
 
 # ===== 授权文件（本机绑定，不入库） =====
 license.dat

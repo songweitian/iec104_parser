@@ -8,6 +8,7 @@
 import os
 import sys
 import base64
+import json
 import tempfile
 from datetime import date, timedelta
 
@@ -129,10 +130,12 @@ class TestLicenseFileRoundTrip:
         _use_test_key()
         self._tmpdir = tempfile.mkdtemp()
         L.LICENSE_FILE = os.path.join(self._tmpdir, "license.dat")
+        L._HWM_FILE = os.path.join(self._tmpdir, ".lic_hwm")
 
     def teardown_method(self):
-        if os.path.exists(L.LICENSE_FILE):
-            os.remove(L.LICENSE_FILE)
+        for path in (L.LICENSE_FILE, L._HWM_FILE):
+            if os.path.exists(path):
+                os.remove(path)
         import shutil
         shutil.rmtree(self._tmpdir, ignore_errors=True)
         _restore_pub_key()
@@ -190,6 +193,195 @@ class TestLicenseFileRoundTrip:
         assert L.verify_license_code(self._fp, code) is True
 
 
+class _FakeDate:
+    """date 替身：today() 返回固定日期（模拟系统时钟被拨回）"""
+
+    def __init__(self, fixed: date):
+        self._fixed = fixed
+
+    def today(self) -> date:
+        return self._fixed
+
+
+class TestClockRollback:
+    """时钟回拨防护：到期判定取 max(系统日期, 历史水位)"""
+
+    @property
+    def _fp(self):
+        return L.get_hardware_fingerprint()
+
+    def setup_method(self):
+        _use_test_key()
+        self._tmpdir = tempfile.mkdtemp()
+        L.LICENSE_FILE = os.path.join(self._tmpdir, "license.dat")
+        L._HWM_FILE = os.path.join(self._tmpdir, ".lic_hwm")
+
+    def teardown_method(self):
+        for path in (L.LICENSE_FILE, L._HWM_FILE):
+            if os.path.exists(path):
+                os.remove(path)
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+        _restore_pub_key()
+
+    def _activate_timed(self, days):
+        expiry = (date.today() + timedelta(days=days)).strftime("%Y-%m-%d")
+        ok, _ = L.activate(make_code(self._fp, expiry))
+        assert ok
+        return expiry
+
+    def _patch_date(self, fake):
+        self._orig_date = L.date
+        L.date = fake
+
+    def _restore_date(self):
+        L.date = self._orig_date
+
+    def test_activation_seeds_watermark(self):
+        self._activate_timed(30)
+        raw = json.loads(base64.b64decode(
+            open(L.LICENSE_FILE, encoding="utf-8").read().strip()))
+        assert raw.get("last_seen") == date.today().isoformat()
+        assert L._read_hwm_file() == date.today()
+
+    def test_rollback_blocked_by_watermark(self):
+        """把系统时钟拨回 10 天：有效期不得因此延长"""
+        self._activate_timed(30)
+        rolled_back = date.today() - timedelta(days=10)
+        try:
+            self._patch_date(_FakeDate(rolled_back))
+            status = L.get_license_status()
+        finally:
+            self._restore_date()
+        assert status["activated"] is True
+        assert status["days_remaining"] == 30   # 若被回拨蒙蔽会是 40
+
+    def test_rollback_blocked_even_without_last_seen_field(self):
+        """授权文件里的 last_seen 被删：独立水位文件仍然兜底"""
+        self._activate_timed(30)
+        raw = json.loads(base64.b64decode(
+            open(L.LICENSE_FILE, encoding="utf-8").read().strip()))
+        raw.pop("last_seen", None)
+        with open(L.LICENSE_FILE, "w", encoding="utf-8") as f:
+            f.write(base64.b64encode(json.dumps(raw).encode()).decode())
+        rolled_back = date.today() - timedelta(days=10)
+        try:
+            self._patch_date(_FakeDate(rolled_back))
+            status = L.get_license_status()
+        finally:
+            self._restore_date()
+        assert status["days_remaining"] == 30
+
+    def test_all_watermarks_removed_is_the_boundary(self):
+        """双水位全被删（重装级清理）：回拨会得逞——防护的已知边界"""
+        self._activate_timed(30)
+        raw = json.loads(base64.b64decode(
+            open(L.LICENSE_FILE, encoding="utf-8").read().strip()))
+        raw.pop("last_seen", None)
+        with open(L.LICENSE_FILE, "w", encoding="utf-8") as f:
+            f.write(base64.b64encode(json.dumps(raw).encode()).decode())
+        os.remove(L._HWM_FILE)
+        rolled_back = date.today() - timedelta(days=10)
+        try:
+            self._patch_date(_FakeDate(rolled_back))
+            status = L.get_license_status()
+        finally:
+            self._restore_date()
+        assert status["days_remaining"] == 40   # 水位缺失 → 回拨生效（边界行为）
+
+    def test_effective_today_takes_max(self):
+        """_effective_today = max(系统日期, last_seen, 水位文件)"""
+        self._activate_timed(30)
+        data = {"last_seen": "2030-01-01"}
+        L._write_hwm_file(date(2029, 6, 15))
+        assert L._effective_today(data) == date(2030, 1, 1)
+        assert L._effective_today({}) == date(2029, 6, 15)
+        assert L._effective_today(None) == date(2029, 6, 15)
+        L._write_hwm_file(date(2031, 3, 1))
+        assert L._effective_today(data) == date(2031, 3, 1)
+
+    def test_corrupt_watermark_ignored(self):
+        self._activate_timed(30)
+        with open(L._HWM_FILE, "w", encoding="utf-8") as f:
+            f.write("not-a-date[::-1]")
+        assert L._read_hwm_file() is None
+        data = {"last_seen": date.today().isoformat()}
+        assert L._effective_today(data) == date.today()
+
+
+class TestFingerprintDrift:
+    """指纹漂移容忍：组件级绑定（≥2/3）+ 旧授权文件精确指纹回退"""
+
+    @property
+    def _fp(self):
+        return L.get_hardware_fingerprint()
+
+    def setup_method(self):
+        _use_test_key()
+        self._tmpdir = tempfile.mkdtemp()
+        L.LICENSE_FILE = os.path.join(self._tmpdir, "license.dat")
+        L._HWM_FILE = os.path.join(self._tmpdir, ".lic_hwm")
+
+    def teardown_method(self):
+        for path in (L.LICENSE_FILE, L._HWM_FILE):
+            if os.path.exists(path):
+                os.remove(path)
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+        _restore_pub_key()
+
+    def test_components_saved_on_activate(self):
+        ok, _ = L.activate(make_code(self._fp))
+        assert ok
+        raw = json.loads(base64.b64decode(
+            open(L.LICENSE_FILE, encoding="utf-8").read().strip()))
+        comps = raw.get("components")
+        assert isinstance(comps, dict) and len(comps) == 3
+        for v in comps.values():
+            assert len(v) == 32        # 哈希，非明文
+
+    def test_single_drift_tolerated(self):
+        """指纹变了（如改主机名）但机器没换：组件 ≥2/3 匹配 → 仍有效"""
+        ok, _ = L.activate(make_code(self._fp))
+        assert ok
+        orig_fp = L.get_hardware_fingerprint
+        try:
+            L.get_hardware_fingerprint = lambda: "DEADBEEF" * 4
+            assert L.load_license() is not None
+            assert L.is_activated() is True
+        finally:
+            L.get_hardware_fingerprint = orig_fp
+
+    def test_wholesale_copy_rejected(self):
+        """授权文件整体拷到别的机器：组件全不匹配 → 无效"""
+        ok, _ = L.activate(make_code(self._fp))
+        assert ok
+        orig_fp = L.get_hardware_fingerprint
+        orig_comps = L.get_hardware_components
+        try:
+            L.get_hardware_fingerprint = lambda: "DEADBEEF" * 4
+            L.get_hardware_components = lambda: {
+                "guid": "F" * 32, "mac": "E" * 32, "host": "D" * 32}
+            assert L.load_license() is None
+            assert L.is_activated() is False
+        finally:
+            L.get_hardware_fingerprint = orig_fp
+            L.get_hardware_components = orig_comps
+
+    def test_legacy_license_without_components_exact_fp_only(self):
+        """旧版授权文件（无组件快照）：行为不变，仅精确指纹生效"""
+        code = make_code(self._fp)
+        legacy = {"fingerprint": self._fp, "code": code, "holder": ""}
+        with open(L.LICENSE_FILE, "w", encoding="utf-8") as f:
+            f.write(base64.b64encode(json.dumps(legacy).encode()).decode())
+        assert L.load_license() is not None
+
+        legacy["fingerprint"] = "DEADBEEF" * 4
+        with open(L.LICENSE_FILE, "w", encoding="utf-8") as f:
+            f.write(base64.b64encode(json.dumps(legacy).encode()).decode())
+        assert L.load_license() is None
+
+
 if __name__ == "__main__":
     # 支持直接运行：python tests/test_license.py（无需 pytest）
     import traceback
@@ -217,7 +409,8 @@ if __name__ == "__main__":
                 inst.teardown_method()
 
     for cls in (TestLicenseCodeResolution, TestLegacyDeactivated,
-                TestLicenseFileRoundTrip):
+                TestLicenseFileRoundTrip, TestClockRollback,
+                TestFingerprintDrift):
         _run_class(cls)
     print(f"\n{total - failed}/{total} passed")
     sys.exit(1 if failed else 0)

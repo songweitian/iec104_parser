@@ -51,15 +51,72 @@ def _get_app_dir() -> str:
 # 授权文件路径
 LICENSE_FILE = os.path.join(_get_app_dir(), "license.dat")
 
+# 时钟回拨防护：记录"见过的最大日期"，到期判定取 max(系统日期, 历史水位)。
+# 水位双写（授权文件 last_seen + 独立状态文件，内容倒序混淆），
+# 两处同时删除/篡改才可能重置，抬高 casual 回拨的成本。
+_HWM_FILE = os.path.join(_get_app_dir(), ".lic_hwm")
+
 
 def get_hardware_fingerprint() -> str:
-    """生成硬件指纹"""
+    """生成硬件指纹（签发/验签绑定的标识）
+
+    注意：算法不可变更——已签发激活码的签名绑定该指纹值。
+    单一指纹的漂移问题（Win11 随机化 MAC、改主机名导致已激活用户失效）
+    由 get_hardware_components 的组件级容忍兜底，见 load_license。
+    """
     mac = uuid.getnode()
     hostname = platform.node()
     disk = os.getenv("SystemDrive", "C:")
 
     raw = f"{mac}:{hostname}:{disk}"
     return hashlib.md5(raw.encode()).hexdigest().upper()
+
+
+def _windows_machine_guid() -> str:
+    """Windows 安装唯一 ID（HKLM\\SOFTWARE\\Microsoft\\Cryptography\\MachineGuid）
+
+    随系统安装生成，改硬件/改名都不变，重装系统才更换——组件中最稳定的一个。
+    非 Windows 或读取失败返回空（参与匹配时跳过）。
+    """
+    if sys.platform != "win32":
+        return ""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"SOFTWARE\Microsoft\Cryptography") as key:
+            value, _ = winreg.QueryValueEx(key, "MachineGuid")
+        return str(value)
+    except Exception:
+        return ""
+
+
+def _hash_component(value: str) -> str:
+    """组件哈希：授权文件里不存机器信息明文"""
+    if not value:
+        return ""
+    return hashlib.sha256(value.encode()).hexdigest()[:32].upper()
+
+
+def get_hardware_components() -> dict:
+    """采集本机硬件组件（哈希后），供组件级绑定校验"""
+    return {
+        "guid": _hash_component(_windows_machine_guid()),
+        "mac": _hash_component(str(uuid.getnode())),
+        "host": _hash_component(platform.node()),
+    }
+
+
+def _machine_matches(stored_components) -> bool:
+    """当前机器是否为激活时的同一台：≥2/3 组件一致即认可。
+
+    单组件漂移（随机化 MAC / 改主机名）不误伤；整机拷贝到另一台机器
+    至少 guid/host/mac 三个全新，无法通过。
+    """
+    if not isinstance(stored_components, dict):
+        return False
+    cur = get_hardware_components()
+    matched = sum(1 for k, v in cur.items() if v and stored_components.get(k) == v)
+    return matched >= 2
 
 
 def is_legacy_code(code: str) -> bool:
@@ -139,12 +196,16 @@ def verify_license_code(fingerprint: str, code: str) -> bool:
 
 
 def save_license(fingerprint: str, code: str, holder: str = "") -> bool:
-    """保存授权文件（保留原始激活码文本；注意新码区分大小写，不做 upper）"""
+    """保存授权文件（保留原始激活码文本；注意新码区分大小写，不做 upper）
+
+    同时记录激活时的硬件组件快照，供 load_license 做组件级漂移容忍。
+    """
     try:
         data = {
             "fingerprint": fingerprint,
             "code": code.strip(),
             "holder": holder,
+            "components": get_hardware_components(),
         }
         # 简单混淆：base64 编码
         encoded = base64.b64encode(json.dumps(data).encode()).decode()
@@ -163,13 +224,67 @@ def load_license():
         with open(LICENSE_FILE, "r", encoding="utf-8") as f:
             encoded = f.read().strip()
         data = json.loads(base64.b64decode(encoded))
-        # 验证当前硬件指纹
+        # 绑定校验：优先精确指纹（旧版授权文件无组件快照，行为不变）；
+        # 不匹配时按组件容忍单点漂移（随机化 MAC / 改主机名）
         current_fp = get_hardware_fingerprint()
         if data.get("fingerprint") != current_fp:
-            return None
+            if not _machine_matches(data.get("components")):
+                return None
+            # 自愈：回写当前组件快照，避免多次漂移后累积失效。
+            # 注意不更新 fingerprint——激活码签名绑定的是激活时的指纹值。
+            try:
+                data["components"] = get_hardware_components()
+                with open(LICENSE_FILE, "w", encoding="utf-8") as f:
+                    f.write(base64.b64encode(json.dumps(data).encode()).decode())
+            except Exception:
+                pass
         return data
     except Exception:
         return None
+
+
+def _read_hwm_file():
+    """读取独立水位文件（内容倒序混淆）"""
+    try:
+        with open(_HWM_FILE, "r", encoding="utf-8") as f:
+            return _parse_date(f.read().strip()[::-1])
+    except Exception:
+        return None
+
+
+def _write_hwm_file(d: date):
+    try:
+        with open(_HWM_FILE, "w", encoding="utf-8") as f:
+            f.write(d.isoformat()[::-1])
+    except Exception:
+        pass
+
+
+def _effective_today(data) -> date:
+    """有效当前日期 = max(系统日期, 各处记录的历史水位)——时钟只能前进"""
+    candidates = [date.today()]
+    if isinstance(data, dict):
+        stored = data.get("last_seen")
+        d = _parse_date(stored) if isinstance(stored, str) else None
+        if d:
+            candidates.append(d)
+    d = _read_hwm_file()
+    if d:
+        candidates.append(d)
+    return max(candidates)
+
+
+def _remember_today(data: dict, today: date):
+    """推进水位（尽力而为：只读目录/文件损坏不影响判定本身）"""
+    stored = data.get("last_seen")
+    if not isinstance(stored, str) or _parse_date(stored) != today:
+        data["last_seen"] = today.isoformat()
+        try:
+            with open(LICENSE_FILE, "w", encoding="utf-8") as f:
+                f.write(base64.b64encode(json.dumps(data).encode()).decode())
+        except Exception:
+            pass
+    _write_hwm_file(today)
 
 
 def remove_license() -> bool:
@@ -226,9 +341,11 @@ def get_license_status() -> dict:
             "holder": data.get("holder", ""), "fingerprint": fp,
         }
 
-    today = date.today()
+    # 时钟回拨防护：以历史水位与系统日期的较大者参与到期判定
+    today = _effective_today(data)
     expired = today > exp_date
     days_remaining = (exp_date - today).days  # 可为负数（已过期）
+    _remember_today(data, today)
     return {
         "activated": not expired, "expired": expired, "permanent": False,
         "expiry_date": expiry, "days_remaining": max(days_remaining, 0),
@@ -255,6 +372,10 @@ def activate(license_code: str, holder: str = ""):
         if expiry and _parse_date(expiry) and date.today() > _parse_date(expiry):
             return False, "该激活码已过期，请联系开发者续期"
         if save_license(fingerprint, license_code, holder):
+            # 激活即播种时钟水位，防止激活后把系统时钟拨回首次运行前
+            seeded = load_license()
+            if seeded:
+                _remember_today(seeded, date.today())
             label = "永久授权" if not expiry else f"有效期至 {expiry}"
             return True, f"激活成功！{label}"
         return False, "保存授权文件失败"
