@@ -478,22 +478,40 @@ class IEC104Frame:
 # ============================================================================
 # CP56Time2a / CP24Time2a 时标解析
 # ============================================================================
+class ProtocolTime(datetime):
+    """协议时标：标准 datetime 附加 IV（无效位）标记
+
+    CP56Time2a/CP24Time2a 分钟字节的 bit7=IV 表示时标不可信（源时钟无效/未同步）。
+    此前该位被 0x3F 掩码直接丢弃，无效时标与有效时标完全无法区分。
+    判别方式：getattr(ts, "invalid", False)。
+    """
+    invalid = False
+
+
+def _mk_time(*args, iv: bool, fallback: bool = False) -> ProtocolTime:
+    """构造带 IV 标记的协议时标；日期非法回退时同样标记无效"""
+    ts = ProtocolTime(*args)
+    ts.invalid = bool(iv or fallback)
+    return ts
+
+
 def parse_cp56time2a(data: bytes) -> datetime:
     """解析CP56Time2a格式时标 (7字节)
     Byte 0-1: 毫秒 (0-59999, 含秒: 值 = 秒*1000 + 毫秒)
-    Byte 2: 分钟 (bit0-5)
+    Byte 2: 分钟 (bit0-5) + bit7=IV(时标无效)
     Byte 3: 小时 (bit0-4)
     Byte 4: 日 (bit0-4) + 星期 (bit5-7)
     Byte 5: 月 (bit0-3)
     Byte 6: 年 (bit0-6) + 夏时制 (bit7)
     """
     if len(data) < 7:
-        return datetime(2000, 1, 1)
+        return ProtocolTime(2000, 1, 1)
 
     ms_field = data[0] + ((data[1] & 0xFF) << 8)  # 0-59999 (秒*1000+毫秒)
     second = ms_field // 1000       # 秒 (0-59)
     millis = ms_field % 1000        # 毫秒 (0-999)
     micros = millis * 1000          # 微秒 (0-999000)
+    iv = bool(data[2] & 0x80)       # IV: 时标无效位
     minute = data[2] & 0x3F
     hour = data[3] & 0x1F
     day = data[4] & 0x1F
@@ -507,40 +525,41 @@ def parse_cp56time2a(data: bytes) -> datetime:
     second = min(59, second)
 
     try:
-        return datetime(year, month, day, hour, minute, second, micros)
+        return _mk_time(year, month, day, hour, minute, second, micros, iv=iv)
     except ValueError:
         # 日期无效（如2月30日）时，回退到该月最后一天
         max_day = calendar.monthrange(year, month)[1]
         day = min(day, max_day)
         try:
-            return datetime(year, month, day, hour, minute, second, micros)
+            return _mk_time(year, month, day, hour, minute, second, micros,
+                            iv=iv, fallback=True)
         except ValueError:
-            return datetime(2000, 1, 1)
+            ts = ProtocolTime(2000, 1, 1)
+            ts.invalid = True
+            return ts
 
 
 def parse_cp24time2a(data: bytes, hour: int = 0) -> datetime:
     """解析CP24Time2a格式时标 (3字节) - 用于 type_id=2/4/6/8/10/12/14/16
     Byte 0-1: 毫秒 (0-59999, 含秒: 值 = 秒*1000 + 毫秒)
-    Byte 2: 分钟 (bit0-5)
+    Byte 2: 分钟 (bit0-5) + bit7=IV(时标无效)
     注意: CP24Time2a 不含日期和小时信息，需要外部提供
     """
     if len(data) < 3:
-        return datetime(2000, 1, 1)
+        return ProtocolTime(2000, 1, 1)
 
     ms_field = data[0] + ((data[1] & 0xFF) << 8)  # 0-59999
     second = ms_field // 1000       # 秒 (0-59)
     millis = ms_field % 1000        # 毫秒 (0-999)
     micros = millis * 1000          # 微秒 (0-999000)
+    iv = bool(data[2] & 0x80)       # IV: 时标无效位
     minute = data[2] & 0x3F
 
     minute = min(59, minute)
     second = min(59, second)
     hour = max(0, min(23, hour))
 
-    try:
-        return datetime(2000, 1, 1, hour, minute, second, micros)
-    except ValueError:
-        return datetime(2000, 1, 1)
+    return _mk_time(2000, 1, 1, hour, minute, second, micros, iv=iv)
 
 
 # ============================================================================
@@ -1275,6 +1294,10 @@ class IEC104Parser:
             consumed = self._parse_element_value(asdu.type_id, elem_data[offset:], elem)
             offset += consumed
 
+            # IV=1 的时标（源时钟无效）在描述里显式提示，避免误信
+            if elem.timestamp is not None and getattr(elem.timestamp, "invalid", False):
+                elem.value_desc += " [时标无效:IV=1]"
+
             asdu.information_elements.append(elem)
 
         # 0补齐对齐
@@ -1339,11 +1362,13 @@ class IEC104Parser:
             elif type_id == 9:  # M_ME_NA_1 测量值(归一化) (遥测)
                 if len(data) >= 2:
                     raw_val = data[0] + (data[1] << 8)
+                    # 归一化值是有符号数（-1..+1 → 0x8001..0x7FFF），按无符号
+                    # 解析会把 -32768 显示成 +1.00003
                     signed_val = self._to_signed(raw_val, 16)
-                    normalized = raw_val / 32767.0
-                    elem.value = raw_val
+                    normalized = signed_val / 32767.0
+                    elem.value = signed_val
                     elem.value_desc = (
-                        f"归一化={normalized:.6f} | DEC={raw_val}(有符号:{signed_val}) HEX=0x{raw_val:04X}"
+                        f"归一化={normalized:.6f} | DEC={signed_val} HEX=0x{raw_val:04X}"
                     )
                     consumed = 2
                     if len(data) >= 3:
@@ -1354,10 +1379,10 @@ class IEC104Parser:
                 if len(data) >= 2:
                     raw_val = data[0] + (data[1] << 8)
                     signed_val = self._to_signed(raw_val, 16)
-                    normalized = raw_val / 32767.0
-                    elem.value = raw_val
+                    normalized = signed_val / 32767.0   # 归一化值有符号
+                    elem.value = signed_val
                     elem.value_desc = (
-                        f"归一化={normalized:.6f} | DEC={raw_val}(有符号:{signed_val}) HEX=0x{raw_val:04X}"
+                        f"归一化={normalized:.6f} | DEC={signed_val} HEX=0x{raw_val:04X}"
                     )
                     consumed = 2
                     if len(data) >= 3:
@@ -1424,9 +1449,10 @@ class IEC104Parser:
             elif type_id == 21:  # M_ME_ND_1 测量值(归一化,无品质) (遥测)
                 if len(data) >= 2:
                     raw_val = data[0] + (data[1] << 8)
-                    normalized = raw_val / 32767.0
-                    elem.value = raw_val
-                    elem.value_desc = f"归一化={normalized:.6f} | DEC={raw_val} HEX=0x{raw_val:04X}"
+                    signed_val = self._to_signed(raw_val, 16)   # 归一化值有符号
+                    normalized = signed_val / 32767.0
+                    elem.value = signed_val
+                    elem.value_desc = f"归一化={normalized:.6f} | DEC={signed_val} HEX=0x{raw_val:04X}"
                     consumed = 2
 
             elif type_id in (30, 31, 32, 33):
@@ -1590,11 +1616,11 @@ class IEC104Parser:
             if type_id == 34:  # 归一化值 (遥测)
                 if len(data) >= 3:
                     raw_val = data[0] + (data[1] << 8)
-                    signed_val = self._to_signed(raw_val, 16)
-                    normalized = raw_val / 32767.0
-                    elem.value = raw_val
+                    signed_val = self._to_signed(raw_val, 16)   # 归一化值有符号
+                    normalized = signed_val / 32767.0
+                    elem.value = signed_val
                     elem.value_desc = (
-                        f"归一化={normalized:.6f} | DEC={raw_val}(有符号:{signed_val}) HEX=0x{raw_val:04X}"
+                        f"归一化={normalized:.6f} | DEC={signed_val} HEX=0x{raw_val:04X}"
                     )
                     elem.quality = QualityDescriptor(data[2])
                     offset = 3
@@ -1621,32 +1647,40 @@ class IEC104Parser:
                     offset = 5
 
             elif type_id == 38:  # M_EP_TD_1 继电保护事件 (遥信)
+                # 结构: SPI(1)+QDS(1)+CP16Time2a(2)+CP56Time2a(7) = 11 字节
+                if len(data) >= 11:
+                    elem.value = data[0]
+                    elem.quality = QualityDescriptor(data[1])
+                    elem.value_desc = (
+                        f"保护事件SPI=0x{data[0]:02X} | QDS=0x{data[1]:02X} "
+                        f"| CP16时延={data[2] + (data[3] << 8)}ms"
+                    )
+                    elem.timestamp = parse_cp56time2a(data[4:11])
+                    offset = 11
+
+            elif type_id == 39:  # M_EP_TE_1 继电保护成组启动事件 (遥信)
+                # 结构: SPE(1)+QDS(1)+CP16Time2a(2)+SOD(1)+CP56Time2a(7) = 12 字节
                 if len(data) >= 12:
                     elem.value = data[0]
-                    elem.value_desc = f"保护事件=0x{data[0]:02X} | DEC={data[0]} HEX=0x{data[0]:02X}"
                     elem.quality = QualityDescriptor(data[1])
-                    offset = 5  # skip 1+4 timetag bytes
-                    if len(data) >= 12:
-                        elem.timestamp = parse_cp56time2a(data[5:12])
-                        offset = 12
+                    elem.value_desc = (
+                        f"保护启动SPE=0x{data[0]:02X} | QDS=0x{data[1]:02X} "
+                        f"| CP16时延={data[2] + (data[3] << 8)}ms | SOD=0x{data[4]:02X}"
+                    )
+                    elem.timestamp = parse_cp56time2a(data[5:12])
+                    offset = 12
 
-            elif type_id == 39:  # M_EP_TE_1 继电保护成组启动事件 (遥测)
-                if len(data) >= 24:
+            elif type_id == 40:  # M_EP_TF_1 继电保护成组输出电路信息 (遥信)
+                # 结构: OCI(1)+QDS(1)+CP16Time2a(2)+SOD(1)+CP56Time2a(7) = 12 字节
+                if len(data) >= 12:
                     elem.value = data[0]
-                    elem.value_desc = f"启动事件=0x{data[0]:02X} | DEC={data[0]} HEX=0x{data[0]:02X}"
-                    offset = 17  # skip 1+4+12 bytes (event + timetag + additional)
-                    if len(data) >= 24:
-                        elem.timestamp = parse_cp56time2a(data[17:24])
-                        offset = 24
-
-            elif type_id == 40:  # M_EP_TF_1 继电保护成组输出电路信息 (遥测)
-                if len(data) >= 24:
-                    elem.value = data[0]
-                    elem.value_desc = f"输出电路=0x{data[0]:02X} | DEC={data[0]} HEX=0x{data[0]:02X}"
-                    offset = 17  # skip 1+4+12 bytes (event + timetag + additional)
-                    if len(data) >= 24:
-                        elem.timestamp = parse_cp56time2a(data[17:24])
-                        offset = 24
+                    elem.quality = QualityDescriptor(data[1])
+                    elem.value_desc = (
+                        f"输出电路OCI=0x{data[0]:02X} | QDS=0x{data[1]:02X} "
+                        f"| CP16时延={data[2] + (data[3] << 8)}ms | SOD=0x{data[4]:02X}"
+                    )
+                    elem.timestamp = parse_cp56time2a(data[5:12])
+                    offset = 12
 
         except Exception:
             pass
@@ -1704,12 +1738,12 @@ class IEC104Parser:
             if len(data) >= 3:
                 raw_val = data[0] + (data[1] << 8)
                 signed_val = self._to_signed(raw_val, 16)
-                normalized = raw_val / 32767.0
+                normalized = signed_val / 32767.0   # 归一化值有符号
                 qdp = data[2]
                 elem.value = {"raw": raw_val, "normalized": normalized}
                 elem.value_desc = (
                     f"[{ctrl_type}] 归一化设定值={normalized:.6f} "
-                    f"| DEC={raw_val}(有符号:{signed_val}) HEX=0x{raw_val:04X} "
+                    f"| DEC={signed_val} HEX=0x{raw_val:04X} "
                     f"| QDS=0x{qdp:02X}"
                 )
                 consumed = 3
@@ -1794,8 +1828,9 @@ class IEC104Parser:
 
         if type_id == 108 and len(data) >= 3:  # 归一化值
             raw_val = data[1] + (data[2] << 8)
-            normalized = raw_val / 32767.0
-            elem.value_desc += f" | 归一化={normalized:.6f} DEC={raw_val}"
+            signed_val = self._to_signed(raw_val, 16)
+            normalized = signed_val / 32767.0   # 归一化值有符号
+            elem.value_desc += f" | 归一化={normalized:.6f} DEC={signed_val}"
             consumed = 3
         elif type_id == 109 and len(data) >= 3:  # 标度化值
             signed_val = self._to_signed(data[1] + (data[2] << 8), 16)

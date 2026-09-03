@@ -57,6 +57,41 @@ class TestExtractHexLines:
         assert hex_lines == ["680401000e00"]
         assert line_map == [[0]] if line_map == [[0]] else True
 
+    def test_single_line_multi_frames_split(self):
+        """单行拼接多帧应拆开，行映射沿用源行
+
+        回归：此前 NORMAL 模式把整行当一帧解析，_parse_single_frame
+        按长度域截断后静默丢弃行内其余帧。
+        """
+        w = ParseWorker(None, "", ParseMode.NORMAL)
+        text = "680401000e00680402000a00"
+        hex_lines, line_map = w._extract_hex_lines(text)
+        assert hex_lines == ["680401000e00", "680402000a00"]
+        assert line_map == [[0], [0]]
+
+    def test_single_frame_line_keeps_spacing(self):
+        # 多行文本中的单帧行保留原始排版（含空格），不因拆分逻辑改写字节内容
+        # （注意：整段文本恰好是一个 APDU 时走快速路径会去掉空格，属既有行为）
+        w = ParseWorker(None, "", ParseMode.NORMAL)
+        text = "68 04 01 00 0E 00\n68 04 02 00 0A 00"
+        hex_lines, line_map = w._extract_hex_lines(text)
+        assert hex_lines == ["68 04 01 00 0E 00", "68 04 02 00 0A 00"]
+        assert line_map == [[0], [1]]
+
+    def test_multi_frame_line_parses_as_two(self):
+        # 端到端：拆分后整行文本解析出 2 帧（而非 1 帧 + 丢弃）
+        w = ParseWorker(None, CONCAT_2S, ParseMode.NORMAL)
+        frames = _run_sync(w)
+        assert len(frames) == 2
+        assert all(not f.error for f in frames), [f.error for f in frames]
+        assert frames[0].apci.recv_seq != frames[1].apci.recv_seq
+
+    def test_garbage_line_still_reports(self):
+        # 纯垃圾行不被拆分逻辑吞掉，仍进入解析并报错（保持既有报错行为）
+        w = ParseWorker(None, "hello world", ParseMode.NORMAL)
+        hex_lines, _ = w._extract_hex_lines("hello world")
+        assert len(hex_lines) == 1
+
     def test_empty_returns_empty(self):
         w = ParseWorker(None, "", ParseMode.NORMAL)
         hex_lines, line_map = w._extract_hex_lines("   \n# only comment\n")

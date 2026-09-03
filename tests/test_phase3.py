@@ -184,6 +184,160 @@ class TestCP56Time2a:
         result = parse_cp56time2a(b'')
         assert result == datetime(2000, 1, 1)
 
+    def test_cp56_iv_bit_set(self):
+        """分钟字节 bit7=IV 必须保留为 invalid 标记，而不是被 0x3F 掩码丢弃"""
+        data = struct.pack('<H', 1234) + bytes([0x80 | 30, 10, 15, 6, 23])
+        data += bytes([0, 0, 0])
+        result = parse_cp56time2a(data)
+        assert result.minute == 30          # IV 位不参与数值
+        assert getattr(result, "invalid", False) is True
+
+    def test_cp56_iv_bit_clear(self):
+        data = struct.pack('<H', 1234) + bytes([30, 10, 15, 6, 23])
+        data += bytes([0, 0, 0])
+        result = parse_cp56time2a(data)
+        assert result.minute == 30
+        assert getattr(result, "invalid", False) is False
+
+    def test_cp24_iv_bit_set(self):
+        data = struct.pack('<H', 500) + bytes([0x80 | 45])
+        result = parse_cp24time2a(data)
+        assert result.minute == 45
+        assert getattr(result, "invalid", False) is True
+
+    def test_cp24_iv_bit_clear(self):
+        data = struct.pack('<H', 500) + bytes([45])
+        result = parse_cp24time2a(data)
+        assert result.minute == 45
+        assert getattr(result, "invalid", False) is False
+
+    def test_iv_annotated_in_frame(self):
+        """IV=1 的时标在报文解析时应在描述中显式标注，避免误信"""
+        parser = IEC104Parser()
+        # type 30 (M_SP_TB_1): SIQ(1) + CP56(7)，分钟字节带 IV=0x80
+        cp56 = bytes([0x00, 0x00, 0x9E, 0x0A, 0x0F, 0x06, 0x17])
+        hex_str = f"68 15 00 00 00 00 1E 01 03 00 01 00 01 40 00 01 {' '.join(f'{b:02X}' for b in cp56)}"
+        frame = parser.parse_hex(hex_str)
+        elem = frame.asdu.information_elements[0]
+        assert getattr(elem.timestamp, "invalid", False) is True
+        assert "[时标无效:IV=1]" in elem.value_desc
+
+
+class TestNormalizedSigned:
+    """归一化值(NVA)是有符号数：0x8001..0x7FFF 映射 -1..+1。
+
+    回归：此前按无符号解析，-32768 会被显示成 +1.00003。
+    """
+
+    def _type9(self, lo: str, hi: str) -> InfoElement:
+        parser = IEC104Parser()
+        frame = parser.parse_hex(f"68 10 00 00 00 00 09 01 03 00 01 00 01 40 00 {lo} {hi} 00")
+        return frame.asdu.information_elements[0]
+
+    def test_type9_negative_full_scale(self):
+        elem = self._type9("FF", "FF")   # 0xFFFF → -1
+        assert elem.value == -1
+        assert "DEC=-1" in elem.value_desc
+
+    def test_type9_negative_min(self):
+        elem = self._type9("00", "80")   # 0x8000 → -32768，归一化约 -1.00003
+        assert elem.value == -32768
+        assert "归一化=-1.000031" in elem.value_desc
+        assert "HEX=0x8000" in elem.value_desc
+
+    def test_type9_positive_unchanged(self):
+        elem = self._type9("00", "02")   # 0x0200 = 512，正值不受影响
+        assert elem.value == 512
+
+    def test_type21_signed(self):
+        parser = IEC104Parser()
+        frame = parser.parse_hex("68 0F 00 00 00 00 15 01 03 00 01 00 01 40 00 FF FF")
+        elem = frame.asdu.information_elements[0]
+        assert elem.value == -1
+        assert "归一化=-0.000031" in elem.value_desc
+
+    def test_type34_signed(self):
+        parser = IEC104Parser()
+        # type 34: NVA(2) + QDS(1) + CP56(7)
+        cp56 = "00 00 1E 0A 0F 06 17"
+        frame = parser.parse_hex(f"68 17 00 00 00 00 22 01 03 00 01 00 01 40 00 FF FF 00 {cp56}")
+        elem = frame.asdu.information_elements[0]
+        assert elem.value == -1
+        assert "DEC=-1" in elem.value_desc
+
+    def test_type48_setpoint_signed(self):
+        parser = IEC104Parser()
+        # C_SE_NA_1: NVA(2) + QDS(1)，0x8000 → -32768
+        frame = parser.parse_hex("68 10 00 00 00 00 30 01 06 00 01 00 01 60 00 00 80 00")
+        elem = frame.asdu.information_elements[0]
+        assert elem.value["raw"] == 0x8000
+        assert elem.value["normalized"] == pytest.approx(-32768 / 32767.0)
+        assert "归一化设定值=-1.000031" in elem.value_desc
+        assert "DEC=-32768" in elem.value_desc
+
+
+class TestProtectionEventTypes:
+    """保护事件类型 38/39/40 对象长度回归：标准为 11/12/12 字节。
+
+    回归：此前类型 38 按 12 字节、39/40 按 24 字节（错误的 4 字节时标跳过），
+    单对象帧解析不到时标，多对象帧步长错位导致后续对象全部错乱。
+    结构：38 = SPI+QDS+CP16(2)+CP56(7)=11；39/40 再加 SOD，=12。
+    """
+    CP56 = "00 00 1E 0A 0F 06 17"   # 2023-06-15 10:30，无 IV
+
+    def test_type38_event(self):
+        parser = IEC104Parser()
+        # SPI(1)+QDS(1)+CP16=0x1234+CP56(7) = 11 字节
+        frame = parser.parse_hex(
+            "68 18 00 00 00 00 26 01 03 00 01 00 01 40 00 "
+            "01 00 34 12 " + self.CP56)
+        assert frame.asdu is not None
+        elem = frame.asdu.information_elements[0]
+        assert elem.value == 1
+        assert elem.quality is not None
+        assert "CP16时延=4660" in elem.value_desc     # 0x1234
+        assert elem.timestamp.year == 2023
+        assert elem.timestamp.minute == 30
+
+    def test_type38_two_objects_stride(self):
+        """VSQ=2：若步长不是 11 字节，第二个对象会错位"""
+        parser = IEC104Parser()
+        obj = "01 00 34 12 " + self.CP56
+        frame = parser.parse_hex(
+            "68 26 00 00 00 00 26 02 03 00 01 00 "
+            "01 40 00 " + obj + " 02 40 00 " + obj)
+        assert frame.asdu is not None
+        elems = frame.asdu.information_elements
+        assert len(elems) == 2
+        for e in elems:
+            assert e.value == 1
+            assert e.timestamp.year == 2023, "时标应取到对象内偏移 4..11"
+
+    def test_type39_startup_event(self):
+        parser = IEC104Parser()
+        # SPE(1)+QDS(1)+CP16(2)+SOD(1)+CP56(7) = 12 字节
+        frame = parser.parse_hex(
+            "68 19 00 00 00 00 27 01 03 00 01 00 01 40 00 "
+            "05 00 00 00 01 " + self.CP56)
+        assert frame.asdu is not None
+        elem = frame.asdu.information_elements[0]
+        assert elem.value == 5
+        assert "SPE=0x05" in elem.value_desc
+        assert "SOD=0x01" in elem.value_desc
+        assert elem.timestamp.year == 2023
+
+    def test_type40_output_circuit(self):
+        parser = IEC104Parser()
+        # OCI(1)+QDS(1)+CP16(2)+SOD(1)+CP56(7) = 12 字节
+        frame = parser.parse_hex(
+            "68 19 00 00 00 00 28 01 03 00 01 00 01 40 00 "
+            "03 00 00 00 01 " + self.CP56)
+        assert frame.asdu is not None
+        elem = frame.asdu.information_elements[0]
+        assert elem.value == 3
+        assert "OCI=0x03" in elem.value_desc
+        assert elem.timestamp.year == 2023
+
 
 class TestDirectionDetection:
     """主站/子站方向判定测试"""

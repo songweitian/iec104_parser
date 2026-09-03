@@ -154,8 +154,17 @@ class ParseWorker(QThread):
             line = line.strip()
             if not line or line.startswith('#'):
                 continue
-            hex_lines.append(line)
-            line_map.append([i])
+            # 单行多帧（无分隔拼接，如 680401000e00680402000a00）：拆成单帧序列，
+            # 否则 _parse_single_frame 只取第一个 APDU，静默丢弃其余帧。
+            # 仅在确实拆出多帧时替换原行，单帧行保留原始空格排版。
+            split = split_concatenated_frames(line)
+            if len(split) > 1:
+                for frame_hex in split:
+                    hex_lines.append(frame_hex)
+                    line_map.append([i])
+            else:
+                hex_lines.append(line)
+                line_map.append([i])
         return hex_lines, line_map
 
     def _extract_xn_blocks(self, text: str, parse_mode: ParseMode):

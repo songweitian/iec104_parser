@@ -806,10 +806,20 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(current)
         self.statusbar.showMessage(f"正在解析报文... {current}/{total}")
 
+    def _set_frames(self, frames: list):
+        """更新全量帧表并同步主解析器
+
+        序号检查/合规检查/报文配对三个分析功能都从 self.parser.frames 取数，
+        而 ParseWorker 在自己的内部副本上解析——若只更新 all_frames，三者
+        实际永远面对空表，恒报"无问题"（审查 Top1 缺陷）。
+        """
+        self.all_frames = frames
+        self.parser.frames = list(frames)
+
     def _on_parse_finished(self, frames: list):
         """解析完成处理"""
         self._is_parsing = False
-        self.all_frames = frames
+        self._set_frames(frames)
 
         # 存储输入行映射
         if hasattr(self._parse_worker, '_frame_input_lines'):
@@ -1088,14 +1098,14 @@ class MainWindow(QMainWindow):
         """加载指定标签页的解析结果"""
         if index in self._tab_data:
             data = self._tab_data[index]
-            self.all_frames = data["frames"]
+            self._set_frames(data["frames"])
             self._frame_input_lines = data["input_lines"]
             self._bookmarks = data["bookmarks"]
             self._populate_table()
             self._update_status_stats()
         else:
             # 新标签页，清空结果
-            self.all_frames = []
+            self._set_frames([])
             self._frame_input_lines = []
             self._bookmarks = set()
             self.tree_widget.clear()
