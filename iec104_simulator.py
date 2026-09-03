@@ -62,6 +62,20 @@ DEFAULT_K = 12      # 发送窗口大小 (最大未确认 I 帧数)
 DEFAULT_W = 8       # 接收窗口大小 (发送 S 帧确认前可接收的最大 I 帧数)
 
 
+def _friendly_connect_error(e: Exception) -> str:
+    """把 socket 报错翻成用户能懂的原因（WinError 数字对用户无意义）"""
+    s = str(e)
+    if "10061" in s or isinstance(e, ConnectionRefusedError):
+        return "对端拒绝连接（目标 IP:端口没有服务在监听，请检查 IP/端口或先启动从站）"
+    if "10060" in s or isinstance(e, socket.timeout):
+        return "连接超时（网络不通或防火墙拦截）"
+    if "10049" in s:
+        return "IP 地址无效（本机没有该网络地址）"
+    if "11001" in s:
+        return "主机名无法解析"
+    return s
+
+
 # ============================================================================
 # 点位数据
 # ============================================================================
@@ -144,6 +158,12 @@ class IEC104Simulator(QThread):
 
         # 接收计数器 (用于 W 窗口控制)
         self._rx_count_since_last_s = 0
+
+        # TCP 流重组缓冲：recv 可能给出半包/粘包，跨包缓存直到凑出完整帧
+        self._rx_buffer = bytearray()
+        # 发送锁：GUI 线程(手动发送/定时上送)与工作线程(t3 TESTFR/t2 S帧)
+        # 可能并发 sendall，无锁会交错写出损坏字节流
+        self._send_lock = threading.Lock()
 
         # 发送窗口：已发出但尚未被确认的 I 帧序号（用于 K 窗口限制）
         self._unacknowledged_i = 0
@@ -259,8 +279,14 @@ class IEC104Simulator(QThread):
         self._server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._server_socket.settimeout(1.0)
-        self._server_socket.bind((self.host, self.port))
-        self._server_socket.listen(1)
+        try:
+            self._server_socket.bind((self.host, self.port))
+            self._server_socket.listen(1)
+        except OSError as e:
+            # 端口被占用等：给出可读原因并结束线程，而不是抛通用异常
+            self.error_occurred.emit(
+                f"[服务端] 监听 {self.host}:{self.port} 失败（端口可能已被占用）: {e}")
+            return
 
         while self._running:
             self.log_message.emit("[服务端] 等待客户端连接...")
@@ -298,9 +324,14 @@ class IEC104Simulator(QThread):
                 self.send_startdt()
                 self._handle_connection()
             except (ConnectionRefusedError, socket.timeout, OSError) as e:
-                self.log_message.emit(f"[客户端] 连接失败: {e}")
+                self.error_occurred.emit(f"[客户端] 连接失败: {_friendly_connect_error(e)}")
                 if self._running:
-                    time.sleep(3)
+                    self.log_message.emit("[客户端] 3 秒后重试…（点击\"停止\"可中止）")
+                    # 可中断等待：整段 time.sleep(3) 会让 stop() 后线程迟迟不退出
+                    for _ in range(30):
+                        if not self._running:
+                            break
+                        time.sleep(0.1)
             finally:
                 if self._client_socket:
                     try:
@@ -330,32 +361,52 @@ class IEC104Simulator(QThread):
     # ==================================================================
 
     def _receive_and_process(self):
-        """接收并处理数据"""
+        """接收并处理数据
+
+        TCP 是字节流：recv 可能返回半包（帧不完整）或粘包（多帧一次到达），
+        这里用跨包缓冲 _rx_buffer 重组——凑齐"0x68 + 长度域"声明的完整帧才上送，
+        残留字节留待下一次 recv 拼接；起始字节非法时逐字节重同步。
+        """
+        # 局部引用 + None 检查：stop() 可能在 GUI 线程把 _client_socket 置 None，
+        # 直接 self._client_socket.recv 存在"判空后属性被改"的竞态
+        sock = self._client_socket
+        if sock is None:
+            return
         try:
-            data = self._client_socket.recv(4096)
-            if not data:
-                self.log_message.emit("[连接] 对端关闭连接")
-                self._client_socket = None
-                return
-
-            self._last_activity_time = time.time()
-            offset = 0
-            while offset < len(data):
-                if offset + 2 > len(data):
-                    break
-                if data[offset] != 0x68:
-                    offset += 1
-                    continue
-                apdu_len = data[offset + 1]
-                frame_len = apdu_len + 2
-                if offset + frame_len > len(data):
-                    break
-                frame_data = data[offset:offset + frame_len]
-                offset += frame_len
-                self._process_received_frame(frame_data)
-
+            data = sock.recv(4096)
         except socket.timeout:
-            pass
+            return
+        if not data:
+            self.log_message.emit("[连接] 对端关闭连接")
+            self._client_socket = None
+            return
+
+        self._last_activity_time = time.time()
+        self._rx_buffer.extend(data)
+        # 防御：对端异常刷垃圾字节时丢弃最旧数据，避免缓冲无限增长
+        if len(self._rx_buffer) > 256 * 1024:
+            del self._rx_buffer[:128 * 1024]
+
+        offset = 0
+        buf = self._rx_buffer
+        while offset + 2 <= len(buf):
+            if buf[offset] != 0x68:
+                offset += 1          # 重同步：跳过非法字节找帧头
+                continue
+            apdu_len = buf[offset + 1]
+            if not (4 <= apdu_len <= 253):
+                offset += 1          # 长度域非法，视为流内垃圾，重同步
+                continue
+            frame_len = apdu_len + 2
+            if offset + frame_len > len(buf):
+                break                # 半包：留给下次 recv 拼接
+            frame_data = bytes(buf[offset:offset + frame_len])
+            offset += frame_len
+            self._process_received_frame(frame_data)
+
+        # 消费已处理字节，保留未凑齐的尾部
+        if offset:
+            del self._rx_buffer[:offset]
 
     def _process_received_frame(self, frame_data: bytes):
         """处理一个收到的完整帧"""
@@ -659,13 +710,19 @@ class IEC104Simulator(QThread):
     # ==================================================================
 
     def _send_raw(self, hex_string: str):
-        """发送原始十六进制帧"""
-        if not self._client_socket:
+        """发送原始十六进制帧
+
+        加锁串行化 sendall：GUI 线程（手动发送/行内遥控）与工作线程
+        （t2 S帧 / t3 TESTFR）可能并发调用，无锁时字节流会交错损坏。
+        """
+        sock = self._client_socket
+        if sock is None:
             self.error_occurred.emit("未连接，无法发送")
             return False
         try:
             data = hex_to_bytes(hex_string)
-            self._client_socket.sendall(data)
+            with self._send_lock:
+                sock.sendall(data)
             self.frame_sent.emit(hex_string)
             self._last_activity_time = time.time()
             self.log_message.emit(f"[发] {hex_string[:60]}...")
@@ -792,6 +849,7 @@ class IEC104Simulator(QThread):
         self._rx_count_since_last_s = 0
         self._unacknowledged_i = 0
         self._select_locks.clear()
+        self._rx_buffer.clear()   # 新连接从干净字节流开始，旧半包不得混入
         self._last_send_time = 0
         self._last_rx_time = time.time()
         self._last_activity_time = time.time()

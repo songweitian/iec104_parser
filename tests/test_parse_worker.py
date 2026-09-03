@@ -153,6 +153,20 @@ class TestParseSingleFrame:
         frame = w._parse_single_frame(p, "ZZZZ", 4)
         assert "太短" in (frame.error or "")
 
+    def test_malformed_apdu_length_rejected(self):
+        """长度域非法（0x00/0xFF）的 U 帧不得触发 IndexError，应判 APCI 失败
+
+        回归：畸形 U 帧 68 00 07 00 00 00 曾把报文体截到 2 字节，
+        _describe_u_frame 切片越界使模拟器收包线程崩溃（GHSA-f5xp-w6f3-vvrv 同类缺陷）。
+        """
+        w = self._worker()
+        p = IEC104Parser(ParseMode.NORMAL)
+        for hex_str in ("68 00 07 00 00 00",     # 长度域=0
+                        "68 FF 07 00 00 00",     # 长度域=255 超上限
+                        "68 03 07 00 00 00"):    # 长度域=3 不足控制域4字节
+            frame = w._parse_single_frame(p, hex_str, 1)
+            assert "APCI" in (frame.error or ""), f"{hex_str} 应报 APCI 解析失败"
+
 
 class TestParseWithMetadata:
     def test_tx_overrides_role(self):

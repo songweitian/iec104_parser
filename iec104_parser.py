@@ -1165,10 +1165,15 @@ class IEC104Parser:
 
     def _parse_apci(self, raw: bytes) -> Optional[APCIHeader]:
         """解析APCI控制头"""
-        if raw[0] != 0x68:
+        if len(raw) < 6 or raw[0] != 0x68:
             return None
 
         apdu_len = raw[1]
+        # IEC 60870-5-104 §13.2：长度域 = 控制域4字节 + ASDU（最大249），
+        # 合法区间 4..253。不校验会让畸形帧（如 68 00 07 00 00 00）把
+        # 报文体截到 2 字节，后续控制域切片触发 IndexError。
+        if not (4 <= apdu_len <= 253):
+            return None
         ctrl_bytes = raw[2:6]
         ctrl1 = ctrl_bytes[0]
         ctrl2 = ctrl_bytes[1]
