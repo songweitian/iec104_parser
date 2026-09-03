@@ -4,7 +4,7 @@
 
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QLineEdit, QGroupBox, QFormLayout, QMessageBox, QApplication,
+    QLineEdit, QGroupBox, QFormLayout, QMessageBox,
     QTableWidget, QTableWidgetItem, QHeaderView
 )
 from PyQt5.QtCore import Qt
@@ -14,7 +14,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from license import get_hardware_fingerprint, get_license_info, activate, remove_license
+from license import get_hardware_fingerprint, get_license_info, activate
 
 
 class LicenseDialog(QDialog):

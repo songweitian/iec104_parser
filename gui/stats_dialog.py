@@ -3,7 +3,7 @@
 """
 
 from PyQt5.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
     QTabWidget, QWidget
 )
 from PyQt5.QtCore import Qt, QRectF

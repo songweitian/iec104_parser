@@ -14,9 +14,9 @@ import struct
 import calendar
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 from enum import IntEnum, Enum
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional, Dict, Any
 
 
 # 解析模式
@@ -117,17 +117,6 @@ class TypeID(IntEnum):
             return cls(type_id).name
         except ValueError:
             return f"未知类型({type_id})"
-
-    @classmethod
-    def get_direction(cls, type_id: int) -> str:
-        """判断类型标识的方向"""
-        if 1 <= type_id <= 44 or type_id == 70:
-            return "监视方向"
-        elif 45 <= type_id <= 69 or 100 <= type_id <= 110 or 120 <= type_id <= 127:
-            return "控制方向"
-        elif 128 <= type_id <= 255:
-            return "自定义范围"
-        return "未知方向"
 
     @classmethod
     def get_description(cls, type_id: int) -> str:
@@ -684,9 +673,6 @@ class IEC104Parser:
         # M3: 最近一条 I 帧的发送方（'master'/'slave'/None），用于 S/U 帧方向判定
         self._last_i_sender: Optional[str] = None
 
-    def set_mode(self, mode: ParseMode):
-        """设置解析模式"""
-        self.mode = mode
 
     def set_master_send_first(self, master_first: bool):
         """设置第一个报文是否由主站发出"""
@@ -796,29 +782,6 @@ class IEC104Parser:
         """清除已解析的报文"""
         self.frames.clear()
 
-    def get_statistics(self) -> Dict[str, Any]:
-        """获取解析统计"""
-        total = len(self.frames)
-        valid = sum(1 for f in self.frames if not f.error)
-        i_frames = sum(1 for f in self.frames if f.apci and f.apci.frame_type == "I-format")
-        s_frames = sum(1 for f in self.frames if f.apci and f.apci.frame_type == "S-format")
-        u_frames = sum(1 for f in self.frames if f.apci and f.apci.frame_type == "U-format")
-        errors = sum(1 for f in self.frames if f.error)
-
-        master_to_slave = sum(1 for f in self.frames if f.direction == "主站→子站")
-        slave_to_master = sum(1 for f in self.frames if f.direction == "子站→主站")
-
-        return {
-            "total": total,
-            "valid": valid,
-            "invalid": total - valid,
-            "i_frames": i_frames,
-            "s_frames": s_frames,
-            "u_frames": u_frames,
-            "errors": errors,
-            "master_send": master_to_slave,
-            "slave_send": slave_to_master,
-        }
 
     def check_sequence(self) -> List[Dict[str, Any]]:
         """检查I帧发送/接收序号连续性，返回异常列表"""

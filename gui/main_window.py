@@ -6,7 +6,6 @@ import os
 import sys
 import re
 import json
-import struct
 import logging
 from datetime import datetime
 from typing import List, Optional
@@ -14,16 +13,14 @@ from typing import List, Optional
 from PyQt5.QtWidgets import (
     QMainWindow, QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QTreeWidget, QTreeWidgetItem, QTextEdit, QPushButton,
-    QToolBar, QAction, QFileDialog, QMessageBox, QStatusBar,
-    QLabel, QLineEdit, QGroupBox, QGridLayout, QComboBox,
-    QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView,
-    QCheckBox, QSpinBox, QProgressBar, QMenu, QMenuBar,
-    QDialog, QListWidget, QListWidgetItem, QFrame, QPlainTextEdit,
-    QDialogButtonBox, QFormLayout, QInputDialog,
-    QStyledItemDelegate, QStyleOptionViewItem, QStyle
+    QToolBar, QFileDialog, QMessageBox, QStatusBar,
+    QLabel, QLineEdit, QGroupBox, QComboBox,
+    QTabWidget, QTableWidget, QProgressBar, QMenu,
+    QDialog, QPlainTextEdit, QInputDialog,
+    QStyledItemDelegate, QStyle
 )
 from PyQt5.QtCore import Qt, QTimer, QSettings, QSize, QPoint
-from PyQt5.QtGui import (QFont, QColor, QTextCursor, QIcon, QPalette,
+from PyQt5.QtGui import (QFont, QColor, QTextCursor, QIcon,
                          QPainter, QBrush, QPen, QPixmap, QFontMetrics)
 
 # 确保能找到父模块
@@ -31,8 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from iec104_parser import (
     IEC104Parser, IEC104Frame, SignalType, TypeID, COT,
-    APCIHeader, ASDU, InfoElement, ParseMode,
-    hex_to_bytes, is_log_format
+    ParseMode
 )
 from gui.about_dialog import AboutDialog
 from gui.stats_dialog import StatsDialog
@@ -40,7 +36,7 @@ from gui.ioa_alias_dialog import IOAAliasDialog, get_alias
 from gui.style import LIGHT_QSS, DARK_QSS
 from gui.exporters import export_csv, export_json, export_txt
 # 拆分出去的模块，这里重新导出以保持 `from gui.main_window import ...` 既有引用不变
-from gui.icons import create_app_icon, _doc_icon, _arrow_icon, _ICON_PRIMARY
+from gui.icons import create_app_icon, _doc_icon, _ICON_PRIMARY
 from gui.parse_worker import ParseWorker
 from version import APP_TITLE, APP_VERSION
 
@@ -70,7 +66,6 @@ FILTER_BTN_STYLE_ACTIVE = (
 LICENSE_COLOR_OK = "#2E7D32"
 LICENSE_COLOR_WARN = "#FF9800"    # 剩余 ≤7 天 / 未激活
 LICENSE_COLOR_DANGER = "#F44336"  # 剩余 ≤3 天 / 已到期
-
 
 
 class FrameCellDelegate(QStyledItemDelegate):
@@ -1112,12 +1107,6 @@ class MainWindow(QMainWindow):
             self.hex_view.clear()
             self._update_status_stats()
 
-    def _get_current_hex_input(self):
-        """获取当前活动的输入框"""
-        idx = self.input_tabs.currentIndex()
-        if 0 <= idx < len(self._input_tab_list):
-            return self._input_tab_list[idx][1]
-        return self.hex_input
 
     # ==================================================================
     # 导入/导出
@@ -1629,7 +1618,7 @@ class MainWindow(QMainWindow):
                 elem_root = self._add_tree_item(
                     asdu_root, f"信息元素 #{i+1}",
                     f"IOA=0x{elem.ioa:06X}{alias_str} [{elem_sig}]",
-                    f"信息对象地址")
+                    "信息对象地址")
                 if elem.value_desc:
                     self._add_tree_item(elem_root, "值", elem.value_desc, "")
                 if elem.quality:
@@ -1766,20 +1755,6 @@ class MainWindow(QMainWindow):
             flush_row()
         return "<br>".join(rows)
 
-    def _format_hex(self, raw: str) -> str:
-        """格式化十六进制字符串，每16字节换行"""
-        cleaned = raw.replace(" ", "").replace("\n", "")
-        cleaned = ''.join(c for c in cleaned if c in '0123456789ABCDEFabcdef')
-        if len(cleaned) % 2 != 0:
-            return raw
-        result = []
-        byte_count = 0
-        for i in range(0, len(cleaned), 2):
-            result.append(cleaned[i:i+2].upper())
-            byte_count += 1
-            if byte_count % 16 == 0:
-                result.append("\n")
-        return " ".join(result)
 
     # ==================================================================
     # 事件处理
@@ -2128,96 +2103,6 @@ class MainWindow(QMainWindow):
 
         self.hex_input.setExtraSelections(selections)
 
-    def _highlight_input_bytes(self, start_byte: int, end_byte: int, frame_index: int = 0):
-        """在原始报文输入区高亮指定字节范围"""
-        byte_map = getattr(self, '_byte_position_map', [])
-        frame_offsets = getattr(self, '_frame_byte_offset', [])
-
-        # Convert frame-relative to global byte index
-        if frame_index < len(frame_offsets):
-            offset = frame_offsets[frame_index]
-            start_byte += offset
-            end_byte += offset
-
-        if start_byte >= len(byte_map) or end_byte > len(byte_map):
-            return
-
-        text_start = byte_map[start_byte]
-        text_end = byte_map[end_byte - 1] + 1
-
-        cursor = self.hex_input.textCursor()
-        cursor.setPosition(text_start)
-        cursor.setPosition(text_end, QTextCursor.KeepAnchor)
-
-        extra_sel = QTextEdit.ExtraSelection()
-        extra_sel.format.setBackground(QColor("#FFEB3B"))
-        extra_sel.format.setForeground(QColor("#000000"))
-        extra_sel.cursor = cursor
-        self.hex_input.setExtraSelections([extra_sel])
-
-    def _build_byte_position_map(self, text: str) -> list:
-        """构建字节索引到原始文本位置的映射。
-        处理普通十六进制和带时间戳/方向标记的通信日志格式。
-        返回 list[byte_idx] = text_position_of_first_hex_char。
-        """
-        byte_map = []
-        is_log = is_log_format(text)
-        i = 0
-        n = len(text)
-
-        while i < n:
-            if is_log:
-                rest = text[i:]
-                # 跳过纯元数据行 (时间戳 + RX/TX，行尾无十六进制数据)
-                m = re.match(r'[\d:.\s]+(?:RX|TX):[ \t]*[\r\n]+', rest)
-                if m:
-                    i += m.end()
-                    continue
-                m = re.match(r'^(?:RX|TX):[ \t]*[\r\n]+', rest)
-                if m:
-                    i += m.end()
-                    continue
-
-                # 跳过行首的元数据前缀 (时间戳 + RX/TX + 空格，后面跟十六进制数据)
-                m = re.match(r'[\d:.\s]+(?:RX|TX):[ \t]*', rest)
-                if m:
-                    i += m.end()
-                else:
-                    m = re.match(r'^(?:RX|TX):[ \t]*', rest)
-                    if m:
-                        i += m.end()
-
-            # 从当前位置开始收集十六进制字节对
-            byte_start = None
-            byte_chars = []
-            while i < n:
-                c = text[i]
-                if c in '0123456789ABCDEFabcdef':
-                    if byte_start is None:
-                        byte_start = i
-                    byte_chars.append(c)
-                    if len(byte_chars) == 2:
-                        byte_map.append(byte_start)
-                        byte_chars = []
-                        byte_start = None
-                elif c in '\r\n':
-                    i += 1
-                    break
-                # else: 分隔符 (. 或 空格), 忽略
-                i += 1
-            else:
-                break  # 文本结束
-
-        return byte_map
-
-    def _current_frame_index(self) -> int:
-        """获取当前展示的报文索引"""
-        sel = self.table_widget.selectionModel()
-        if sel and sel.hasSelection():
-            rows = sel.selectedRows()
-            if rows:
-                return self._frame_idx_at_row(rows[0].row())
-        return self._frame_idx_at_row(self.table_widget.currentRow())
 
     # ==================================================================
     # 拖放文件支持

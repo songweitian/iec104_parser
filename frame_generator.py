@@ -4,7 +4,6 @@ IEC104 帧生成器
 """
 
 import struct
-from typing import Optional
 
 
 def generate_i_frame(

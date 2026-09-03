@@ -4,7 +4,7 @@
 
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QTableWidget, QTableWidgetItem, QHeaderView, QWidget
+    QTableWidget, QTableWidgetItem, QHeaderView
 )
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont

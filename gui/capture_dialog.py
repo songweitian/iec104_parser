@@ -5,10 +5,9 @@
 
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QComboBox, QSpinBox, QTextEdit, QGroupBox, QFormLayout,
+    QComboBox, QSpinBox, QGroupBox, QFormLayout,
     QCheckBox, QMessageBox
 )
-from PyQt5.QtCore import Qt
 
 
 class CaptureDialog(QDialog):

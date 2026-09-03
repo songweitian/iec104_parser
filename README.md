@@ -53,7 +53,8 @@
 - **报文对比**：并排对比两组报文的差异
 
 ### 工具功能
-- **帧生成器**：根据参数生成符合标准的IEC104报文帧
+- **帧生成器**：根据参数生成符合标准的IEC104报文帧，遥控/遥调支持选择（预制）/执行
+- **通信模拟器**：主站/从站模式 TCP 通信模拟，四遥数据表格化展示，从站模式下可编辑点位值
 - **IOA地址别名**：管理IOA地址与名称的映射关系
 - **历史会话管理**：保存/加载/删除解析会话
 
@@ -88,6 +89,9 @@
 | Ctrl+Shift+T | 导出TXT |
 | Ctrl+Shift+D | 切换主题 |
 | Ctrl+Shift+M | 报文对比 |
+| Ctrl+M | 通信模拟器 |
+| Ctrl+Shift+S | 序号检查 |
+| Ctrl+Shift+I | IOA地址别名 |
 | Ctrl+Shift+R | 历史报文管理 |
 | Ctrl+1/2/3 | 切换结果面板标签页 |
 | Ctrl+Up/Down | 上/下一个书签 |
@@ -226,26 +230,30 @@ iec104_parser/
 ├── main.py                 # 程序入口
 ├── iec104_parser.py        # 核心协议解析引擎
 ├── frame_generator.py      # 帧生成器
+├── iec104_simulator.py     # IEC104 通信模拟器（TCP 主/从站）
 ├── pcap_importer.py        # PCAP文件导入
 ├── license.py              # 注册激活模块
-├── gen_license.py          # 激活码生成工具
+├── gen_license.py          # 激活码生成工具（开发者专用，不随发行包分发）
+├── version.py              # 版本/作者信息（发版只改一处）
 ├── requirements.txt        # Python 依赖
 ├── build.bat               # 打包脚本
 ├── gui/
 │   ├── __init__.py
 │   ├── main_window.py      # 主窗口（UI 面板统筹）
-│   ├── parse_worker.py     # 后台解析/抓包工作线程
+│   ├── parse_worker.py     # 后台解析工作线程（含同步入口）
+│   ├── style.py            # 浅色/深色主题样式表
 │   ├── icons.py            # 程序图标绘制
 │   ├── about_dialog.py     # 关于/IOA说明
 │   ├── license_dialog.py   # 激活对话框
 │   ├── compare_dialog.py   # 报文对比
 │   ├── generator_dialog.py # 帧生成器
+│   ├── simulator_dialog.py # 通信模拟器对话框
 │   ├── history_dialog.py   # 历史会话
 │   ├── stats_dialog.py     # 统计图表
+│   ├── exporters.py        # CSV/JSON/TXT 导出
+│   ├── capture_dialog.py   # 网络抓包配置（预留）
 │   └── ioa_alias_dialog.py # IOA别名管理
-├── tests/
-│   ├── test_phase1.py      # 基础功能测试
-│   └── test_phase3.py      # 协议解析测试
+├── tests/                  # pytest 测试（协议解析/授权/搜索视图/导出等）
 └── sessions/               # 历史会话存储
 ```
 
@@ -278,7 +286,7 @@ python gen_license.py <硬件指纹> 2026-12-31
 
 - **作者**：宋伟田
 - **邮箱**：3028905947@qq.com
-- **编辑日期**：2026-06-18
+- **编辑日期**：2026-09-03
 
 ## 许可
 

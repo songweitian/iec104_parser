@@ -4,14 +4,12 @@ IEC60870-5-104 通信模拟器
 """
 
 import socket
-import struct
 import threading
 import time
 import logging
-import random
 from enum import Enum, IntEnum
-from dataclasses import dataclass, field
-from typing import Optional, Callable, Dict, Any, List
+from dataclasses import dataclass
+from typing import Optional, Dict, Any
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
@@ -466,11 +464,6 @@ class IEC104Simulator(QThread):
         if self._rx_count_since_last_s >= self.w:
             self.send_s_frame()
 
-    def _handle_s_frame_received(self, frame):
-        """处理收到的 S 帧 (通过 parser 解析)"""
-        rn = frame.apci.recv_seq
-        self.log_message.emit(f"[S帧] 确认序号 RN={rn}")
-        self._handle_s_frame_received_raw(rn)
 
     def _handle_s_frame_received_raw(self, rn: int):
         """处理收到的 S 帧 (直接使用序号)

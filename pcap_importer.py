@@ -196,12 +196,3 @@ def pcap_to_hex_text(file_path: str) -> str:
     return '\n'.join(lines)
 
 
-def is_pcap_file(file_path: str) -> bool:
-    """检查文件是否是 PCAP 格式"""
-    try:
-        with open(file_path, 'rb') as f:
-            magic = f.read(4)
-            return magic in (b'\xd4\xc3\xb2\xa1', b'\xa1\xb2\xc3\xd4',
-                           b'\x4d\x3c\xb2\xa1', b'\xa1\xb2\x3c\x4d')
-    except Exception:
-        return False

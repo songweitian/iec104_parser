@@ -57,9 +57,9 @@ def generate_keypair(force: bool = False):
     else:
         print("  提示: Windows 下无法设置 POSIX 文件权限，请确保私钥目录不被他人访问")
 
-    print(f"已生成密钥对:")
+    print("已生成密钥对:")
     print(f"  私钥文件: {KEY_FILE}")
-    print(f"           （已列入 .gitignore；请务必异地备份！）")
+    print("           （已列入 .gitignore；请务必异地备份！）")
     print(f"  公钥(hex): {pub_hex}")
     print()
     print("请把上面的公钥填入 license.py 的 _LICENSE_PUBLIC_KEY_HEX 常量，")

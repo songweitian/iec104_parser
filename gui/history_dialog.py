@@ -9,11 +9,10 @@ import json
 import time
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox,
-    QLineEdit, QFileDialog, QInputDialog
+    QTableWidget, QTableWidgetItem, QMessageBox,
+    QLineEdit, QInputDialog
 )
 from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QFont
 
 
 def _get_app_dir() -> str:

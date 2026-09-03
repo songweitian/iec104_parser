@@ -3,11 +3,10 @@ IEC104 帧生成器对话框
 """
 
 from PyQt5.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
     QComboBox, QLineEdit, QTextEdit, QGroupBox, QFormLayout,
     QMessageBox, QSpinBox, QApplication
 )
-from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont
 import sys
 import os

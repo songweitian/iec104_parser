@@ -6,14 +6,13 @@ IEC104 通信模拟器对话框
 
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QComboBox, QLineEdit, QGroupBox, QFormLayout,
-    QMessageBox, QSpinBox, QSplitter, QTableWidget, QTableWidgetItem,
-    QHeaderView, QPlainTextEdit, QCheckBox, QTabWidget, QWidget,
-    QDoubleSpinBox, QToolBar, QAction, QSizePolicy, QAbstractItemView,
-    QFileDialog
+    QComboBox, QLineEdit, QGroupBox,
+    QMessageBox, QSpinBox, QTableWidget, QTableWidgetItem,
+    QCheckBox, QTabWidget, QWidget,
+    QDoubleSpinBox, QFileDialog
 )
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QFont, QColor, QIcon
+from PyQt5.QtGui import QFont, QColor
 
 import csv
 import json
@@ -25,9 +24,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from iec104_simulator import (
     IEC104Simulator, SimulatorRole, ConnectionState,
-    PointData, create_default_points, DEFAULT_IOA_RANGES
+    PointData, create_default_points
 )
-from iec104_parser import IEC104Parser, TypeID, COT, SignalType, hex_to_bytes
+from iec104_parser import IEC104Parser, hex_to_bytes
 
 
 # 样式常量
