@@ -11,9 +11,8 @@ import re
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from iec104_parser import (
-    IEC104Parser, IEC104Frame, ParseMode,
-    hex_to_bytes, is_log_format, split_concatenated_frames, parse_log_format_blocks,
-    _CONTROL_TYPE_IDS, _MONITOR_TYPE_IDS,
+    IEC104Parser, ParseMode,
+    is_log_format, split_concatenated_frames, parse_log_format_blocks,
 )
 
 
@@ -194,10 +193,12 @@ class ParseWorker(QThread):
         for line_idx, line in enumerate(lines):
             line = line.strip()
 
+            # 时间戳/方向标记行，冒号后可带同行十六进制（如 "13:25:00.692 RX: 68 04 ..."）。
+            # 此前要求标记独占一行，同行格式的日志整块被静默丢弃（0 帧解析）。
             if parse_mode == ParseMode.XN3000:
-                ts_match = re.match(r'^(\d{2}:\d{2}:\d{2}\.\d+)\s+(RX|TX):\s*$', line)
+                ts_match = re.match(r'^(\d{2}:\d{2}:\d{2}\.\d+)\s+(RX|TX):\s*(.*)$', line)
             else:
-                ts_match = re.match(r'^([\d\- :\.]+)\s+(send|recv):\s*$', line)
+                ts_match = re.match(r'^([\d\- :\.]+)\s+(send|recv):\s*(.*)$', line)
 
             if ts_match:
                 if current_hex_parts:
@@ -207,6 +208,12 @@ class ParseWorker(QThread):
                     current_line_nums = []
                 current_timestamp = ts_match.group(1)
                 current_direction = ts_match.group(2)
+                same_line = ts_match.group(3).strip()
+                if same_line:
+                    cleaned = same_line.replace('.', '').strip()
+                    if cleaned:
+                        current_hex_parts.append(cleaned)
+                        current_line_nums.append(line_idx)
                 continue
 
             if current_timestamp:
@@ -222,84 +229,13 @@ class ParseWorker(QThread):
         return blocks, line_map
 
     def _parse_single_frame(self, parser, hex_string: str, index: int):
-        """解析单个帧"""
-        frame = IEC104Frame()
-        frame.index = index
-        frame.raw_hex = hex_string.strip()
+        """解析单个帧
 
-        try:
-            raw_bytes = hex_to_bytes(frame.raw_hex)
-        except ValueError as e:
-            frame.error = f"十六进制解析错误: {e}"
-            return frame
-
-        if len(raw_bytes) < 6:
-            frame.error = "报文太短 (最少6字节)"
-            return frame
-
-        frame.apci = parser._parse_apci(raw_bytes)
-        if frame.apci is None:
-            frame.error = "APCI解析失败"
-            return frame
-
-        apci = frame.apci
-
-        if len(raw_bytes) < apci.total_length:
-            frame.error = f"报文不完整 (需要{apci.total_length}字节, 实际{len(raw_bytes)}字节)"
-        else:
-            raw_bytes = raw_bytes[:apci.total_length]
-
-        if parser.last_master_send:
-            frame.send_role = "子站"
-            frame.recv_role = "主站"
-            frame.direction = "子站→主站"
-        else:
-            frame.send_role = "主站"
-            frame.recv_role = "子站"
-            frame.direction = "主站→子站"
-        parser.last_master_send = not parser.last_master_send
-
-        if apci.frame_type == "I-format" and len(raw_bytes) >= 7:
-            try:
-                frame.asdu = parser._parse_asdu(raw_bytes[6:], apci)
-                parser._build_description(frame)
-
-                tid = frame.asdu.type_id
-                if tid in _CONTROL_TYPE_IDS:
-                    frame.direction = "主站→子站"
-                    frame.send_role = "主站"
-                    frame.recv_role = "子站"
-                    parser.last_master_send = True
-                    parser._last_i_sender = 'master'
-                elif tid in _MONITOR_TYPE_IDS:
-                    frame.direction = "子站→主站"
-                    frame.send_role = "子站"
-                    frame.recv_role = "主站"
-                    parser.last_master_send = False
-                    parser._last_i_sender = 'slave'
-
-                frame.signal_type = frame.asdu.signal_type
-                frame.signal_label = frame.asdu.signal_type.label
-
-            except Exception as e:
-                frame.error = f"ASDU解析异常: {e}"
-        elif apci.frame_type == "S-format":
-            frame.description = f"S帧 (确认帧, RN={apci.recv_seq})"
-            # M3: S帧由最近收到 I 帧的一方发送确认，据此推断方向
-            if parser._last_i_sender == 'master':
-                frame.direction = "子站→主站"
-                frame.send_role = "子站"
-                frame.recv_role = "主站"
-                parser.last_master_send = False
-            elif parser._last_i_sender == 'slave':
-                frame.direction = "主站→子站"
-                frame.send_role = "主站"
-                frame.recv_role = "子站"
-                parser.last_master_send = True
-        elif apci.frame_type == "U-format":
-            frame.description = parser._describe_u_frame(raw_bytes[2:6])
-
-        return frame
+        直接委托 parser.parse_hex——此前这里是 parse_hex 的手工副本，缺少
+        CP56→CP24 小时学习（_last_known_hour）更新，且不完整帧的处理行为
+        与 parse_hex 不一致；两套逻辑并存导致修复需要改两处（审查遗留）。
+        """
+        return parser.parse_hex(hex_string)
 
     def _parse_frame_with_metadata(self, parser, hex_string: str, timestamp: str, direction: str, index: int):
         """解析帧并附加元数据"""
