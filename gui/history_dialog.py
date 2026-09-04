@@ -6,6 +6,7 @@
 import os
 import sys
 import json
+import re
 import time
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -145,7 +146,9 @@ class HistoryDialog(QDialog):
         if not os.path.exists(HISTORY_DIR):
             os.makedirs(HISTORY_DIR)
 
-        filename = f"{name.replace(' ', '_')}_{int(time.time())}.json"
+        # 消毒文件名：移除 Windows 文件名非法字符 \ / : * ? " < > |
+        safe_name = re.sub(r'[\\/:*?"<>|]', '_', name)
+        filename = f"{safe_name}_{int(time.time())}.json"
         path = os.path.join(HISTORY_DIR, filename)
 
         with open(path, 'w', encoding='utf-8') as f:

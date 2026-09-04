@@ -120,37 +120,40 @@ class CompareDialog(QDialog):
         self.frames_a = parse_text_sync(text_a)
         self.frames_b = parse_text_sync(text_b)
 
-        # Compare by IOA
+        # Compare by (common_address, IOA) - 否则不同公共地址的相同 IOA 会被误判为同一对象
         map_a = {}
         for f in self.frames_a:
             if f.asdu:
+                ca = f.asdu.common_address
                 for e in f.asdu.information_elements:
-                    map_a[e.ioa] = (f, e)
+                    map_a[(ca, e.ioa)] = (f, e)
 
         map_b = {}
         for f in self.frames_b:
             if f.asdu:
+                ca = f.asdu.common_address
                 for e in f.asdu.information_elements:
-                    map_b[e.ioa] = (f, e)
+                    map_b[(ca, e.ioa)] = (f, e)
 
         # Find differences
-        all_ioas = sorted(set(list(map_a.keys()) + list(map_b.keys())))
+        all_keys = sorted(set(list(map_a.keys()) + list(map_b.keys())))
         diffs = []
-        for ioa in all_ioas:
-            if ioa in map_a and ioa in map_b:
-                fa, ea = map_a[ioa]
-                fb, eb = map_b[ioa]
+        for key in all_keys:
+            ca, ioa = key
+            if key in map_a and key in map_b:
+                fa, ea = map_a[key]
+                fb, eb = map_b[key]
                 val_a = str(ea.value) if ea.value is not None else "-"
                 val_b = str(eb.value) if eb.value is not None else "-"
                 if val_a != val_b:
                     diffs.append(("不同", fa.index, ea, val_a, fb.index, eb, val_b))
                 else:
                     diffs.append(("相同", fa.index, ea, val_a, fb.index, eb, val_b))
-            elif ioa in map_a:
-                fa, ea = map_a[ioa]
+            elif key in map_a:
+                fa, ea = map_a[key]
                 diffs.append(("仅A", fa.index, ea, str(ea.value), "-", None, "-"))
             else:
-                fb, eb = map_b[ioa]
+                fb, eb = map_b[key]
                 diffs.append(("仅B", "-", None, "-", fb.index, eb, str(eb.value)))
 
         # Populate table
@@ -170,7 +173,9 @@ class CompareDialog(QDialog):
 
             self.result_table.setItem(i, 1, QTableWidgetItem(str(idx_a)))
             self.result_table.setItem(i, 2, QTableWidgetItem(ea.signal_type.label if ea else "-"))
-            self.result_table.setItem(i, 3, QTableWidgetItem(f"0x{ea.ioa:06X}" if ea else "-"))
+            # IOA 列显示 "CA=x IOA=0x..." 格式
+            ca_str_a = f"CA={fa.asdu.common_address}" if fa.asdu else ""
+            self.result_table.setItem(i, 3, QTableWidgetItem(f"{ca_str_a} IOA=0x{ea.ioa:06X}" if ea else "-"))
 
             val_a_item = QTableWidgetItem(val_a)
             val_b_item = QTableWidgetItem(val_b)
@@ -183,7 +188,8 @@ class CompareDialog(QDialog):
 
             self.result_table.setItem(i, 5, QTableWidgetItem(str(idx_b)))
             self.result_table.setItem(i, 6, QTableWidgetItem(eb.signal_type.label if eb else "-"))
-            self.result_table.setItem(i, 7, QTableWidgetItem(f"0x{eb.ioa:06X}" if eb else "-"))
+            ca_str_b = f"CA={fb.asdu.common_address}" if fb.asdu else ""
+            self.result_table.setItem(i, 7, QTableWidgetItem(f"{ca_str_b} IOA=0x{eb.ioa:06X}" if eb else "-"))
             self.result_table.setItem(i, 8, val_b_item)
 
         self.result_table.setSortingEnabled(True)
