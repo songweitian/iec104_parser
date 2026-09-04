@@ -618,20 +618,31 @@ def parse_log_format_blocks(text: str) -> tuple:
         if not line:
             continue
 
-        m = re.match(r'[\d:.\s]+(RX|TX):\s*$', line)
+        # RX:/TX: 标记行，冒号后可带同行十六进制（如 "13:25:00.692 RX: 68 04 ..."）。
+        # 此前只认行尾形式，同行格式会把时间戳数字混进 hex 流（数字恰为合法
+        # 十六进制字符），报文字节错乱。
+        m = re.match(r'[\d:.\s]+(RX|TX):\s*(.*)$', line)
         if m:
             if current_hex:
                 blocks.append((' '.join(current_hex), list(current_line_nums)))
                 current_hex = []
                 current_line_nums = []
+            same_line = m.group(2).strip()
+            if same_line and re.search(r'[0-9A-Fa-f]{2}', same_line):
+                current_hex.append(same_line)
+                current_line_nums.append(i)
             continue
 
-        m = re.match(r'^(RX|TX):\s*$', line)
+        m = re.match(r'^(RX|TX):\s*(.*)$', line)
         if m:
             if current_hex:
                 blocks.append((' '.join(current_hex), list(current_line_nums)))
                 current_hex = []
                 current_line_nums = []
+            same_line = m.group(2).strip()
+            if same_line and re.search(r'[0-9A-Fa-f]{2}', same_line):
+                current_hex.append(same_line)
+                current_line_nums.append(i)
             continue
 
         if re.search(r'[0-9A-Fa-f]{2}', line):

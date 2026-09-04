@@ -2185,14 +2185,20 @@ class MainWindow(QMainWindow):
             self.lbl_input_status.setText("")
             return
 
-        # 逐行收集数据行：跳过空行/# 注释/日志格式元数据行（如 "13:25:00.692 RX:"）
+        # 逐行收集数据行：跳过空行/# 注释/日志格式元数据行（如 "13:25:00.692 RX:"），
+        # 标记后带同行十六进制时仅保留 hex 部分（时间戳数字是合法 hex 字符，
+        # 混入会把字节数/合法性判断带偏）
         data_lines = []
         for line in text.splitlines():
             stripped = line.strip()
             if not stripped or stripped.startswith('#'):
                 continue
-            if re.match(r'^[\d\- :.]*?(RX|TX|send|recv)\s*:\s*$',
-                        stripped, re.IGNORECASE):
+            m = re.match(r'^[\d\- :.]*?(RX|TX|send|recv)\s*:\s*(.*)$',
+                         stripped, re.IGNORECASE)
+            if m:
+                rest = m.group(2).strip()
+                if rest:
+                    data_lines.append(rest)
                 continue
             data_lines.append(stripped)
 
