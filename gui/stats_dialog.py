@@ -7,7 +7,7 @@ from PyQt5.QtWidgets import (
     QTabWidget, QWidget
 )
 from PyQt5.QtCore import Qt, QRectF
-from PyQt5.QtGui import QFont, QColor, QPainter, QPen, QBrush
+from PyQt5.QtGui import QFont, QColor, QPainter, QPen, QBrush, QPalette
 
 
 class BarChartWidget(QWidget):
@@ -28,6 +28,9 @@ class BarChartWidget(QWidget):
 
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
+        # 配色跟随系统主题：硬编码 #333/#E0E0E0 在深色主题下会不可见
+        text_pen = QPen(self.palette().color(QPalette.WindowText))
+        grid_pen = QPen(self.palette().color(QPalette.Mid), 1, Qt.DashLine)
 
         w = self.width()
         h = self.height()
@@ -35,7 +38,7 @@ class BarChartWidget(QWidget):
         # 标题
         title_font = QFont("Microsoft YaHei", 12, QFont.Bold)
         painter.setFont(title_font)
-        painter.setPen(QColor("#333"))
+        painter.setPen(text_pen)
         painter.drawText(QRectF(0, 10, w, 30), Qt.AlignCenter, self.title)
 
         # 绘图区域
@@ -59,7 +62,7 @@ class BarChartWidget(QWidget):
         bar_width = max(20, (chart_w - bar_spacing * (bar_count + 1)) / bar_count)
 
         # 绘制网格线
-        painter.setPen(QPen(QColor("#E0E0E0"), 1, Qt.DashLine))
+        painter.setPen(grid_pen)
         label_font = QFont("Consolas", 8)
         painter.setFont(label_font)
         for i in range(5):
@@ -82,14 +85,14 @@ class BarChartWidget(QWidget):
             painter.drawRoundedRect(QRectF(x, y, bar_width, bar_h), 3, 3)
 
             # 数值标签
-            painter.setPen(QColor("#333"))
+            painter.setPen(text_pen)
             val_font = QFont("Consolas", 9, QFont.Bold)
             painter.setFont(val_font)
             painter.drawText(QRectF(x, y - 20, bar_width, 20),
                              Qt.AlignCenter, str(value))
 
             # X轴标签
-            painter.setPen(QColor("#666"))
+            painter.setPen(text_pen)
             lbl_font = QFont("Microsoft YaHei", 8)
             painter.setFont(lbl_font)
             painter.drawText(QRectF(x - 10, margin_top + chart_h + 5,
@@ -117,6 +120,8 @@ class PieChartWidget(QWidget):
 
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
+        # 配色跟随系统主题
+        text_pen = QPen(self.palette().color(QPalette.WindowText))
 
         w = self.width()
         h = self.height()
@@ -124,7 +129,7 @@ class PieChartWidget(QWidget):
         # 标题
         title_font = QFont("Microsoft YaHei", 12, QFont.Bold)
         painter.setFont(title_font)
-        painter.setPen(QColor("#333"))
+        painter.setPen(text_pen)
         painter.drawText(QRectF(0, 10, w, 30), Qt.AlignCenter, self.title)
 
         total = sum(v for _, v, _ in self.data)
@@ -155,7 +160,7 @@ class PieChartWidget(QWidget):
             painter.setPen(Qt.NoPen)
             lx = w * 0.65
             painter.drawRect(int(lx), int(legend_y), 14, 14)
-            painter.setPen(QColor("#333"))
+            painter.setPen(text_pen)
             legend_font = QFont("Microsoft YaHei", 9)
             painter.setFont(legend_font)
             pct = value / total * 100

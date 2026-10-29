@@ -8,11 +8,11 @@ from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QLineEdit, QGroupBox,
     QMessageBox, QSpinBox, QTableWidget, QTableWidgetItem,
-    QCheckBox, QTabWidget, QWidget,
-    QDoubleSpinBox, QFileDialog
+    QCheckBox, QTabWidget,
+    QDoubleSpinBox, QFileDialog, QFormLayout, QDialogButtonBox
 )
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QFont, QColor
+from PyQt5.QtGui import QFont
 
 import csv
 import json
@@ -27,54 +27,65 @@ from iec104_simulator import (
     PointData, create_default_points
 )
 from iec104_parser import IEC104Parser, hex_to_bytes
+from app_paths import get_app_dir
+from gui.sim_point_tables import PointTablesMixin
+from gui.sim_style import (
+    YX_ON_COLOR,
+    YX_OFF_COLOR,
+    BLUE_LIGHT,
+    PURPLE_LIGHT,
+    BLUE_DARK,
+    PURPLE_DARK,
+    RED_LIGHT,
+    RED_DARK,
+    ERROR_FG_LIGHT,
+    ERROR_FG_DARK,
+    LOCAL_FG,
+    START_BTN_ACTIVE,
+    START_BTN_INACTIVE,
+    STOP_BTN_ACTIVE,
+    STOP_BTN_INACTIVE,
+    SEL_BTN_NORMAL,
+    SEL_BTN_ARMED,
+    YK_BTN_ON_NORMAL,
+    YK_BTN_ON_ARMED,
+    YK_BTN_OFF_NORMAL,
+    YK_BTN_OFF_ARMED,
+)
 
 
 # 样式常量
-INVALID_COLOR = QColor("#AAAAAA")
-YX_ON_COLOR = QColor("#4CAF50")
-YX_OFF_COLOR = QColor("#F44336")
-GRAY_BG = QColor("#F5F5F5")
-BLUE_LIGHT = QColor("#E3F2FD")
-PURPLE_LIGHT = QColor("#F3E5F5")
 # 深色主题下的收发日志行背景（暗色系，避免浅色刺眼）
-BLUE_DARK = QColor("#1A3650")
-PURPLE_DARK = QColor("#3A2A4A")
 # 错误日志行背景（浅/深主题）
-RED_LIGHT = QColor("#FDE7E7")
-RED_DARK = QColor("#4A2222")
-ERROR_FG_LIGHT = QColor("#C62828")
-ERROR_FG_DARK = QColor("#EF9A9A")
-LOCAL_FG = QColor("#9E9E9E")
+
+# 点位表格里允许编辑的列（描述）
 
 # 启动/停止按钮点亮样式：当前状态对应的按钮高亮，另一按钮灰暗
-START_BTN_ACTIVE = (
-    "QPushButton { background-color: #4CAF50; color: white; font-weight: bold; "
-    "padding: 5px 16px; border-radius: 3px; border: none; }"
-    "QPushButton:hover { background-color: #388E3C; }"
-)
-START_BTN_INACTIVE = (
-    "QPushButton { background-color: #9E9E9E; color: #E0E0E0; font-weight: bold; "
-    "padding: 5px 16px; border-radius: 3px; border: none; }"
-)
-STOP_BTN_ACTIVE = (
-    "QPushButton { background-color: #f44336; color: white; font-weight: bold; "
-    "padding: 5px 16px; border-radius: 3px; border: none; }"
-    "QPushButton:hover { background-color: #c62828; }"
-)
-STOP_BTN_INACTIVE = (
-    "QPushButton { background-color: #9E9E9E; color: #E0E0E0; font-weight: bold; "
-    "padding: 5px 16px; border-radius: 3px; border: none; }"
-)
+
+# 遥控/遥调：合(绿)/分(红) 采用电力行业"合位绿、分位红"语义；
+# 预制按钮在"已预制(armed)"时转绿并加粗，与初始橙色明确区分
+# 遥控行按钮：预制阶段(预制合/预制分)与执行阶段(执行合/执行分)同色系，
+# 执行态加粗描边以示"已解锁可下发"；合绿/分红语义保持
+
+# IEC 104 协议参数默认值（对齐 lib60870 / QTester104 等专业工具暴露项）
+DEFAULT_PARAMS = {
+    "t1": 15.0,        # 发送 I 帧后等待确认超时 (s)
+    "t2": 10.0,        # 收到 I 帧后延迟发 S 帧确认 (s)，需 < t1
+    "t3": 20.0,        # 空闲时发送 TESTFR 周期 (s)
+    "k": 12,           # 发送窗口（未被确认的最大 I 帧数）
+    "w": 8,            # 接收窗口（发 S 帧前可收的 I 帧数），需 <= k
+    "ca": 1,           # ASDU 公共地址（站地址）
+    "gi_period": 0,    # 主站周期总召唤间隔 (s)，0=仅连接后总召唤一次
+    "base_yx": 0x0001, # 遥信 IOA 基址
+    "base_yc": 0x4001, # 遥测 IOA 基址
+    "base_yk": 0x6001, # 遥控 IOA 基址
+    "base_yt": 0x6201, # 遥调 IOA 基址
+    "soe": False,      # 遥信/遥测带 CP56Time2a 时标 (SOE)
+}
 
 def _get_app_dir() -> str:
-    """获取应用数据目录（兼容 --onefile 和开发模式）
-
-    onefile 打包后 __file__ 指向临时解压目录(_MEIxxxx)，直接用会把配置
-    写进临时目录、退出即丢，故冻结时改为 exe 所在目录。
-    """
-    if getattr(sys, 'frozen', False):
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    """获取应用数据目录（统一实现见 app_paths.get_app_dir）"""
+    return get_app_dir()
 
 
 # 配置文件路径
@@ -93,7 +104,7 @@ def _short_error(msg: str) -> str:
     return msg.strip()[:20] or "连接失败"
 
 
-class SimulatorDialog(QDialog):
+class SimulatorDialog(PointTablesMixin, QDialog):
     """IEC104 通信模拟器对话框（非模态）"""
 
     def __init__(self, parent=None):
@@ -107,9 +118,16 @@ class SimulatorDialog(QDialog):
         self._current_points = {}
         self._yc_edit_timers = {}
         self._block_cell_changed = False  # 阻止 cellChanged 信号
-        # 遥控/遥调操作控件引用：{ioa: {"btn_on":.., "btn_off":.., "btn_set":.., "btn_select":..}}
+        # 遥控/遥调操作控件引用：YK {ioa: {"btn_on":.., "btn_off":.., "selected_cmd":..}}
+        #                         YT {ioa: {"btn_set":.., "btn_select":..}}
         self._yk_ops = {}
         self._yt_ops = {}
+        # IEC 104 协议参数（协议参数对话框配置，随配置文件持久化）
+        self._params = dict(DEFAULT_PARAMS)
+        # 遥控/遥调 ↔ 关联遥信/遥测点位映射 {yk_ioa: yx_ioa} / {yt_ioa: yc_ioa}
+        # 遥控/遥调本质是写点位：执行结果体现为关联点位的值变化
+        self._yk_links = {}
+        self._yt_links = {}
         # 当前是否为深色主题（由 _apply_theme 依据样式表内容判定）
         self._dark_theme = False
         # 连接状态机辅助状态：最近失败原因 / 等待反馈的操作 / 停止中的线程
@@ -190,10 +208,24 @@ class SimulatorDialog(QDialog):
         self.chk_sbo = QCheckBox("启用预制")
         self.chk_sbo.setChecked(True)
         self.chk_sbo.setToolTip(
-            "开启：遥控/遥调需先点\"预制\"，预制确认后方可执行（SBO 安全流程）\n"
-            "关闭：点击合/分/设定直接执行")
+            "开启(SBO 安全流程)：遥控点\"合/分\"先发\"预制(选择)\"，预制确认后再点一次才下发执行；\n"
+            "遥调先点\"预制\"再点\"设定\"。\n"
+            "关闭：点击合/分/设定直接执行(跳过预制)")
         self.chk_sbo.stateChanged.connect(self._on_sbo_toggled)
         conn_layout.addWidget(self.chk_sbo)
+
+        # 协议参数（t1/t2/t3、k/w、公共地址、IOA 基址、周期总召唤、SOE）
+        self.btn_params = QPushButton("协议参数…")
+        self.btn_params.setStyleSheet(
+            "QPushButton { background-color: #607D8B; color: white; padding: 4px 12px; "
+            "border-radius: 3px; border: none; }"
+            "QPushButton:hover { background-color: #455A64; }"
+        )
+        self.btn_params.setToolTip(
+            "配置 IEC 104 协议参数：t1/t2/t3 超时、k/w 窗口、ASDU 公共地址、\n"
+            "各类型 IOA 基址、主站周期总召唤间隔、遥信/遥测带时标(SOE)")
+        self.btn_params.clicked.connect(self._on_edit_params)
+        conn_layout.addWidget(self.btn_params)
 
         # 分隔
         conn_layout.addStretch()
@@ -259,17 +291,17 @@ class SimulatorDialog(QDialog):
         master_btns_layout.setSpacing(6)
         master_btns_layout.setContentsMargins(6, 4, 6, 4)
 
-        for label, slot, color in [
-            ("总召唤", self._on_gi, "#4CAF50"),
-            ("时钟同步", self._on_clock_sync, "#2196F3"),
-            ("启动传输", self._on_startdt, "#FF9800"),
-            ("停止传输", self._on_stopdt, "#9E9E9E"),
-            ("测试帧", self._on_testfr, "#9C27B0"),
+        for label, slot, color, hover in [
+            ("总召唤", self._on_gi, "#4CAF50", "#388E3C"),
+            ("时钟同步", self._on_clock_sync, "#2196F3", "#1565C0"),
+            ("启动传输", self._on_startdt, "#FF9800", "#E65100"),
+            ("停止传输", self._on_stopdt, "#9E9E9E", "#757575"),
+            ("测试帧", self._on_testfr, "#9C27B0", "#7B1FA2"),
         ]:
             btn = QPushButton(label)
             btn.setStyleSheet(
                 f"QPushButton {{ background-color: {color}; color: white; padding: 4px 10px; border-radius: 3px; border: none; font-size: 9pt; }}"
-                f"QPushButton:hover {{ opacity: 0.8; }}"
+                f"QPushButton:hover {{ background-color: {hover}; }}"
             )
             btn.clicked.connect(slot)
             btn.setEnabled(False)
@@ -329,6 +361,10 @@ class SimulatorDialog(QDialog):
         self.auto_timer = QTimer()
         self.auto_timer.timeout.connect(self._on_auto_tick)
 
+        # 主站周期总召唤定时器（周期在协议参数中配置，0=关闭）
+        self._gi_timer = QTimer()
+        self._gi_timer.timeout.connect(self._on_gi_timer_tick)
+
         self.lbl_auto_status = QLabel("")
         self.lbl_auto_status.setStyleSheet("color: #4CAF50; font-size: 9pt;")
         auto_layout.addWidget(self.lbl_auto_status)
@@ -355,17 +391,17 @@ class SimulatorDialog(QDialog):
         )
         self.tabs.addTab(self.yc_table, "遥测 (YC)")
 
-        # 遥控
+        # 遥控（关联遥信列用于选择遥控结果体现到哪个遥信点位）
         self.yk_table = self._create_point_table(
-            ["序号", "IOA", "IOA(10)", "描述", "当前值", "操作"],
-            [40, 70, 60, 120, 80, 180]
+            ["序号", "IOA", "IOA(10)", "描述", "当前值", "关联遥信", "操作"],
+            [40, 70, 60, 120, 80, 150, 230]
         )
         self.tabs.addTab(self.yk_table, "遥控 (YK)")
 
-        # 遥调
+        # 遥调（关联遥测列用于选择遥调结果体现到哪个遥测点位）
         self.yt_table = self._create_point_table(
-            ["序号", "IOA", "IOA(10)", "描述", "当前值", "操作"],
-            [40, 70, 60, 120, 100, 200]
+            ["序号", "IOA", "IOA(10)", "描述", "当前值", "关联遥测", "操作"],
+            [40, 70, 60, 120, 100, 150, 200]
         )
         self.tabs.addTab(self.yt_table, "遥调 (YT)")
 
@@ -428,21 +464,6 @@ class SimulatorDialog(QDialog):
 
         parent_layout.addLayout(manual_layout)
 
-    def _create_point_table(self, headers, widths):
-        """创建点位表格（描述列可编辑）"""
-        table = QTableWidget()
-        table.setColumnCount(len(headers))
-        table.setHorizontalHeaderLabels(headers)
-        table.setAlternatingRowColors(True)
-        table.setSelectionBehavior(QTableWidget.SelectRows)
-        # 允许编辑（用于描述列）
-        table.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed)
-        table.horizontalHeader().setStretchLastSection(True)
-        for i, w in enumerate(widths):
-            table.setColumnWidth(i, w)
-        # cellChanged 信号用于保存描述编辑
-        table.cellChanged.connect(self._on_cell_changed)
-        return table
 
     # ==================================================================
     # 描述编辑
@@ -480,8 +501,16 @@ class SimulatorDialog(QDialog):
     # ==================================================================
 
     def _set_role_silently(self, index: int):
-        """程序化设置角色（重置/加载配置时使用）"""
-        self.role_combo.setCurrentIndex(index)
+        """程序化设置角色（重置/加载配置时使用）
+
+        必须屏蔽信号：setCurrentIndex 会触发 _on_role_changed → _on_apply_points，
+        后者在已有点位数据时弹"确认重建"对话框，并把刚加载的配置点位冲掉。
+        """
+        blocked = self.role_combo.blockSignals(True)
+        try:
+            self.role_combo.setCurrentIndex(index)
+        finally:
+            self.role_combo.blockSignals(blocked)
 
     def _on_role_changed(self, index):
         """角色切换：更新默认 IP，并按数量重建点位
@@ -530,6 +559,9 @@ class SimulatorDialog(QDialog):
 
         # ---- 主站操作按钮 ----
         self.master_btns_group.setVisible(is_master)
+        # SBO 开关只影响主站行为，从站模式隐藏——避免"在从站实例上取消
+        # 勾选、主站实例仍勾选"导致误以为关了预制还在发选择帧
+        self.chk_sbo.setVisible(is_master)
         ops_ready = running and connected and is_master
         for name in ("总召唤", "时钟同步", "启动传输", "停止传输", "测试帧"):
             btn = getattr(self, f'_btn_{name}', None)
@@ -546,6 +578,9 @@ class SimulatorDialog(QDialog):
             self.auto_timer.stop()
             if self.chk_auto_send.isChecked():
                 self.chk_auto_send.setChecked(False)
+
+        # ---- 主站周期总召唤 ----
+        self._update_gi_timer()
 
         # ---- 遥控/遥调行内按钮 ----
         self._update_point_op_buttons()
@@ -590,18 +625,88 @@ class SimulatorDialog(QDialog):
         connected = bool(self.simulator and self.simulator.is_connected)
         sbo_on = self.chk_sbo.isChecked()
         for ops in self._yk_ops.values():
-            exec_ok = connected and (not sbo_on or ops["selected"])
-            ops["btn_on"].setEnabled(exec_ok)
-            ops["btn_off"].setEnabled(exec_ok)
-            ops["btn_select"].setEnabled(
-                connected and sbo_on
-                and f"sel:45:{ops['ioa']}" not in self._pending_ops)
+            if ops["selected"]:
+                # 预制成功：仅放行预制所对应的那条命令下发
+                cmd = ops.get("selected_cmd")
+                ops["btn_on"].setEnabled(connected and cmd == "on")
+                ops["btn_off"].setEnabled(connected and cmd == "off")
+            elif f"sel:45:{ops['ioa']}" in self._pending_ops:
+                # 等待预制反馈期间：双按钮禁用，避免并发误点
+                ops["btn_on"].setEnabled(False)
+                ops["btn_off"].setEnabled(False)
+            else:
+                # 未预制：SBO 开启时点击=发送对应命令的"预制(选择)"；
+                # SBO 关闭时点击=直接执行
+                ops["btn_on"].setEnabled(connected)
+                ops["btn_off"].setEnabled(connected)
         for ops in self._yt_ops.values():
             ops["btn_set"].setEnabled(
                 connected and (not sbo_on or ops["selected"]))
             ops["btn_select"].setEnabled(
                 connected and sbo_on
                 and f"sel:50:{ops['ioa']}" not in self._pending_ops)
+            # 预制成功后锁定设定值：SBO 要求"执行值 == 预制值"，
+            # 允许中途改数会让从站回 COT=8（激活终止）
+            spin = ops.get("spin")
+            if spin is not None:
+                spin.setEnabled(
+                    connected and not (sbo_on and ops.get("selected")))
+
+    # ==================================================================
+    # 协议参数（t1/t2/t3、k/w、公共地址、IOA 基址、周期总召唤、SOE）
+    # ==================================================================
+
+    def _apply_params_to_simulator(self):
+        """把协议参数应用到运行中的模拟器（支持连接中热更新）"""
+        if not self.simulator:
+            return
+        sim = self.simulator
+        sim.t1 = float(self._params["t1"])
+        sim.t2 = float(self._params["t2"])
+        sim.t3 = float(self._params["t3"])
+        sim.k = int(self._params["k"])
+        sim.w = int(self._params["w"])
+        sim.common_addr = int(self._params["ca"])
+        sim.soe_enabled = bool(self._params["soe"])
+
+    def _update_gi_timer(self):
+        """按 (主站, 运行中, 周期>0) 启停周期总召唤定时器"""
+        period = int(self._params.get("gi_period", 0))
+        is_master = self.role_combo.currentData() == SimulatorRole.MASTER
+        running = bool(self.simulator and self.simulator.isRunning())
+        if running and is_master and period > 0:
+            interval_ms = period * 1000
+            if not self._gi_timer.isActive() \
+                    or self._gi_timer.interval() != interval_ms:
+                self._gi_timer.start(interval_ms)
+        else:
+            self._gi_timer.stop()
+
+    def _on_gi_timer_tick(self):
+        """周期总召唤到点：复用总召唤按钮的发送与等待反馈逻辑"""
+        if not (self.simulator and self.simulator.is_connected
+                and self.role_combo.currentData() == SimulatorRole.MASTER):
+            return
+        self._on_gi()
+
+    def _on_edit_params(self):
+        """打开协议参数对话框并应用"""
+        dlg = ProtocolParamsDialog(self._params, self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        self._params = dlg.get_params()
+        self._apply_params_to_simulator()
+        self._update_gi_timer()
+        p = self._params
+        gi_txt = f"{p['gi_period']}s" if p['gi_period'] else "关闭"
+        self._append_log(
+            f"[协议参数] t1={p['t1']}s t2={p['t2']}s t3={p['t3']}s "
+            f"k={p['k']} w={p['w']} 公共地址={p['ca']} "
+            f"周期总召唤={gi_txt} "
+            f"SOE={'开' if p['soe'] else '关'} "
+            f"IOA基址 YX=0x{p['base_yx']:04X} YC=0x{p['base_yc']:04X} "
+            f"YK=0x{p['base_yk']:04X} YT=0x{p['base_yt']:04X}"
+            + ("（IOA 基址需重新\"应用配置\"生效）" if self._current_points else ""))
 
     # ==================================================================
     # 操作按钮反馈：等待 → 确认/超时
@@ -627,8 +732,16 @@ class SimulatorDialog(QDialog):
         entry = self._pending_ops.pop(key, None)
         if not entry:
             return
-        entry["timer"].stop()
-        entry["btn"].setText(entry["text"])
+        timer = entry["timer"]
+        timer.stop()
+        timer.deleteLater()
+        # 等待反馈期间表格可能被重建（角色/点数/配置变更），行内按钮的
+        # C++ 对象已随 setRowCount 销毁，此时 setText 抛 RuntimeError；
+        # PyQt5 对槽内未捕获异常会直接终止进程。
+        try:
+            entry["btn"].setText(entry["text"])
+        except RuntimeError:
+            pass
         if note:
             self._append_log(note)
         self._refresh_ui_state()
@@ -644,8 +757,8 @@ class SimulatorDialog(QDialog):
                 _, tid_s, ioa_s = key.split(":")
                 self._reset_select(int(ioa_s), int(tid_s))
                 note += "，预制已取消"
-            except ValueError:
-                pass
+            except (ValueError, RuntimeError):
+                pass  # 表格已重建、行内按钮已销毁时不再处理（见 _op_end）
         self._op_end(key, note)
 
     def _cancel_pending_ops(self):
@@ -657,7 +770,13 @@ class SimulatorDialog(QDialog):
         """清空全部点位的预制态（连接断开后会话结束，预制不再有效）"""
         for ops in list(self._yk_ops.values()) + list(self._yt_ops.values()):
             ops["selected"] = False
-            ops["btn_select"].setText("预制")
+            if "selected_cmd" in ops:
+                ops["selected_cmd"] = None
+                ops["pending_cmd"] = None
+                self._apply_yk_button_state(ops)
+            else:
+                ops["btn_select"].setText("预制")
+                ops["btn_select"].setStyleSheet(SEL_BTN_NORMAL)
         self._update_point_op_buttons()
 
     def _reap_closing_sims(self):
@@ -677,6 +796,8 @@ class SimulatorDialog(QDialog):
 
         self.simulator = IEC104Simulator(role)
         self.simulator.points = dict(self._current_points)
+        self._sync_links_to_simulator()
+        self._apply_params_to_simulator()
         self.simulator.frame_sent.connect(self._on_frame_sent)
         self.simulator.frame_received.connect(self._on_frame_received)
         self.simulator.state_changed.connect(self._on_state_changed)
@@ -712,6 +833,16 @@ class SimulatorDialog(QDialog):
         self._last_error_detail = ""
         self._closing_sims.append(sim)
         sim.stop()
+        # 断开旧会话信号：停止是异步的，收尾期间仍在队列里的
+        # frame_received/point_updated 会把上一条会话的数据写进新会话
+        for sig in (sim.frame_sent, sim.frame_received, sim.state_changed,
+                    sim.error_occurred, sim.log_message,
+                    sim.connection_established, sim.connection_lost,
+                    sim.point_updated, sim.control_ack):
+            try:
+                sig.disconnect(self)
+            except (TypeError, RuntimeError):
+                pass
         self._cancel_pending_ops()
         self._clear_select_states()
         QTimer.singleShot(500, self._reap_closing_sims)
@@ -743,6 +874,8 @@ class SimulatorDialog(QDialog):
         self.chk_auto_send.setChecked(False)
         self.auto_interval_spin.setValue(2000)
         self.auto_range_spin.setValue(10)
+        self.chk_sbo.setChecked(True)
+        self._params = dict(DEFAULT_PARAMS)
         # 清空日志
         self.log_table.setRowCount(0)
         # 清空 hex 历史
@@ -765,12 +898,22 @@ class SimulatorDialog(QDialog):
         """关闭时停止模拟器并保存配置"""
         if self.simulator:
             self._on_stop()
-        # 应用即将退出：给停止中的线程最多约 2s 收尾，避免 QThread 运行中被销毁
+        # 应用即将退出：给停止中的线程最多约 2s 收尾，避免 QThread 运行中被销毁。
+        # 此处逐个 wait 并自然结束循环——此前只等 _closing_sims[0]，且依赖
+        # QTimer.singleShot 的 _reap_closing_sims 收缩列表，而本循环正阻塞
+        # 事件循环导致定时器永不触发，实际固定空耗满 2s 且其余线程完全没等。
         deadline = time.time() + 2.0
-        while self._closing_sims and time.time() < deadline:
-            self._closing_sims[0].wait(100)
-        self._closing_sims.clear()
+        still_running = []
+        for sim in list(self._closing_sims):
+            remaining_ms = max(0, int((deadline - time.time()) * 1000))
+            if not sim.wait(remaining_ms):
+                still_running.append(sim)
+        # 超时未退出的线程**不能丢引用**：QThread 在运行中被析构会让整个
+        # 进程 abort。进程马上退出，把引用留到最后即可。
+        self._closing_sims = still_running
+        self._cancel_pending_ops()
         self.auto_timer.stop()
+        self._gi_timer.stop()
         self._save_config()
         event.accept()
 
@@ -798,7 +941,14 @@ class SimulatorDialog(QDialog):
                     "description": pt.description,
                 }
                 for ioa, pt in self._current_points.items()
-            }
+            },
+            # 遥控/遥调的关联点位映射（用户可改，需持久化）
+            "yk_links": {str(k): v for k, v in self._yk_links.items()},
+            "yt_links": {str(k): v for k, v in self._yt_links.items()},
+            # SBO 预制开关状态（此前不持久化，重启后默认勾选易造成误解）
+            "sbo": self.chk_sbo.isChecked(),
+            # IEC 104 协议参数
+            "params": dict(self._params),
         }
 
     def _apply_config_data(self, data):
@@ -829,6 +979,28 @@ class SimulatorDialog(QDialog):
                     )
             else:
                 self._on_apply_points()
+
+            # 恢复关联映射（仅保留双向仍有效的项；缺失则按默认规则补齐）
+            for attr, key in (("_yk_links", "yk_links"), ("_yt_links", "yt_links")):
+                saved = data.get(key) or {}
+                links = {}
+                for k, v in saved.items():
+                    try:
+                        k_i, v_i = int(k), int(v)
+                    except (TypeError, ValueError):
+                        continue
+                    if k_i in self._current_points and v_i in self._current_points:
+                        links[k_i] = v_i
+                setattr(self, attr, links)
+            self._rebuild_default_links(force=False)
+            self._sync_links_to_simulator()
+            # SBO 开关状态（默认勾选）
+            self.chk_sbo.setChecked(bool(data.get("sbo", True)))
+            # 协议参数（仅接受已知键，其余保持默认）
+            saved_params = data.get("params") or {}
+            self._params = {**DEFAULT_PARAMS,
+                            **{k: v for k, v in saved_params.items()
+                               if k in DEFAULT_PARAMS}}
 
             self._refresh_all_tables()
         finally:
@@ -925,6 +1097,8 @@ class SimulatorDialog(QDialog):
                 QMessageBox.warning(self, "导入失败", "CSV 中没有有效的点位数据")
                 return
             self._current_points = points
+            self._rebuild_default_links(force=True)
+            self._sync_links_to_simulator()
             self._refresh_all_tables()
             if self.simulator:
                 self.simulator.points = dict(self._current_points)
@@ -953,224 +1127,76 @@ class SimulatorDialog(QDialog):
         yc = self.yc_count.value()
         yk = self.yk_count.value()
         yt = self.yt_count.value()
-        self._current_points = create_default_points(yx, yc, yk, yt)
+        self._current_points = create_default_points(
+            yx, yc, yk, yt,
+            ioa_bases={"YX": self._params["base_yx"],
+                       "YC": self._params["base_yc"],
+                       "YK": self._params["base_yk"],
+                       "YT": self._params["base_yt"]})
+        # 点位集合变化 → 按默认规则重排关联（第 i 个遥控↔第 i 个遥信…）
+        self._rebuild_default_links(force=True)
+        self._sync_links_to_simulator()
         self._refresh_all_tables()
         if self.simulator:
             self.simulator.points = dict(self._current_points)
 
-    def _refresh_all_tables(self):
-        """刷新所有表格"""
-        self._block_cell_changed = True
-        try:
-            self._refresh_yx_table()
-            self._refresh_yc_table()
-            self._refresh_yk_table()
-            self._refresh_yt_table()
-        finally:
-            self._block_cell_changed = False
 
-    def _refresh_yx_table(self):
-        """刷新遥信表格"""
-        yx_points = sorted(
-            [p for p in self._current_points.values() if p.signal_type == "YX"],
-            key=lambda p: p.ioa
-        )
-        is_slave = self.role_combo.currentData() == SimulatorRole.SLAVE
-        self.yx_table.setRowCount(len(yx_points))
+    # ==================================================================
+    # 遥控/遥调 ↔ 遥信/遥测 关联
+    # ==================================================================
 
-        for i, pt in enumerate(yx_points):
-            self.yx_table.setItem(i, 0, QTableWidgetItem(str(i + 1)))
-            self.yx_table.setItem(i, 1, QTableWidgetItem(f"0x{pt.ioa:04X}"))
-            self.yx_table.setItem(i, 2, QTableWidgetItem(str(pt.ioa)))
-            self.yx_table.setItem(i, 3, QTableWidgetItem(pt.description))
+    def _rebuild_default_links(self, force: bool = True):
+        """按默认规则排关联：第 i 个遥控 ↔ 第 i 个遥信、第 i 个遥调 ↔ 第 i 个遥测
 
-            # 当前值
-            if not pt.is_valid and not is_slave:
-                val_item = QTableWidgetItem("-")
-                val_item.setForeground(INVALID_COLOR)
-                val_item.setBackground(GRAY_BG)
-                self.yx_table.setItem(i, 4, val_item)
-            elif is_slave:
-                btn = QPushButton("合" if pt.value else "分")
-                btn.setStyleSheet(
-                    f"QPushButton {{ background-color: {'#4CAF50' if pt.value else '#9E9E9E'}; "
-                    f"color: white; font-weight: bold; padding: 3px 8px; border-radius: 3px; border: none; min-width: 50px; }}"
-                    "QPushButton:hover { opacity: 0.8; }"
-                )
-                btn.clicked.connect(lambda _, ioa=pt.ioa: self._on_toggle_yx(ioa))
-                self.yx_table.setCellWidget(i, 4, btn)
-            else:
-                val_item = QTableWidgetItem("合" if pt.value else "分")
-                val_item.setForeground(YX_ON_COLOR if pt.value else YX_OFF_COLOR)
-                self.yx_table.setItem(i, 4, val_item)
+        force=True 整表重排（点位集合变化后）；False 仅补缺失项并清理
+        失效项（加载旧配置文件时保留用户已保存的关联）。
+        """
+        yx = sorted(p.ioa for p in self._current_points.values()
+                    if p.signal_type == "YX")
+        yc = sorted(p.ioa for p in self._current_points.values()
+                    if p.signal_type == "YC")
+        yk = sorted(p.ioa for p in self._current_points.values()
+                    if p.signal_type == "YK")
+        yt = sorted(p.ioa for p in self._current_points.values()
+                    if p.signal_type == "YT")
+        if force:
+            self._yk_links = {}
+            self._yt_links = {}
+        for i, k in enumerate(yk):
+            if k not in self._yk_links and i < len(yx):
+                self._yk_links[k] = yx[i]
+        for i, t in enumerate(yt):
+            if t not in self._yt_links and i < len(yc):
+                self._yt_links[t] = yc[i]
+        # 清掉指向已不存在点位的关联
+        self._yk_links = {k: v for k, v in self._yk_links.items()
+                          if k in self._current_points and v in self._current_points}
+        self._yt_links = {k: v for k, v in self._yt_links.items()
+                          if k in self._current_points and v in self._current_points}
 
-            q_text = "有效" if pt.quality == 0 else f"0x{pt.quality:02X}"
-            self.yx_table.setItem(i, 5, QTableWidgetItem(q_text))
-            self.yx_table.setItem(i, 6, QTableWidgetItem(pt.timestamp or "-"))
+    def _sync_links_to_simulator(self):
+        """把关联映射同步给运行中的模拟器（从站执行控制时写关联点位）"""
+        if self.simulator:
+            self.simulator.yk_links = dict(self._yk_links)
+            self.simulator.yt_links = dict(self._yt_links)
 
-    def _refresh_yc_table(self):
-        """刷新遥测表格"""
-        yc_points = sorted(
-            [p for p in self._current_points.values() if p.signal_type == "YC"],
-            key=lambda p: p.ioa
-        )
-        is_slave = self.role_combo.currentData() == SimulatorRole.SLAVE
-        self.yc_table.setRowCount(len(yc_points))
 
-        for i, pt in enumerate(yc_points):
-            self.yc_table.setItem(i, 0, QTableWidgetItem(str(i + 1)))
-            self.yc_table.setItem(i, 1, QTableWidgetItem(f"0x{pt.ioa:04X}"))
-            self.yc_table.setItem(i, 2, QTableWidgetItem(str(pt.ioa)))
-            self.yc_table.setItem(i, 3, QTableWidgetItem(pt.description))
+    def _on_yk_link_changed(self, yk_ioa, link_ioa):
+        """遥控关联遥信变更：更新映射、同步模拟器并刷新显示值"""
+        if link_ioa is None:
+            return
+        self._yk_links[yk_ioa] = link_ioa
+        self._sync_links_to_simulator()
+        self._update_yk_value_cell(yk_ioa)
 
-            if is_slave:
-                spin = QDoubleSpinBox()
-                spin.setRange(-999999, 999999)
-                spin.setDecimals(2)
-                spin.setValue(float(pt.value) if pt.value is not None else 0)
-                spin.setStyleSheet("QDoubleSpinBox { padding: 2px; }")
-                spin.setProperty("ioa", pt.ioa)
-                spin.editingFinished.connect(lambda s=spin: self._on_yc_edit_finished(s))
-                self.yc_table.setCellWidget(i, 4, spin)
-            elif not pt.is_valid:
-                val_item = QTableWidgetItem("-")
-                val_item.setForeground(INVALID_COLOR)
-                val_item.setBackground(GRAY_BG)
-                self.yc_table.setItem(i, 4, val_item)
-            else:
-                val_text = f"{pt.value:.2f}" if isinstance(pt.value, (int, float)) else str(pt.value)
-                self.yc_table.setItem(i, 4, QTableWidgetItem(val_text))
+    def _on_yt_link_changed(self, yt_ioa, link_ioa):
+        """遥调关联遥测变更：更新映射、同步模拟器并刷新显示值"""
+        if link_ioa is None:
+            return
+        self._yt_links[yt_ioa] = link_ioa
+        self._sync_links_to_simulator()
+        self._update_yt_value_cell(yt_ioa)
 
-            q_text = "有效" if pt.quality == 0 else f"0x{pt.quality:02X}"
-            self.yc_table.setItem(i, 5, QTableWidgetItem(q_text))
-            self.yc_table.setItem(i, 6, QTableWidgetItem(pt.timestamp or "-"))
-
-    def _refresh_yk_table(self):
-        """刷新遥控表格"""
-        yk_points = sorted(
-            [p for p in self._current_points.values() if p.signal_type == "YK"],
-            key=lambda p: p.ioa
-        )
-        is_slave = self.role_combo.currentData() == SimulatorRole.SLAVE
-        self.yk_table.setRowCount(len(yk_points))
-
-        for i, pt in enumerate(yk_points):
-            self.yk_table.setItem(i, 0, QTableWidgetItem(str(i + 1)))
-            self.yk_table.setItem(i, 1, QTableWidgetItem(f"0x{pt.ioa:04X}"))
-            self.yk_table.setItem(i, 2, QTableWidgetItem(str(pt.ioa)))
-            self.yk_table.setItem(i, 3, QTableWidgetItem(pt.description))
-
-            val_text = "合" if pt.value else "分"
-            val_item = QTableWidgetItem(val_text)
-            val_item.setForeground(YX_ON_COLOR if pt.value else YX_OFF_COLOR)
-            self.yk_table.setItem(i, 4, val_item)
-
-            if is_slave:
-                self.yk_table.setItem(i, 5, QTableWidgetItem("(等待主站遥控)"))
-                self._yk_ops.pop(pt.ioa, None)
-            else:
-                ops = QWidget()
-                ops_layout = QHBoxLayout(ops)
-                ops_layout.setContentsMargins(4, 2, 4, 2)
-                ops_layout.setSpacing(6)
-                # 独立预制按钮：发送 SBO 选择命令，确认后点亮合/分
-                btn_select = QPushButton("预制")
-                btn_select.setStyleSheet(
-                    "QPushButton { background-color: #FF9800; color: white; padding: 3px 10px; border-radius: 3px; border: none; }"
-                    "QPushButton:hover { background-color: #F57C00; }"
-                )
-                btn_select.clicked.connect(
-                    lambda _, ioa=pt.ioa: self._on_yk_select(ioa))
-                btn_on = QPushButton("合")
-                btn_on.setStyleSheet(
-                    "QPushButton { background-color: #4CAF50; color: white; padding: 3px 10px; border-radius: 3px; border: none; }"
-                    "QPushButton:hover { background-color: #388E3C; }"
-                )
-                btn_on.clicked.connect(
-                    lambda _, ioa=pt.ioa: self._on_yk_command(ioa, 1))
-                btn_off = QPushButton("分")
-                btn_off.setStyleSheet(
-                    "QPushButton { background-color: #9E9E9E; color: white; padding: 3px 10px; border-radius: 3px; border: none; }"
-                    "QPushButton:hover { background-color: #757575; }"
-                )
-                btn_off.clicked.connect(
-                    lambda _, ioa=pt.ioa: self._on_yk_command(ioa, 0))
-                # 初始全部禁用，可用性由 _update_point_op_buttons 统一派生
-                btn_on.setEnabled(False)
-                btn_off.setEnabled(False)
-                btn_select.setEnabled(False)
-                ops_layout.addWidget(btn_select)
-                ops_layout.addWidget(btn_on)
-                ops_layout.addWidget(btn_off)
-                ops_layout.addStretch()
-                self.yk_table.setCellWidget(i, 5, ops)
-                self._yk_ops[pt.ioa] = {
-                    "ioa": pt.ioa,
-                    "btn_on": btn_on, "btn_off": btn_off,
-                    "btn_select": btn_select, "selected": False,
-                }
-        self._update_point_op_buttons()
-
-    def _refresh_yt_table(self):
-        """刷新遥调表格"""
-        yt_points = sorted(
-            [p for p in self._current_points.values() if p.signal_type == "YT"],
-            key=lambda p: p.ioa
-        )
-        is_slave = self.role_combo.currentData() == SimulatorRole.SLAVE
-        self.yt_table.setRowCount(len(yt_points))
-
-        for i, pt in enumerate(yt_points):
-            self.yt_table.setItem(i, 0, QTableWidgetItem(str(i + 1)))
-            self.yt_table.setItem(i, 1, QTableWidgetItem(f"0x{pt.ioa:04X}"))
-            self.yt_table.setItem(i, 2, QTableWidgetItem(str(pt.ioa)))
-            self.yt_table.setItem(i, 3, QTableWidgetItem(pt.description))
-
-            val_text = f"{pt.value:.2f}" if isinstance(pt.value, (int, float)) else str(pt.value)
-            self.yt_table.setItem(i, 4, QTableWidgetItem(val_text))
-
-            if is_slave:
-                self.yt_table.setItem(i, 5, QTableWidgetItem("(等待主站遥调)"))
-                self._yt_ops.pop(pt.ioa, None)
-            else:
-                ops = QWidget()
-                ops_layout = QHBoxLayout(ops)
-                ops_layout.setContentsMargins(4, 2, 4, 2)
-                ops_layout.setSpacing(6)
-                # 独立预制按钮：发送 SBO 选择命令，确认后点亮设定
-                btn_select = QPushButton("预制")
-                btn_select.setStyleSheet(
-                    "QPushButton { background-color: #FF9800; color: white; padding: 3px 10px; border-radius: 3px; border: none; }"
-                    "QPushButton:hover { background-color: #F57C00; }"
-                )
-                btn_select.clicked.connect(
-                    lambda _, ioa=pt.ioa: self._on_yt_select(ioa))
-                spin = QDoubleSpinBox()
-                spin.setRange(-999999, 999999)
-                spin.setDecimals(2)
-                spin.setValue(float(pt.value) if pt.value is not None else 0)
-                spin.setMaximumWidth(100)
-                ops_layout.addWidget(btn_select)
-                ops_layout.addWidget(spin)
-                btn_set = QPushButton("设定")
-                btn_set.setStyleSheet(
-                    "QPushButton { background-color: #2196F3; color: white; padding: 3px 10px; border-radius: 3px; border: none; }"
-                    "QPushButton:hover { background-color: #1565C0; }"
-                )
-                btn_set.clicked.connect(
-                    lambda _, ioa=pt.ioa, s=spin: self._on_yt_command(ioa, s.value()))
-                # 初始全部禁用，可用性由 _update_point_op_buttons 统一派生
-                btn_set.setEnabled(False)
-                btn_select.setEnabled(False)
-                ops_layout.addWidget(btn_set)
-                ops_layout.addStretch()
-                self.yt_table.setCellWidget(i, 5, ops)
-                self._yt_ops[pt.ioa] = {
-                    "ioa": pt.ioa,
-                    "btn_set": btn_set, "btn_select": btn_select,
-                    "spin": spin, "selected": False,
-                }
-        self._update_point_op_buttons()
 
     # ==================================================================
     # 主站操作
@@ -1179,13 +1205,14 @@ class SimulatorDialog(QDialog):
     def _on_gi(self):
         if not (self.simulator and self.simulator.is_connected):
             return
-        if self.simulator.send_general_interrogation(common_addr=1):
+        if self.simulator.send_general_interrogation(
+                common_addr=self._params["ca"]):
             self._op_begin("gi", self._btn_总召唤, 15000, "总召唤…", "总召唤")
 
     def _on_clock_sync(self):
         if not (self.simulator and self.simulator.is_connected):
             return
-        if self.simulator.send_clock_sync(common_addr=1):
+        if self.simulator.send_clock_sync(common_addr=self._params["ca"]):
             self._op_begin("clock", self._btn_时钟同步, 10000, "对时…", "时钟同步")
 
     def _on_startdt(self):
@@ -1216,11 +1243,16 @@ class SimulatorDialog(QDialog):
             return
         pt = self._current_points[ioa]
         new_val = not bool(pt.value)
-        pt.value = new_val
-        pt.is_valid = True
-        pt.timestamp = __import__('time').strftime("%H:%M:%S")
         if self.simulator:
+            # 由 set_point_value 独占写入 pt.value：simulator.points 与
+            # _current_points 共享同一批 PointData 对象，若此处先改 pt.value，
+            # set_point_value 里的 old_val 会等于新值 → "值变化"判定恒为
+            # False → 勾选自动上送后手动改点永不产生报文。
             self.simulator.set_point_value(ioa, new_val)
+        else:
+            pt.value = new_val
+            pt.is_valid = True
+            pt.timestamp = time.strftime("%H:%M:%S")
         self._refresh_yx_table()
 
     def _on_yc_edit_finished(self, spin):
@@ -1230,12 +1262,13 @@ class SimulatorDialog(QDialog):
             return
         value = spin.value()
         pt = self._current_points[ioa]
-        old_val = pt.value
-        pt.value = value
-        pt.is_valid = True
-        pt.timestamp = __import__('time').strftime("%H:%M:%S")
-        if self.simulator and old_val != value:
+        if self.simulator:
+            # 同上：写入口唯一，避免 old_val 被提前覆盖
             self.simulator.set_point_value(ioa, value)
+        elif pt.value != value:
+            pt.value = value
+            pt.is_valid = True
+            pt.timestamp = time.strftime("%H:%M:%S")
 
     # ==================================================================
     # SBO 预制（遥控/遥调）
@@ -1252,23 +1285,13 @@ class SimulatorDialog(QDialog):
             for key in [k for k in self._pending_ops if k.startswith("sel:")]:
                 self._op_end(key)
             self._clear_select_states()
+        # SBO 开启/关闭都需刷新遥控按钮文案（预制合 ↔ 合）
+        for ops in self._yk_ops.values():
+            self._apply_yk_button_state(ops)
         self._update_point_op_buttons()
         self._append_log(
             f"[SBO] {'启用' if sbo_on else '关闭'}预制流程："
             f"{'遥控/遥调需先预制后执行' if sbo_on else '遥控/遥调直接执行'}")
-
-    def _on_yk_select(self, ioa):
-        """遥控预制：发送 SBO 选择命令，5s 未确认自动取消"""
-        if not (self.simulator and self.simulator.is_connected):
-            return  # 未连接时按钮已禁用，双保险静默返回
-        ops = self._yk_ops.get(ioa)
-        if not ops:
-            return
-        if self.simulator.send_i_frame(
-                type_id=45, cot=6, common_addr=1, ioa=ioa, value=1, select=True):
-            self._op_begin(f"sel:45:{ioa}", ops["btn_select"], 5000, "预制…",
-                           f"遥控预制 IOA=0x{ioa:04X}")
-            self._append_log(f"[主站] 发送遥控预制 IOA=0x{ioa:04X}，等待确认...")
 
     def _on_yt_select(self, ioa):
         """遥调预制：发送 SBO 选择命令（设点短浮点），5s 未确认自动取消"""
@@ -1280,11 +1303,18 @@ class SimulatorDialog(QDialog):
         spin = ops.get("spin")
         value = spin.value() if spin else 0.0
         if self.simulator.send_i_frame(
-                type_id=50, cot=6, common_addr=1, ioa=ioa, value=value, select=True):
+                type_id=50, cot=6, common_addr=self._params["ca"],
+                ioa=ioa, value=value, select=True):
+            # 记住预制值：执行时必须下发同一个值，否则从站按 SBO 校验
+            # 会判"预制值不一致"并回 COT=8（此前执行时重新读 spin）
+            ops["selected_value"] = float(value)
             self._op_begin(f"sel:50:{ioa}", ops["btn_select"], 5000, "预制…",
                            f"遥调预制 IOA=0x{ioa:04X}")
             self._append_log(
                 f"[主站] 发送遥调预制 IOA=0x{ioa:04X} 值={value}，等待确认...")
+        else:
+            self._append_log(
+                f"[主站] 遥调预制发送失败 IOA=0x{ioa:04X}（未进入数据传输状态或发送窗口已满）")
 
     def _on_control_ack(self, ioa, cot, tid):
         """收到从站控制命令确认（COT=7 确认 / COT=8 终止）"""
@@ -1298,7 +1328,15 @@ class SimulatorDialog(QDialog):
                        self._yt_ops if tid == 50 else {}).get(ioa)
                 if ops:
                     ops["selected"] = True
-                    ops["btn_select"].setText("已预制")
+                    if tid == 45:
+                        # 记录预制的是哪条命令，仅放行其下发。
+                        # 注意 _op_end 已把 pending_ops 弹出，必须用发送时
+                        # 存在 ops["pending_cmd"] 的命令，不能回查 _pending_ops
+                        ops["selected_cmd"] = ops.get("pending_cmd")
+                        self._apply_yk_button_state(ops)
+                    else:
+                        ops["btn_select"].setText("已预制")
+                        ops["btn_select"].setStyleSheet(SEL_BTN_ARMED)
                 self._update_point_op_buttons()
                 self._append_log(f"[主站] 预制确认成功 IOA=0x{ioa:04X}，可执行")
             else:
@@ -1314,25 +1352,76 @@ class SimulatorDialog(QDialog):
         if not ops:
             return
         ops["selected"] = False
-        ops["btn_select"].setText("预制")
+        if tid == 45:
+            ops["selected_cmd"] = None
+            ops["pending_cmd"] = None
+            self._apply_yk_button_state(ops)
+        else:
+            ops["selected_value"] = None
+            ops["btn_select"].setText("预制")
+            ops["btn_select"].setStyleSheet(SEL_BTN_NORMAL)
         self._update_point_op_buttons()
 
-    def _on_yk_command(self, ioa, value):
-        """遥控执行（type 45 单点命令）
+    def _apply_yk_button_state(self, ops: dict):
+        """按 (SBO 开关, 预制态) 刷新该行遥控按钮的文案与样式
 
-        启用预制时：仅已预制成功的点位可执行（按钮未点亮即不可点）；
-        执行后立即重置预制状态，防止重复执行。
+        SBO 开启：预制阶段显示"预制合/预制分"，确认后对应按钮转
+        "执行合/执行分"（加粗描边，表示已解锁可下发）；
+        SBO 关闭：恒为"合/分"，点击直接执行。
+        """
+        sbo_on = self.chk_sbo.isChecked()
+        armed = ops.get("selected_cmd") if ops.get("selected") else None
+        if sbo_on:
+            on_text = "执行合" if armed == "on" else "预制合"
+            off_text = "执行分" if armed == "off" else "预制分"
+        else:
+            on_text, off_text = "合", "分"
+        ops["btn_on"].setText(on_text)
+        ops["btn_on"].setStyleSheet(
+            YK_BTN_ON_ARMED if armed == "on" else YK_BTN_ON_NORMAL)
+        ops["btn_off"].setText(off_text)
+        ops["btn_off"].setStyleSheet(
+            YK_BTN_OFF_ARMED if armed == "off" else YK_BTN_OFF_NORMAL)
+
+    def _on_yk_command(self, ioa, value):
+        """遥控命令（type 45 单点命令），显式两段式 SBO 流程
+
+        SBO 开启：
+          - 未预制 → 本次点击发送"选择(预制)"该命令（预制合/预制分），不执行；
+          - 预制确认后对应按钮转"执行合/执行分"，再次点击才下发执行；
+          - 未预制的命令按钮处于禁用态，无法直接执行。
+        SBO 关闭：点击直接执行（跳过预制）。
         """
         if not (self.simulator and self.simulator.is_connected):
             return
-        if self.chk_sbo.isChecked():
-            ops = self._yk_ops.get(ioa)
-            if not ops or not ops["selected"]:
-                return
+        ops = self._yk_ops.get(ioa)
+        if not ops:
+            return
+        kind = "合" if value else "分"
+        cmd = "on" if value else "off"
+        btn = ops["btn_on"] if value else ops["btn_off"]
+        sbo_on = self.chk_sbo.isChecked()
+        if sbo_on and not ops["selected"]:
+            # 未预制 → 本次点击发"选择(预制)"该命令，不执行
+            if self.simulator.send_i_frame(
+                    type_id=45, cot=6, common_addr=self._params["ca"],
+                    ioa=ioa, value=value, select=True):
+                ops["pending_cmd"] = cmd
+                self._op_begin(f"sel:45:{ioa}", btn, 5000, f"预制{kind}…",
+                               f"遥控预制(控{kind}) IOA=0x{ioa:04X}")
+                # 等待预制反馈期间禁用另一命令，避免并发误点
+                other = ops["btn_off"] if value else ops["btn_on"]
+                other.setEnabled(False)
+                self._append_log(
+                    f"[主站] 发送遥控预制(控{kind}) IOA=0x{ioa:04X}，等待确认...")
+            return
+        if sbo_on and ops.get("selected_cmd") != cmd:
+            return  # 已预制另一命令，按钮应已禁用，双保险
+        # SBO 关闭直接执行；SBO 开启须已预制同一命令 → 执行(下发)
         if self.simulator.send_i_frame(
-                type_id=45, cot=6, common_addr=1, ioa=ioa, value=value,
-                select=False):
-            self._append_log(f"[主站] 执行遥控 IOA=0x{ioa:04X} 值={value}")
+                type_id=45, cot=6, common_addr=self._params["ca"],
+                ioa=ioa, value=value, select=False):
+            self._append_log(f"[主站] 执行遥控(控{kind}) IOA=0x{ioa:04X}")
             self._reset_select(ioa, 45)
 
     def _on_yt_command(self, ioa, value):
@@ -1343,10 +1432,17 @@ class SimulatorDialog(QDialog):
             ops = self._yt_ops.get(ioa)
             if not ops or not ops["selected"]:
                 return
+            # 执行必须用"预制时的值"：编辑框在预制后已锁定，这里再兜一层
+            value = ops.get("selected_value", value)
         if self.simulator.send_i_frame(
-                type_id=50, cot=6, common_addr=1, ioa=ioa, value=value,
-                select=False):
+                type_id=50, cot=6, common_addr=self._params["ca"],
+                ioa=ioa, value=value, select=False):
             self._append_log(f"[主站] 执行遥调 IOA=0x{ioa:04X} 值={value}")
+            self._reset_select(ioa, 50)
+        else:
+            # 下发失败时预制锁必须释放，否则该行永久停在"已预制"
+            self._append_log(
+                f"[主站] 执行遥调发送失败 IOA=0x{ioa:04X}，已取消预制")
             self._reset_select(ioa, 50)
 
     def _on_auto_send_changed(self, state):
@@ -1373,7 +1469,9 @@ class SimulatorDialog(QDialog):
             if pt.ioa in self._current_points:
                 self._current_points[pt.ioa].value = new_val
                 self._current_points[pt.ioa].is_valid = True
-            self._refresh_yc_table()
+            # 定点刷新单个单元格：整表重建会销毁编辑框，用户正在输入的
+            # 遥测值会被点值覆盖、按钮被判为"已删除对象"
+            self._update_yc_row(pt.ioa)
             changed.append(f"YC:{pt.ioa}")
         yx_points = [p for p in self.simulator.points.values() if p.signal_type == "YX"]
         if yx_points and random.random() < 0.3:
@@ -1383,7 +1481,7 @@ class SimulatorDialog(QDialog):
             if pt.ioa in self._current_points:
                 self._current_points[pt.ioa].value = new_val
                 self._current_points[pt.ioa].is_valid = True
-            self._refresh_yx_table()
+            self._update_yx_row(pt.ioa)
             changed.append(f"YX:{pt.ioa}")
         if changed:
             self.lbl_auto_status.setText(f"已变化: {', '.join(changed)}")
@@ -1523,13 +1621,30 @@ class SimulatorDialog(QDialog):
             self._current_points[ioa].timestamp = pt.timestamp
 
         if pt.signal_type == "YX":
-            self._refresh_yx_table()
+            # 定点刷新：整表重建在总召唤/高频变化上送时会以每帧一次的频率
+            # 销毁重建全部行内按钮（GIL 压力大，且拖慢工作线程收发节奏）
+            self._update_yx_row(ioa)
+            # 关联此遥信的遥控行同步刷新显示值（遥控结果由关联遥信体现）
+            for yk_ioa, yx_ioa in self._yk_links.items():
+                if yx_ioa == ioa:
+                    self._update_yk_value_cell(yk_ioa)
         elif pt.signal_type == "YC":
-            self._refresh_yc_table()
+            self._update_yc_row(ioa)
+            # 关联此遥测的遥调行同步刷新显示值
+            for yt_ioa, yc_ioa in self._yt_links.items():
+                if yc_ioa == ioa:
+                    self._update_yt_value_cell(yt_ioa)
         elif pt.signal_type == "YK":
-            self._refresh_yk_table()
+            # 只更新值单元格：整表重建会销毁行内按钮并重置 SBO 预制态，
+            # 导致执行确认刚到手、按钮却被换掉（外部持有的旧引用随即失效）
+            self._update_point_value_cell(self.yk_table, ioa,
+                                          "合" if pt.value else "分",
+                                          YX_ON_COLOR if pt.value else YX_OFF_COLOR)
         elif pt.signal_type == "YT":
-            self._refresh_yt_table()
+            val_text = (f"{pt.value:.2f}" if isinstance(pt.value, (int, float))
+                        else str(pt.value))
+            self._update_point_value_cell(self.yt_table, ioa, val_text)
+
 
     # ==================================================================
     # 辅助
@@ -1606,3 +1721,146 @@ class SimulatorDialog(QDialog):
         self.log_table.scrollToBottom()
         if self.log_table.rowCount() > 2000:
             self.log_table.removeRow(0)
+
+
+class ProtocolParamsDialog(QDialog):
+    """IEC 60870-5-104 协议参数配置对话框
+
+    可配置项对齐专业工具（lib60870 官方示例 / QTester104 / FreyrScada）：
+    t1/t2/t3 超时、k/w 滑动窗口、ASDU 公共地址、各类型 IOA 基址、
+    主站周期总召唤间隔、遥信/遥测带时标 (SOE)。
+    """
+
+    def __init__(self, params: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("协议参数 (IEC 60870-5-104)")
+        self.setMinimumWidth(420)
+
+        form = QFormLayout(self)
+        form.setSpacing(8)
+
+        def _time_spin(value, tip):
+            sp = QDoubleSpinBox()
+            sp.setRange(1.0, 600.0)
+            sp.setDecimals(1)
+            sp.setSuffix(" s")
+            sp.setValue(float(value))
+            sp.setToolTip(tip)
+            return sp
+
+        # ---- 超时参数 ----
+        self.sp_t1 = _time_spin(
+            params.get("t1", 15.0),
+            "t1：发送 I 帧后等待对端确认的超时（标准默认 15s），\n"
+            "超时未确认视为连接失效并重连")
+        self.sp_t2 = _time_spin(
+            params.get("t2", 10.0),
+            "t2：收到 I 帧后延迟发送 S 帧确认的时间（标准默认 10s），\n"
+            "必须小于 t1")
+        self.sp_t3 = _time_spin(
+            params.get("t3", 20.0),
+            "t3：链路空闲时发送 TESTFR 探活帧的周期（标准默认 20s）")
+        form.addRow("t1 确认超时:", self.sp_t1)
+        form.addRow("t2 延迟确认:", self.sp_t2)
+        form.addRow("t3 空闲探活:", self.sp_t3)
+
+        # ---- 滑动窗口 ----
+        self.sp_k = QSpinBox()
+        self.sp_k.setRange(1, 32767)
+        self.sp_k.setValue(int(params.get("k", 12)))
+        self.sp_k.setToolTip("k：发送窗口——未被对端确认的最大 I 帧数（标准默认 12），\n"
+                             "发满 k 帧未确认将暂停发送")
+        self.sp_w = QSpinBox()
+        self.sp_w.setRange(1, 32767)
+        self.sp_w.setValue(int(params.get("w", 8)))
+        self.sp_w.setToolTip("w：接收窗口——收到 w 个 I 帧后主动发送 S 帧确认（标准默认 8），\n"
+                             "要求 w <= k")
+        form.addRow("k 发送窗口:", self.sp_k)
+        form.addRow("w 接收窗口:", self.sp_w)
+
+        # ---- 公共地址 ----
+        self.sp_ca = QSpinBox()
+        self.sp_ca.setRange(1, 65534)
+        self.sp_ca.setValue(int(params.get("ca", 1)))
+        self.sp_ca.setToolTip("ASDU 公共地址（站地址），主站与从站两侧需一致")
+        form.addRow("公共地址 (CA):", self.sp_ca)
+
+        # ---- 周期总召唤 ----
+        self.sp_gi = QSpinBox()
+        self.sp_gi.setRange(0, 3600)
+        self.sp_gi.setSuffix(" s")
+        self.sp_gi.setSpecialValueText("关闭（仅连接后总召唤一次）")
+        self.sp_gi.setValue(int(params.get("gi_period", 0)))
+        self.sp_gi.setToolTip("主站周期总召唤间隔；0 表示仅在 STARTDT 后总召唤一次。\n"
+                              "调度数据网常用 15~30 分钟")
+        form.addRow("周期总召唤:", self.sp_gi)
+
+        # ---- IOA 基址 ----
+        def _hex_spin(value, tip):
+            sp = QSpinBox()
+            sp.setRange(1, 0xFE00)
+            sp.setDisplayIntegerBase(16)
+            sp.setPrefix("0x")
+            sp.setValue(int(value))
+            sp.setToolTip(tip)
+            return sp
+
+        base_tip = ("该类型第一个点位的 IOA 地址。\n"
+                    "建议保持分区：遥信 <0x4001、遥测 <0x6001、遥控 <0x6201、遥调，\n"
+                    "否则对端按地址范围自动分类时会归错类")
+        self.sp_base_yx = _hex_spin(params.get("base_yx", 0x0001), base_tip)
+        self.sp_base_yc = _hex_spin(params.get("base_yc", 0x4001), base_tip)
+        self.sp_base_yk = _hex_spin(params.get("base_yk", 0x6001), base_tip)
+        self.sp_base_yt = _hex_spin(params.get("base_yt", 0x6201), base_tip)
+        form.addRow("遥信 IOA 基址:", self.sp_base_yx)
+        form.addRow("遥测 IOA 基址:", self.sp_base_yc)
+        form.addRow("遥控 IOA 基址:", self.sp_base_yk)
+        form.addRow("遥调 IOA 基址:", self.sp_base_yt)
+
+        # ---- SOE ----
+        self.chk_soe = QCheckBox("遥信/遥测带时标 (CP56Time2a / SOE)")
+        self.chk_soe.setChecked(bool(params.get("soe", False)))
+        self.chk_soe.setToolTip(
+            "开启后总召唤与变化上送改用带时标类型（遥信 M_SP_TB_1/遥测 M_ME_TF_1），\n"
+            "控制变位上送同样带时标，可用于检验对端 SOE 处理")
+        form.addRow(self.chk_soe)
+
+        # ---- 按钮 ----
+        btns = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.button(QDialogButtonBox.Ok).setText("确定")
+        btns.button(QDialogButtonBox.Cancel).setText("取消")
+        btns.accepted.connect(self._on_accept)
+        btns.rejected.connect(self.reject)
+        form.addRow(btns)
+
+    def _on_accept(self):
+        """参数合法性校验（IEC 104 标准约束）"""
+        if self.sp_t2.value() >= self.sp_t1.value():
+            QMessageBox.warning(self, "参数无效",
+                                "t2 必须小于 t1（标准要求）。\n"
+                                f"当前 t1={self.sp_t1.value()}s t2={self.sp_t2.value()}s")
+            return
+        if self.sp_w.value() > self.sp_k.value():
+            QMessageBox.warning(self, "参数无效",
+                                "w 必须小于等于 k（标准要求）。\n"
+                                f"当前 k={self.sp_k.value()} w={self.sp_w.value()}")
+            return
+        self.accept()
+
+    def get_params(self) -> dict:
+        """收集对话框当前参数"""
+        return {
+            "t1": self.sp_t1.value(),
+            "t2": self.sp_t2.value(),
+            "t3": self.sp_t3.value(),
+            "k": self.sp_k.value(),
+            "w": self.sp_w.value(),
+            "ca": self.sp_ca.value(),
+            "gi_period": self.sp_gi.value(),
+            "base_yx": self.sp_base_yx.value(),
+            "base_yc": self.sp_base_yc.value(),
+            "base_yk": self.sp_base_yk.value(),
+            "base_yt": self.sp_base_yt.value(),
+            "soe": self.chk_soe.isChecked(),
+        }

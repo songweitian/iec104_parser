@@ -15,13 +15,13 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from app_paths import get_app_dir
+
 
 def _get_app_dir() -> str:
-    """获取应用数据目录（兼容 --onefile 和开发模式）"""
-    if getattr(sys, 'frozen', False):
-        return os.path.dirname(sys.executable)
-    else:
-        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    """获取应用数据目录（统一实现见 app_paths.get_app_dir）"""
+    return get_app_dir()
 
 
 HISTORY_DIR = os.path.join(_get_app_dir(), "sessions")

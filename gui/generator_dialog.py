@@ -5,14 +5,17 @@ IEC104 帧生成器对话框
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
     QComboBox, QLineEdit, QTextEdit, QGroupBox, QFormLayout,
-    QMessageBox, QSpinBox, QApplication
+    QMessageBox, QSpinBox, QApplication, QCheckBox
 )
 from PyQt5.QtGui import QFont
 import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from frame_generator import generate_i_frame, generate_s_frame, generate_u_frame, TYPE_INFO
+from frame_generator import (
+    generate_i_frame, generate_s_frame, generate_u_frame,
+    TYPE_INFO, SELECTABLE_TYPES,
+)
 
 
 class GeneratorDialog(QDialog):
@@ -44,10 +47,14 @@ class GeneratorDialog(QDialog):
         self.type_id_combo = QComboBox()
         for tid, (name, desc) in TYPE_INFO.items():
             self.type_id_combo.addItem(f"{tid}: {name} - {desc}", tid)
+        self.type_id_combo.currentIndexChanged.connect(
+            self._update_select_enabled)
         i_layout.addRow("类型标识:", self.type_id_combo)
 
         self.cot_input = QSpinBox()
-        self.cot_input.setRange(1, 65535)
+        # COT 域只有 1 字节（bit0-5 原因 + P/N + T），源发方地址是独立字节；
+        # 此前允许到 65535，生成器要么静默丢弃高字节，要么写出错位帧
+        self.cot_input.setRange(1, 255)
         self.cot_input.setValue(6)
         i_layout.addRow("传送原因 (COT):", self.cot_input)
 
@@ -61,6 +68,13 @@ class GeneratorDialog(QDialog):
 
         self.value_input = QLineEdit("0")
         i_layout.addRow("值:", self.value_input)
+
+        # 选择/执行（S/E）位：仅遥控/遥调/设点命令有效
+        self.select_check = QCheckBox("选择/预制 (S/E=1，不勾选为执行)")
+        self.select_check.setToolTip(
+            "IEC 60870-5-101：S/E=1 为选择(预制)、0 为执行。\n"
+            "仅 45-51、58-64 等控制命令类型生效。")
+        i_layout.addRow("", self.select_check)
 
         self.i_frame_group.setLayout(i_layout)
         layout.addWidget(self.i_frame_group)
@@ -116,10 +130,20 @@ class GeneratorDialog(QDialog):
         self.output.setPlaceholderText("生成的报文将显示在这里...")
         layout.addWidget(self.output)
 
+        self._update_select_enabled()   # 初始类型（单点信息）无 S/E 位
+
     def _on_type_changed(self, index):
         self.i_frame_group.setVisible(index == 0)
         self.s_frame_group.setVisible(index == 1)
         self.u_frame_group.setVisible(index == 2)
+        self._update_select_enabled()
+
+    def _update_select_enabled(self):
+        """S/E 选项仅对控制命令类型有意义（测量值/单点信息没有 S/E 位）"""
+        is_cmd = self.type_id_combo.currentData() in SELECTABLE_TYPES
+        self.select_check.setEnabled(is_cmd)
+        if not is_cmd:
+            self.select_check.setChecked(False)
 
     def _on_generate(self):
         frame_type = self.frame_type.currentIndex()
@@ -144,7 +168,9 @@ class GeneratorDialog(QDialog):
                         f"值 '{value}' 不是合法数字，请输入整数或小数（如 100 或 3.14）。")
                     return
 
-                frame = generate_i_frame(type_id, cot, common_addr, ioa, value)
+                frame = generate_i_frame(
+                    type_id, cot, common_addr, ioa, value,
+                    select=self.select_check.isChecked())
 
             elif frame_type == 1:  # S 帧
                 recv_seq = self.recv_seq_input.value()

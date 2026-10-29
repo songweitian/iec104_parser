@@ -7,10 +7,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from iec104_parser import (
-    IEC104Parser, ParseMode, TypeID, SignalType,
-    hex_to_bytes, is_log_format, split_concatenated_frames,
-    parse_cp24time2a, parse_cp56time2a,
-    APCIHeader, ASDU, InfoElement, QualityDescriptor
+    IEC104Parser, parse_cp24time2a, parse_cp56time2a, InfoElement
 )
 from datetime import datetime
 
@@ -190,26 +187,26 @@ class TestCP56Time2a:
         data += bytes([0, 0, 0])
         result = parse_cp56time2a(data)
         assert result.minute == 30          # IV 位不参与数值
-        assert getattr(result, "invalid", False) is True
+        assert result.invalid is True
 
     def test_cp56_iv_bit_clear(self):
         data = struct.pack('<H', 1234) + bytes([30, 10, 15, 6, 23])
         data += bytes([0, 0, 0])
         result = parse_cp56time2a(data)
         assert result.minute == 30
-        assert getattr(result, "invalid", False) is False
+        assert result.invalid is False
 
     def test_cp24_iv_bit_set(self):
         data = struct.pack('<H', 500) + bytes([0x80 | 45])
         result = parse_cp24time2a(data)
         assert result.minute == 45
-        assert getattr(result, "invalid", False) is True
+        assert result.invalid is True
 
     def test_cp24_iv_bit_clear(self):
         data = struct.pack('<H', 500) + bytes([45])
         result = parse_cp24time2a(data)
         assert result.minute == 45
-        assert getattr(result, "invalid", False) is False
+        assert result.invalid is False
 
     def test_iv_annotated_in_frame(self):
         """IV=1 的时标在报文解析时应在描述中显式标注，避免误信"""
@@ -219,7 +216,7 @@ class TestCP56Time2a:
         hex_str = f"68 15 00 00 00 00 1E 01 03 00 01 00 01 40 00 01 {' '.join(f'{b:02X}' for b in cp56)}"
         frame = parser.parse_hex(hex_str)
         elem = frame.asdu.information_elements[0]
-        assert getattr(elem.timestamp, "invalid", False) is True
+        assert elem.timestamp.invalid is True
         assert "[时标无效:IV=1]" in elem.value_desc
 
 

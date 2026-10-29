@@ -14,12 +14,18 @@
 import os
 import re
 import sys
+import logging
 import hashlib
 import uuid
 import json
 import platform
 import base64
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from typing import Optional
+
+from app_paths import get_app_dir
+
+logger = logging.getLogger(__name__)
 
 # ============================================================
 # Ed25519 公钥（由 gen_license.py --gen-keys 生成私钥时一并产出）。
@@ -30,6 +36,11 @@ _LICENSE_PUBLIC_KEY_HEX = "B781F29C54F887BF51DE9882573337C22DA8FD49EF2A38371DBBC
 # 载荷里的永久授权哨兵值
 _PERMANENT_TOKEN = "0"
 
+# 授权文件格式版本。升级到本机指纹验签后，旧格式授权文件（无论是否仍在
+# 有效期内）一律作废，用户需重新激活一次——旧格式里的 fingerprint /
+# components 都未签名、可任意编辑，继续兼容等于保留绕过口子。
+_LICENSE_SCHEMA = 2
+
 # 旧版（HMAC 对称签名）激活码格式：32 hex（4×4 带横线或无横线），可选日期后缀。
 # 仅供参考换码提示用，识别宽松些（新 Ed25519 码为 86 字符 base64url，不会误判）。
 # TODO(下版本): 旧激活体系已停用数月，若确认无存量用户使用旧码，
@@ -39,13 +50,8 @@ _LEGACY_CODE_RE = re.compile(
 
 
 def _get_app_dir() -> str:
-    """获取应用数据目录（兼容打包和开发模式）"""
-    if getattr(sys, 'frozen', False):
-        # PyInstaller 打包后，基于可执行文件路径
-        return os.path.dirname(sys.executable)
-    else:
-        # 开发模式，基于脚本路径
-        return os.path.dirname(os.path.abspath(__file__))
+    """获取应用数据目录（统一实现见 app_paths.get_app_dir）"""
+    return get_app_dir()
 
 
 # 授权文件路径
@@ -107,16 +113,31 @@ def get_hardware_components() -> dict:
 
 
 def _machine_matches(stored_components) -> bool:
-    """当前机器是否为激活时的同一台：≥2/3 组件一致即认可。
+    """当前机器是否为激活时的同一台。
 
-    单组件漂移（随机化 MAC / 改主机名）不误伤；整机拷贝到另一台机器
-    至少 guid/host/mac 三个全新，无法通过。
+    guid 是三者中最难篡改的一项（Windows 注册表 MachineGuid，改硬件、
+    改主机名都不变，重装系统才换），因此 **必须命中**；mac/host 只需再
+    中一项，用于容忍随机化 MAC 或改主机名这类单点漂移。
+
+    原实现为"≥2/3 任意组件一致"——攻击者改一下网卡 MAC + 主机名即可让
+    同一份授权在第二台机器通过，门槛过低。
     """
     if not isinstance(stored_components, dict):
         return False
     cur = get_hardware_components()
+
+    if cur.get("guid") and stored_components.get("guid"):
+        if cur["guid"] != stored_components["guid"]:
+            return False
+        return sum(1 for k in ("mac", "host")
+                   if cur.get(k) and stored_components.get(k) == cur[k]) >= 1
+
+    # 无 guid（非 Windows / 读取失败）：退化到"≥2 项真实命中"。
+    # 注意不能用固定阈值 2——可用组件不足时会导致授权永久失效。
+    available = [k for k, v in cur.items() if v]
+    need = min(2, len(available)) if available else 1
     matched = sum(1 for k, v in cur.items() if v and stored_components.get(k) == v)
-    return matched >= 2
+    return matched >= need
 
 
 def is_legacy_code(code: str) -> bool:
@@ -150,9 +171,18 @@ def _parse_date(s: str):
 
 
 def _decode_signature(sig_b64: str) -> bytes:
-    """base64url 解码签名（容忍用户复制丢失结尾 padding）"""
-    padding = "=" * (-len(sig_b64) % 4)
-    return base64.urlsafe_b64decode(sig_b64 + padding)
+    """base64url 解码签名（容忍用户复制丢失结尾 padding）
+
+    失败返回 b""（验签必然失败 → 判为无效，fail-closed）。
+    此前直接抛出 binascii.Error，而调用点在 _verify_signature 的 try
+    **之外**，异常会穿透到 Qt 槽外——项目未安装 sys.excepthook，PyQt5
+    默认 qFatal 终止进程，一个被篡改的 license.dat 即可让程序闪退。
+    """
+    try:
+        padding = "=" * (-len(sig_b64) % 4)
+        return base64.urlsafe_b64decode(sig_b64 + padding)
+    except Exception:
+        return b""
 
 
 def _resolve_license_expiry(fingerprint: str, code: str):
@@ -163,6 +193,10 @@ def _resolve_license_expiry(fingerprint: str, code: str):
     - "YYYY-MM-DD" -> 限时授权（签名有效，日期未被篡改）
     - None -> 无效激活码（格式/长度/签名不匹配）
     """
+    # 授权文件可被手工编辑：code 为 null/数字时 "".join(None.split()) 会抛
+    # AttributeError，而调用链上没有 try → 启动即闪退（fail-closed 应先判类型）
+    if not isinstance(code, str):
+        return None
     code = "".join(code.split())          # 去掉复制粘贴可能带入的所有空白
     if not code:
         return None
@@ -202,6 +236,7 @@ def save_license(fingerprint: str, code: str, holder: str = "") -> bool:
     """
     try:
         data = {
+            "schema": _LICENSE_SCHEMA,
             "fingerprint": fingerprint,
             "code": code.strip(),
             "holder": holder,
@@ -224,8 +259,11 @@ def load_license():
         with open(LICENSE_FILE, "r", encoding="utf-8") as f:
             encoded = f.read().strip()
         data = json.loads(base64.b64decode(encoded))
-        # 绑定校验：优先精确指纹（旧版授权文件无组件快照，行为不变）；
-        # 不匹配时按组件容忍单点漂移（随机化 MAC / 改主机名）
+        # 旧格式授权文件一律作废（需重新激活）：_LICENSE_SCHEMA 说明
+        if not isinstance(data, dict) or data.get("schema") != _LICENSE_SCHEMA:
+            return None
+        # 绑定校验：优先精确指纹；不匹配时按组件容忍单点漂移
+        # （随机化 MAC / 改主机名）
         current_fp = get_hardware_fingerprint()
         if data.get("fingerprint") != current_fp:
             if not _machine_matches(data.get("components")):
@@ -260,22 +298,47 @@ def _write_hwm_file(d: date):
         pass
 
 
+# 水位超前系统日期超过该天数时视为脏数据（时钟曾跳到未来的遗留）
+_MAX_HWM_AHEAD_DAYS = 366
+
+
 def _effective_today(data) -> date:
-    """有效当前日期 = max(系统日期, 各处记录的历史水位)——时钟只能前进"""
-    candidates = [date.today()]
+    """有效当前日期 = max(系统日期, 各处记录的历史水位)——时钟只能前进
+
+    但水位明显超前系统日期（>1 年）时忽略：主板电池掉电、手工把时间调到
+    2099 年再改回来，都会把未来日期写进水位，此后 max() 恒为该日期，
+    授权永久判定过期且无法恢复。
+    """
+    today = date.today()
+    candidates = [today]
+
+    def accept(d) -> bool:
+        if d and d > today + timedelta(days=_MAX_HWM_AHEAD_DAYS):
+            logger.warning(
+                "时钟水位 %s 明显超前系统日期 %s，已忽略（疑似系统时间异常遗留）",
+                d, today)
+            return False
+        return bool(d)
+
     if isinstance(data, dict):
         stored = data.get("last_seen")
         d = _parse_date(stored) if isinstance(stored, str) else None
-        if d:
+        if accept(d):
             candidates.append(d)
     d = _read_hwm_file()
-    if d:
+    if accept(d):
         candidates.append(d)
     return max(candidates)
 
 
-def _remember_today(data: dict, today: date):
-    """推进水位（尽力而为：只读目录/文件损坏不影响判定本身）"""
+def _remember_today(data: dict, today: date, exp_date: Optional[date] = None):
+    """推进水位（尽力而为：只读目录/文件损坏不影响判定本身）
+
+    已过授权到期日时不再推进：水位只服务于"防回拨到期判定"，写到到期日之后
+    没有任何额外价值，却会让一次错误的前跳时间把授权永久锁死。
+    """
+    if exp_date is not None and today > exp_date:
+        return
     stored = data.get("last_seen")
     if not isinstance(stored, str) or _parse_date(stored) != today:
         data["last_seen"] = today.isoformat()
@@ -305,7 +368,11 @@ def is_license_expired() -> bool:
 def get_license_status() -> dict:
     """获取完整授权状态（所有解锁/判定以它为准）
 
-    返回字段：activated / expired / permanent / expiry_date / days_remaining / holder / fingerprint
+    返回字段：activated / expired / permanent / expiry_date / days_remaining /
+    holder / fingerprint / needs_reactivation
+
+    needs_reactivation：存在授权文件但已不可用（旧格式待升级、硬件漂移、
+    激活码无效），UI 可据提示"请重新激活"，区别于从未激活。
     """
     data = load_license()
     if not data:
@@ -313,16 +380,29 @@ def get_license_status() -> dict:
             "activated": False, "expired": False, "permanent": False,
             "expiry_date": "", "days_remaining": None,
             "holder": "", "fingerprint": get_hardware_fingerprint(),
+            "needs_reactivation": os.path.exists(LICENSE_FILE),
         }
-    fp = data.get("fingerprint", "")
-    expiry = _resolve_license_expiry(fp, data.get("code", ""))
+    fp_current = get_hardware_fingerprint()
+    # 验签只能用**本机**指纹。授权文件里的 fingerprint / components 都未
+    # 签名、可任意编辑：此前直接用文件里的 fingerprint 验签，整机拷贝后
+    # 只需把 components 换成目标机器的组件值就能通过机器绑定。
+    expiry = _resolve_license_expiry(fp_current, data.get("code", ""))
+
+    # 本机指纹已漂移（改主机名 / 换网卡），但组件仍高度一致 → 视作同一台
+    # 机器，只是需要重新激活（激活码绑定的是原指纹，无法在本地安全迁移，
+    # 否则等于给整机拷贝开后门）。
+    needs_reactivation = (expiry is None
+                          and bool(data.get("fingerprint"))
+                          and data.get("fingerprint") != fp_current
+                          and _machine_matches(data.get("components")))
 
     # 无效激活码（签名/格式不匹配）：视为未激活
     if expiry is None:
         return {
             "activated": False, "expired": False, "permanent": False,
             "expiry_date": "", "days_remaining": None,
-            "holder": data.get("holder", ""), "fingerprint": fp,
+            "holder": data.get("holder", ""), "fingerprint": fp_current,
+            "needs_reactivation": needs_reactivation,
         }
 
     # 永久授权
@@ -330,7 +410,8 @@ def get_license_status() -> dict:
         return {
             "activated": True, "expired": False, "permanent": True,
             "expiry_date": "", "days_remaining": None,
-            "holder": data.get("holder", ""), "fingerprint": fp,
+            "holder": data.get("holder", ""), "fingerprint": fp_current,
+            "needs_reactivation": False,
         }
 
     exp_date = _parse_date(expiry)
@@ -338,18 +419,20 @@ def get_license_status() -> dict:
         return {
             "activated": False, "expired": True, "permanent": False,
             "expiry_date": expiry, "days_remaining": 0,
-            "holder": data.get("holder", ""), "fingerprint": fp,
+            "holder": data.get("holder", ""), "fingerprint": fp_current,
+            "needs_reactivation": False,
         }
 
     # 时钟回拨防护：以历史水位与系统日期的较大者参与到期判定
     today = _effective_today(data)
     expired = today > exp_date
     days_remaining = (exp_date - today).days  # 可为负数（已过期）
-    _remember_today(data, today)
+    _remember_today(data, today, exp_date)
     return {
         "activated": not expired, "expired": expired, "permanent": False,
         "expiry_date": expiry, "days_remaining": max(days_remaining, 0),
-        "holder": data.get("holder", ""), "fingerprint": fp,
+        "holder": data.get("holder", ""), "fingerprint": fp_current,
+        "needs_reactivation": False,
     }
 
 
@@ -367,16 +450,20 @@ def activate(license_code: str, holder: str = ""):
                        "请将本机硬件指纹发送给开发者换取新版激活码")
 
     if verify_license_code(fingerprint, license_code):
-        # 解析出到期日期，若已过期则拒绝（过期即拒，必须续期码）
         expiry = _resolve_license_expiry(fingerprint, license_code)
-        if expiry and _parse_date(expiry) and date.today() > _parse_date(expiry):
+        exp_date = _parse_date(expiry) if expiry else None
+        # 与 get_license_status 同口径：用"防回拨水位"日期判定，而非裸
+        # date.today()。此前拨回系统时间即可激活一个早已过期的码，还会
+        # 用拨回的日期播种水位，把防回拨一起废掉。
+        today = _effective_today(load_license())
+        if exp_date and today > exp_date:
             return False, "该激活码已过期，请联系开发者续期"
         if save_license(fingerprint, license_code, holder):
             # 激活即播种时钟水位，防止激活后把系统时钟拨回首次运行前
             seeded = load_license()
             if seeded:
-                _remember_today(seeded, date.today())
-            label = "永久授权" if not expiry else f"有效期至 {expiry}"
+                _remember_today(seeded, today, exp_date)
+            label = "永久授权" if not exp_date else f"有效期至 {expiry}"
             return True, f"激活成功！{label}"
         return False, "保存授权文件失败"
     return False, "激活码无效或硬件不匹配"

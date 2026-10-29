@@ -35,6 +35,27 @@ QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
     border: 1px solid #2196F3;
 }
 QComboBox::drop-down { border: none; width: 18px; }
+/* 下拉弹出列表：QSS 设置 QComboBox 后，弹出列表绘制即被样式表接管，
+   必须显式给出背景/文字/hover/选中色，否则 hover 项白底白字"消失" */
+QComboBox QAbstractItemView {
+    background-color: #FFFFFF;
+    color: #222222;
+    border: 1px solid #C9C9C9;
+    outline: none;
+    /* 弹出列表的 hover/选中行走 selected 通道，由这两个属性决定，
+       缺失时会回落调色板导致白底白字 */
+    selection-background-color: #E3F2FD;
+    selection-color: #0D47A1;
+}
+QComboBox QAbstractItemView::item { min-height: 22px; padding: 2px 6px; }
+QComboBox QAbstractItemView::item:hover {
+    background-color: #E3F2FD;
+    color: #0D47A1;
+}
+QComboBox QAbstractItemView::item:selected {
+    background-color: #E3F2FD;
+    color: #0D47A1;
+}
 
 /* 注意：QSS 一旦设置圆角/内边距，按钮绘制即由样式表接管，
    必须显式给出边框与背景，否则按钮会退化成无边框纯文字 */
@@ -111,7 +132,10 @@ QTableWidget::item:selected { background-color: #264f78; }
 QTableWidget::item:hover { background-color: #2a3f55; }
 QHeaderView::section { background-color: #333; color: #ccc; border: 1px solid #555; padding: 4px; }
 QComboBox { background-color: #3c3c3c; color: #d4d4d4; border: 1px solid #555; border-radius: 3px; padding: 3px; }
-QComboBox QAbstractItemView { background-color: #3c3c3c; color: #d4d4d4; selection-background-color: #264f78; }
+QComboBox QAbstractItemView { background-color: #3c3c3c; color: #d4d4d4; selection-background-color: #264f78; selection-color: #ffffff; outline: none; }
+QComboBox QAbstractItemView::item { min-height: 22px; padding: 2px 6px; }
+QComboBox QAbstractItemView::item:hover { background-color: #264f78; color: #ffffff; }
+QComboBox QAbstractItemView::item:selected { background-color: #264f78; color: #ffffff; }
 QPushButton { background-color: #3c3c3c; color: #d4d4d4; border: 1px solid #555; border-radius: 4px; padding: 4px 12px; }
 QPushButton:hover { background-color: #4a4a4a; }
 QPushButton:pressed { background-color: #2a2a2a; }
@@ -156,3 +180,28 @@ QDialog { background-color: #2b2b2b; }
 QMessageBox { background-color: #2b2b2b; }
 QTableView { background-color: #1e1e1e; color: #d4d4d4; gridline-color: #404040; }
 """
+
+
+# ============================================================================
+# 选择高亮调色板
+# ============================================================================
+# 下拉弹出列表的 hover/选中行由委托按 QPalette.Highlight / HighlightedText
+# 绘制，QSS 的 ::item:hover 子控件选择器对它不生效——应用主题时须对每个
+# QComboBox 的 view 显式 setPalette，否则会出现白底白字等不可读配色。
+def apply_selection_palette(widget, dark: bool):
+    """把弹出列表高亮配色应用到 widget 下所有 QComboBox 的 view"""
+    from PyQt5.QtWidgets import QComboBox
+    from PyQt5.QtGui import QPalette, QColor
+    highlight = "#264F78" if dark else "#2196F3"
+    base = "#1E1E1E" if dark else "#FFFFFF"
+    text = "#D4D4D4" if dark else "#222222"
+    for combo in widget.findChildren(QComboBox):
+        view = combo.view()
+        if view is None:
+            continue
+        pal = view.palette()
+        pal.setColor(QPalette.Highlight, QColor(highlight))
+        pal.setColor(QPalette.HighlightedText, QColor("#FFFFFF"))
+        pal.setColor(QPalette.Base, QColor(base))
+        pal.setColor(QPalette.Text, QColor(text))
+        view.setPalette(pal)

@@ -97,10 +97,11 @@ class TestViewOrderMapping:
     def test_out_of_range_row_returns_empty(self):
         cell = self.w._cell(9999, 0)
         assert cell["text"] == "-"
-        assert self.w._frame_idx_at_row(9999) == 9999  # 越界回退为自身
+        # 越界返回 -1：此前"回退为自身"会把视图行号当成帧索引，
+        # 过滤/搜索后 _view_order 短于 all_frames 时会打开错误报文详情。
+        assert self.w._frame_idx_at_row(9999) == -1
 
     def test_bookmark_prefix_rendered(self):
-        from PyQt5.QtWidgets import QApplication
         self.w._toggle_bookmark(3)          # 行3 → 帧3
         assert 3 in self.w._bookmarks
         assert "📌" in self.w._cell(3, 0)["text"]

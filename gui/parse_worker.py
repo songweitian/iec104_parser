@@ -6,14 +6,18 @@
 导出名与拆分前一致（main_window 以 `from gui.parse_worker import ...` 重新导出），
 因此 `from gui.main_window import ParseWorker` 等既有引用不受影响。
 """
+import logging
 import re
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from iec104_parser import (
     IEC104Parser, ParseMode,
-    is_log_format, split_concatenated_frames, parse_log_format_blocks,
+    is_log_format, split_concatenated_frames, parse_log_format_frames,
+    clean_hex_text,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def parse_text_sync(raw_text: str, parse_mode: ParseMode = ParseMode.NORMAL) -> list:
@@ -22,12 +26,16 @@ def parse_text_sync(raw_text: str, parse_mode: ParseMode = ParseMode.NORMAL) -> 
     供对比等不需要后台线程的场景复用——与主界面解析走同一条 ParseWorker
     路径（此前对比对话框走 IEC104Parser.parse_from_text，是第二套并行实现，
     解析修复需要改两处才能同步）。
+
+    注意：run() 内异常走 parse_error 信号。此前该信号无人连接，调用方
+    （对比对话框）拿到空列表却无从判断"确实无报文"还是"解析炸了"。
     """
     worker = ParseWorker(None, raw_text, parse_mode)
-    out = []
-    worker.parse_finished.connect(out.append)
-    worker.run()
-    return out[0] if out else []
+    try:
+        return worker.parse()
+    except Exception as e:      # 同步场景没有信号通道，这里兜住并记录
+        logger.warning("同步解析失败: %s", e)
+        return []
 
 
 class ParseWorker(QThread):
@@ -47,106 +55,159 @@ class ParseWorker(QThread):
         self.max_frames = max_frames
         # 因达到帧数上限而提前停止（供主线程读取后提示用户）
         self.hit_frame_limit = False
+        # 帧 → 输入行号映射。必须在 __init__ 就存在并在所有提前返回路径上
+        # 赋值：此前只在 run() 末尾赋值，帧数上限/取消两条 early-return
+        # 会让主线程拿不到映射，未激活场景下"输入行"列与 F2 定位恒失效。
+        self._frame_input_lines = []
+        # 被清洗掉的可疑字符（"第N行: x"）。此前这些字符被静默丢弃，
+        # 用户只看到"解析出来的报文不对"，无从判断是输入抄错还是格式问题。
+        self.hex_warnings = []
 
     def cancel(self):
         """请求取消解析"""
         self._is_cancelled = True
 
     def run(self):
-        """在后台线程中执行解析"""
+        """在后台线程中执行解析（只负责发信号，解析逻辑见 parse()）"""
         try:
-            # 创建独立的解析器副本，避免线程间干扰
-            worker_parser = IEC104Parser(self.parse_mode)
-            worker_parser.set_master_send_first(IEC104Parser.DEFAULT_MASTER_FIRST)
-
-            frames = []
-            if self.parse_mode == ParseMode.NORMAL:
-                # 普通模式：按行解析
-                hex_lines, line_map = self._extract_hex_lines(self.raw_text)
-                total = len(hex_lines)
-
-                if total == 0:
-                    self.parse_finished.emit([])
-                    return
-
-                worker_parser.frames = []
-                worker_parser.last_master_send = worker_parser.master_send_first
-
-                for i, hex_line in enumerate(hex_lines):
-                    if self._is_cancelled:
-                        self.parse_finished.emit(frames)
-                        return
-
-                    hex_line = hex_line.strip()
-                    if not hex_line:
-                        continue
-
-                    frame = self._parse_single_frame(worker_parser, hex_line, len(frames) + 1)
-                    frames.append(frame)
-
-                    # 未激活帧数上限：解析满即停
-                    if self.max_frames and len(frames) >= self.max_frames:
-                        self.hit_frame_limit = True
-                        self.parse_finished.emit(frames)
-                        return
-
-                    # 每解析100帧更新一次进度
-                    if (i + 1) % 100 == 0 or i + 1 == total:
-                        self.progress_updated.emit(i + 1, total)
-
-                # 保存输入行映射
-                self._frame_input_lines = line_map
-            else:
-                # XN3000/XN8000模式
-                blocks, block_line_map = self._extract_xn_blocks(self.raw_text, self.parse_mode)
-                total = len(blocks)
-
-                if total == 0:
-                    self.parse_finished.emit([])
-                    return
-
-                worker_parser.frames = []
-                worker_parser.last_master_send = worker_parser.master_send_first
-                xn_line_map = []
-
-                for i, (hex_text, timestamp, direction) in enumerate(blocks):
-                    if self._is_cancelled:
-                        self.parse_finished.emit(frames)
-                        return
-
-                    src_lines = block_line_map[i] if i < len(block_line_map) else []
-                    split_frames = split_concatenated_frames(hex_text)
-                    for frame_hex in split_frames:
-                        if self._is_cancelled:
-                            break
-                        frame = self._parse_frame_with_metadata(
-                            worker_parser, frame_hex, timestamp, direction, len(frames) + 1
-                        )
-                        frames.append(frame)
-                        xn_line_map.append(list(src_lines))
-
-                        # 未激活帧数上限：解析满即停
-                        if self.max_frames and len(frames) >= self.max_frames:
-                            self.hit_frame_limit = True
-                            self.parse_finished.emit(frames)
-                            return
-
-                    if (i + 1) % 100 == 0 or i + 1 == total:
-                        self.progress_updated.emit(i + 1, total)
-
-                # 保存输入行映射
-                self._frame_input_lines = xn_line_map
-
+            frames = self.parse(progress_cb=self.progress_updated.emit,
+                                should_cancel=lambda: self._is_cancelled)
             self.parse_finished.emit(frames)
-
         except Exception as e:
             import traceback
             self.parse_error.emit(f"解析异常: {str(e)}\n{traceback.format_exc()}")
 
+    def parse(self, progress_cb=None, should_cancel=None) -> list:
+        """同步解析，返回帧列表（不依赖线程与信号，异常向调用方抛出）
+
+        后台线程、对比对话框、单元测试共用这一条解析路径——此前同步场景
+        直接调用未 start() 的 run()，语义上是"把线程对象当函数用"。
+        """
+        cancel = should_cancel if should_cancel is not None \
+            else (lambda: self._is_cancelled)
+
+        def notify(cur: int, tot: int):
+            if progress_cb is not None:
+                progress_cb(cur, tot)
+
+        # 创建独立的解析器副本，避免与界面线程互相干扰
+        worker_parser = IEC104Parser(self.parse_mode)
+        worker_parser.set_master_send_first(IEC104Parser.DEFAULT_MASTER_FIRST)
+
+        frames = []
+        if self.parse_mode == ParseMode.NORMAL:
+            # 普通模式：按行解析
+            (hex_lines, line_map,
+             timestamps, directions) = self._extract_hex_lines_ex(self.raw_text)
+            total = len(hex_lines)
+            self._frame_input_lines = line_map
+
+            if total == 0:
+                return frames
+
+            worker_parser.frames = []
+            worker_parser.last_master_send = worker_parser.master_send_first
+
+            for i, hex_line in enumerate(hex_lines):
+                if cancel():
+                    return frames
+
+                hex_line = hex_line.strip()
+                if not hex_line:
+                    continue
+
+                ts = timestamps[i] if i < len(timestamps) else ""
+                direction = directions[i] if i < len(directions) else ""
+                if ts or direction:
+                    # 日志里带时间和收发标记：方向/时间以日志为准，
+                    # 不再依赖解析器的交替猜测
+                    frame = self._parse_frame_with_metadata(
+                        worker_parser, hex_line, ts, direction, len(frames) + 1)
+                else:
+                    frame = self._parse_single_frame(
+                        worker_parser, hex_line, len(frames) + 1)
+                frames.append(frame)
+
+                # 未激活帧数上限：解析满即停
+                if self.max_frames and len(frames) >= self.max_frames:
+                    self.hit_frame_limit = True
+                    return frames
+
+                # 每解析100帧更新一次进度
+                if (i + 1) % 100 == 0 or i + 1 == total:
+                    notify(i + 1, total)
+
+            # 保存输入行映射
+            self._frame_input_lines = line_map
+        else:
+            # XN3000/XN8000模式
+            blocks, block_line_map = self._extract_xn_blocks(self.raw_text, self.parse_mode)
+            if not blocks:
+                # 没有识别到任何收发标记行（例如用户手选/误判成日志模式的
+                # 纯十六进制或带点 dump）：回退按普通十六进制提取，
+                # 否则会出现"点了解析没反应"（0 帧且无任何提示）。
+                blocks, block_line_map = self._fallback_plain_blocks(self.raw_text)
+            total = len(blocks)
+
+            if total == 0:
+                return frames
+
+            worker_parser.frames = []
+            worker_parser.last_master_send = worker_parser.master_send_first
+            xn_line_map = []
+            # 同一个 list 对象边增边用：提前返回时主线程也能拿到部分映射
+            self._frame_input_lines = xn_line_map
+
+            for i, (hex_text, timestamp, direction) in enumerate(blocks):
+                if cancel():
+                    return frames
+
+                src_lines = block_line_map[i] if i < len(block_line_map) else []
+                split_frames = split_concatenated_frames(hex_text)
+                for frame_hex in split_frames:
+                    if cancel():
+                        return frames
+                    frame = self._parse_frame_with_metadata(
+                        worker_parser, frame_hex, timestamp, direction, len(frames) + 1
+                    )
+                    frames.append(frame)
+                    xn_line_map.append(list(src_lines))
+
+                    # 未激活帧数上限：解析满即停
+                    if self.max_frames and len(frames) >= self.max_frames:
+                        self.hit_frame_limit = True
+                        return frames
+
+                if (i + 1) % 100 == 0 or i + 1 == total:
+                    notify(i + 1, total)
+
+            # 保存输入行映射
+            self._frame_input_lines = xn_line_map
+
+        return frames
+
+    def _fallback_plain_blocks(self, raw_text: str):
+        """日志模式下的兜底：按普通十六进制逐行提取，返回 (blocks, line_map)"""
+        hex_lines, line_map, stamps, dirs = self._extract_hex_lines_ex(raw_text)
+        blocks = [(h, stamps[i] if i < len(stamps) else "",
+                   dirs[i] if i < len(dirs) else "")
+                  for i, h in enumerate(hex_lines)]
+        return blocks, line_map
+
     def _extract_hex_lines(self, raw_text: str):
         """提取十六进制行（简化版）"""
+        hex_lines, line_map, _, _ = self._extract_hex_lines_ex(raw_text)
+        return hex_lines, line_map
+
+    def _extract_hex_lines_ex(self, raw_text: str):
+        """提取十六进制行 + 每帧的时间戳/方向
+
+        返回 (hex_lines, line_map, timestamps, directions)：
+        日志格式里每行的 "13:25:00.692 RX: ..." 前缀现在会随帧一起保留，
+        否则时间列恒为 "-"、方向只能靠交替猜测（S/U 帧常标反）。
+        """
         if is_log_format(raw_text):
-            return parse_log_format_blocks(raw_text)
+            return parse_log_format_frames(raw_text)
 
         cleaned = ''.join(c for c in raw_text if c in '0123456789ABCDEFabcdef')
         if cleaned and len(cleaned) % 2 == 0 and cleaned[:2].lower() == '68':
@@ -156,7 +217,7 @@ class ParseWorker(QThread):
                     apdu_len = raw_bytes[1]
                     if apdu_len + 2 == len(raw_bytes):
                         all_lines = list(range(len(raw_text.strip().split('\n'))))
-                        return [cleaned], [all_lines]
+                        return [cleaned], [all_lines], [""], [""]
             except ValueError:
                 pass
 
@@ -167,6 +228,10 @@ class ParseWorker(QThread):
             line = line.strip()
             if not line or line.startswith('#'):
                 continue
+            _cleaned, dropped = clean_hex_text(line)
+            if dropped:
+                chars = "".join(c for _, c in dropped)
+                self.hex_warnings.append(f"第 {i + 1} 行: 忽略 {chars!r}")
             # 单行多帧（无分隔拼接，如 680401000e00680402000a00）：拆成单帧序列，
             # 否则 _parse_single_frame 只取第一个 APDU，静默丢弃其余帧。
             # 仅在确实拆出多帧时替换原行，单帧行保留原始空格排版。
@@ -178,7 +243,7 @@ class ParseWorker(QThread):
             else:
                 hex_lines.append(line)
                 line_map.append([i])
-        return hex_lines, line_map
+        return hex_lines, line_map, [""] * len(hex_lines), [""] * len(hex_lines)
 
     def _extract_xn_blocks(self, text: str, parse_mode: ParseMode):
         """提取XN格式的数据块，返回 (blocks, line_map)"""

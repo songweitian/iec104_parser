@@ -1,0 +1,11 @@
+# 统一换行符：仓库内一律 LF，检出时按平台转换。
+# 此前部分文件是 CRLF、部分被脚本改写成 LF，git 每次操作都告警
+# "LF will be replaced by CRLF"，diff 里混着整文件改写，code review 很难看。
+* text=auto eol=lf
+
+# 二进制资源不做换行转换
+*.ico binary
+*.png binary
+*.docx binary
+*.pcap binary
+*.bin binary

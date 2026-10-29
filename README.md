@@ -12,6 +12,7 @@
 - **CP56Time2a / CP24Time2a 时标解析**：精确到毫秒级
 
 ### 智能输入处理
+- **PCAP 导入**：自动做 TCP 流重组（跨包拼接 / 重传去重 / 乱序归位），再按 104 长度域切帧
 - **自动检测模式**：自动识别普通十六进制、XN3000（RX/TX格式）、XN8000（send/recv格式）
 - **多种输入格式**：支持空格分隔、点分隔、0x前缀、换行合并
 - **通信日志格式**：支持带时间戳和方向标记的日志文件
@@ -54,6 +55,7 @@
 
 ### 工具功能
 - **帧生成器**：根据参数生成符合标准的IEC104报文帧，遥控/遥调支持选择（预制）/执行
+  （S/E 位按 IEC 60870-5-101：1=选择/预制、0=执行；调节步命令 RCO 的 S/E 在 bit6）
 - **通信模拟器**：主站/从站模式 TCP 通信模拟，四遥数据表格化展示，从站模式下可编辑点位值
 - **IOA地址别名**：管理IOA地址与名称的映射关系
 - **历史会话管理**：保存/加载/删除解析会话
@@ -125,14 +127,14 @@ pip install pyinstaller
 # 运行构建脚本（推荐，参数与下方手动命令一致）
 build.bat
 
-# 或手动打包
-python -m PyInstaller --onedir --windowed --name="IEC104_Parser" ^
+# 或手动打包（单文件模式，与 build.bat 一致）
+python -m PyInstaller --onefile --windowed --name="IEC104_Parser" ^
     --icon=assets/app.ico ^
     --exclude-module gen_license ^
-    main.py
+    --exclude-module generate_doc ^
+    --noconfirm --clean main.py
 
-# 可执行文件在 dist/IEC104_Parser/ 目录下，
-# license.dat 需与 IEC104_Parser.exe 同目录
+# 可执行文件为 dist/IEC104_Parser.exe
 ```
 
 > ⚠ 打包注意：不要使用 `--add-data` 将源码目录打进发行包——
@@ -227,35 +229,48 @@ python -m PyInstaller --onedir --windowed --name="IEC104_Parser" ^
 
 ```
 iec104_parser/
-├── main.py                 # 程序入口
-├── iec104_parser.py        # 核心协议解析引擎
-├── frame_generator.py      # 帧生成器
-├── iec104_simulator.py     # IEC104 通信模拟器（TCP 主/从站）
-├── pcap_importer.py        # PCAP文件导入
-├── license.py              # 注册激活模块
+├── main.py                 # 程序入口（崩溃兜底 + 启动窗口）
+├── iec104_protocol.py      # 协议公共常量（类型分组/S-E 位/命令偏移，唯一事实来源）
+├── iec104_parser.py        # 核心协议解析引擎（APCI/ASDU/时标/信号类型）
+├── frame_generator.py      # 帧生成器（I/S/U 帧，含 S/E 预制位）
+├── iec104_simulator.py     # IEC104 通信模拟器（TCP 主/从站、SBO 状态机）
+├── pcap_importer.py        # PCAP 文件导入（TCP 流重组 + 按长度域切帧）
+├── license.py              # 注册激活、硬件指纹、Ed25519 验签、防回拨水位
+├── app_paths.py            # 应用数据/日志目录解析（打包写 %APPDATA%）
 ├── gen_license.py          # 激活码生成工具（开发者专用，不随发行包分发）
+├── generate_doc.py         # 生成《用户使用说明书》docx（开发者工具）
 ├── version.py              # 版本/作者信息（发版只改一处）
-├── requirements.txt        # Python 依赖
-├── build.bat               # 打包脚本
+├── requirements.txt        # Python 依赖（带版本区间）
+├── build.bat               # PyInstaller 打包脚本（单文件模式）
 ├── gui/
-│   ├── __init__.py
-│   ├── main_window.py      # 主窗口（UI 面板统筹）
-│   ├── parse_worker.py     # 后台解析工作线程（含同步入口）
-│   ├── style.py            # 浅色/深色主题样式表
-│   ├── icons.py            # 程序图标绘制
-│   ├── about_dialog.py     # 关于/IOA说明
+│   ├── main_window.py      # 主窗口业务（解析调度/定位/书签/授权）
+│   ├── ui_layout.py        # 主窗口界面布局层（控件创建与摆放）
+│   ├── frame_table.py      # 报文列表视图层（虚拟行模型 + 单元格渲染）
+│   ├── parse_worker.py     # 后台解析线程 + 同步解析入口
+│   ├── style.py            # 浅色/深色主题 QSS
+│   ├── icons.py            # 矢量图标绘制
+│   ├── about_dialog.py     # 关于/IOA 说明
 │   ├── license_dialog.py   # 激活对话框
 │   ├── compare_dialog.py   # 报文对比
-│   ├── generator_dialog.py # 帧生成器
-│   ├── simulator_dialog.py # 通信模拟器对话框
+│   ├── generator_dialog.py # 帧生成器界面
+│   ├── simulator_dialog.py # 通信模拟器（连接/SBO/日志）
+│   ├── sim_point_tables.py # 模拟器四遥表格层（创建/刷新/定点更新）
+│   ├── sim_style.py        # 模拟器颜色与按钮样式常量
 │   ├── history_dialog.py   # 历史会话
 │   ├── stats_dialog.py     # 统计图表
-│   ├── exporters.py        # CSV/JSON/TXT 导出
-│   ├── capture_dialog.py   # 网络抓包配置（预留）
-│   └── ioa_alias_dialog.py # IOA别名管理
-├── tests/                  # pytest 测试（协议解析/授权/搜索视图/导出等）
-└── sessions/               # 历史会话存储
+│   ├── exporters.py        # CSV/JSON/TXT 导出（纯函数）
+│   └── ioa_alias_dialog.py # IOA 别名管理
+├── tests/                  # pytest 测试
+│   └── data/               # 测试用报文样本（XN3000/XN8000 日志）
+├── docs/                   # 代码审核报告
+│   └── archive/            # 历史评审过程文档（task_plan/findings/progress）
+├── assets/app.ico          # 程序图标
+├── logs/                   # 崩溃日志（运行时生成，不入库）
+└── sessions/               # 历史会话存储（运行时生成，不入库）
 ```
+
+> 运行时数据（会话、别名、模拟器配置、授权文件）在打包模式下写入
+> `%APPDATA%/IEC104Parser`，源码运行时写在项目目录下。
 
 ## 激活码生成
 
@@ -281,6 +296,14 @@ python gen_license.py <硬件指纹> 2026-12-31
 已列入 .gitignore），客户端只内置公钥。用户无法篡改日期后缀、也无法伪造激活码；
 旧版（HMAC）激活码已停用，输入旧码会提示联系开发者换发新版。
 到期判定以用户本机系统时间为准，到期日当天仍可使用，次日起锁定受限功能。
+
+## 问题排查
+
+程序内置崩溃兜底：遇到内部异常不会再"闪退"，而是弹提示并追加写日志。
+
+- 日志位置：`%APPDATA%\IEC104Parser\logs\crash.log`（源码运行为项目下 `logs\crash.log`）
+- 日志包含完整的 Python 调用栈；段错误（abort/访问冲突）还会有原生调用栈
+- 反馈问题时请附上该日志最后一段（含时间戳与 traceback）
 
 ## 作者
 

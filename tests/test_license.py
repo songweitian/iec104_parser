@@ -292,13 +292,26 @@ class TestClockRollback:
     def test_effective_today_takes_max(self):
         """_effective_today = max(系统日期, last_seen, 水位文件)"""
         self._activate_timed(30)
-        data = {"last_seen": "2030-01-01"}
-        L._write_hwm_file(date(2029, 6, 15))
-        assert L._effective_today(data) == date(2030, 1, 1)
-        assert L._effective_today({}) == date(2029, 6, 15)
-        assert L._effective_today(None) == date(2029, 6, 15)
-        L._write_hwm_file(date(2031, 3, 1))
-        assert L._effective_today(data) == date(2031, 3, 1)
+        today = date.today()
+        near, nearer = today + timedelta(days=60), today + timedelta(days=120)
+        data = {"last_seen": near.isoformat()}
+        L._write_hwm_file(today + timedelta(days=30))
+        assert L._effective_today(data) == near
+        assert L._effective_today({}) == today + timedelta(days=30)
+        assert L._effective_today(None) == today + timedelta(days=30)
+        L._write_hwm_file(nearer)
+        assert L._effective_today(data) == nearer
+
+    def test_far_future_watermark_ignored(self):
+        """水位超前系统日期 1 年以上视为脏数据（时钟曾跳到未来），不得让
+        授权永久过期——这是"主板电池掉电即永久锁死"的复发防护"""
+        self._activate_timed(30)
+        L._write_hwm_file(date(2099, 1, 1))
+        assert L._effective_today({}) == date.today()
+        data = {"last_seen": "2099-01-01"}
+        assert L._effective_today(data) == date.today()
+        status = L.get_license_status()
+        assert status["activated"] is True
 
     def test_corrupt_watermark_ignored(self):
         self._activate_timed(30)
@@ -310,7 +323,7 @@ class TestClockRollback:
 
 
 class TestFingerprintDrift:
-    """指纹漂移容忍：组件级绑定（≥2/3）+ 旧授权文件精确指纹回退"""
+    """指纹漂移与整机拷贝：组件级绑定（guid 必须命中）+ 本机指纹验签"""
 
     @property
     def _fp(self):
@@ -340,17 +353,50 @@ class TestFingerprintDrift:
         for v in comps.values():
             assert len(v) == 32        # 哈希，非明文
 
-    def test_single_drift_tolerated(self):
-        """指纹变了（如改主机名）但机器没换：组件 ≥2/3 匹配 → 仍有效"""
+    def test_single_drift_needs_reactivation(self):
+        """指纹漂移（如改主机名）：不再静默放行，标记为需要重新激活
+
+        旧实现是"组件 ≥2/3 匹配就用文件里的 fingerprint 验签"。但
+        fingerprint / components 都未签名、可任意编辑，整机拷贝后只改
+        components 即可在任意机器通过（见 test_components_swap_rejected）。
+        改为：验签只认**本机**指纹；同机漂移时 activated=False 且
+        needs_reactivation=True，UI 据此提示重新激活，而不是静默失效。
+        """
         ok, _ = L.activate(make_code(self._fp))
         assert ok
         orig_fp = L.get_hardware_fingerprint
         try:
             L.get_hardware_fingerprint = lambda: "DEADBEEF" * 4
+            # 仍识别为"同一台机器的授权文件"，只是不能继续验签通过
             assert L.load_license() is not None
-            assert L.is_activated() is True
+            st = L.get_license_status()
+            assert st["activated"] is False
+            assert st["needs_reactivation"] is True
         finally:
             L.get_hardware_fingerprint = orig_fp
+
+    def test_components_swap_rejected(self):
+        """整机拷贝后把 components 换成目标机器的：不得通过（旧实现可绕过）"""
+        ok, _ = L.activate(make_code(self._fp))
+        assert ok
+        raw = json.loads(base64.b64decode(
+            open(L.LICENSE_FILE, encoding="utf-8").read().strip()))
+
+        orig_fp = L.get_hardware_fingerprint
+        orig_comps = L.get_hardware_components
+        try:
+            # 模拟在另一台机器上运行，并把组件快照换成那台机器的
+            L.get_hardware_fingerprint = lambda: "DEADBEEF" * 4
+            L.get_hardware_components = lambda: {
+                "guid": "F" * 32, "mac": "E" * 32, "host": "D" * 32}
+            raw["components"] = {
+                "guid": "F" * 32, "mac": "E" * 32, "host": "D" * 32}
+            with open(L.LICENSE_FILE, "w", encoding="utf-8") as f:
+                f.write(base64.b64encode(json.dumps(raw).encode()).decode())
+            assert L.is_activated() is False
+        finally:
+            L.get_hardware_fingerprint = orig_fp
+            L.get_hardware_components = orig_comps
 
     def test_wholesale_copy_rejected(self):
         """授权文件整体拷到别的机器：组件全不匹配 → 无效"""
@@ -368,18 +414,30 @@ class TestFingerprintDrift:
             L.get_hardware_fingerprint = orig_fp
             L.get_hardware_components = orig_comps
 
-    def test_legacy_license_without_components_exact_fp_only(self):
-        """旧版授权文件（无组件快照）：行为不变，仅精确指纹生效"""
+    def test_legacy_license_file_rejected(self):
+        """旧格式授权文件（无 schema 字段）一律作废，需重新激活
+
+        升级为"只认本机指纹验签"后，旧文件里的 fingerprint / components
+        都未签名、可任意编辑，继续兼容等于保留绕过口子。产品侧已确认：
+        升级到本版本后所有用户重新激活一次。
+        """
         code = make_code(self._fp)
         legacy = {"fingerprint": self._fp, "code": code, "holder": ""}
         with open(L.LICENSE_FILE, "w", encoding="utf-8") as f:
             f.write(base64.b64encode(json.dumps(legacy).encode()).decode())
-        assert L.load_license() is not None
-
-        legacy["fingerprint"] = "DEADBEEF" * 4
-        with open(L.LICENSE_FILE, "w", encoding="utf-8") as f:
-            f.write(base64.b64encode(json.dumps(legacy).encode()).decode())
         assert L.load_license() is None
+
+        st = L.get_license_status()
+        assert st["activated"] is False
+        # 有授权文件但不可用 → 提示重新激活，区别于从未激活
+        assert st["needs_reactivation"] is True
+
+    def test_current_schema_license_accepted(self):
+        """当前 schema 的授权文件正常加载，且不需要重新激活"""
+        ok, _ = L.activate(make_code(self._fp))
+        assert ok
+        assert L.load_license() is not None
+        assert L.get_license_status()["needs_reactivation"] is False
 
 
 if __name__ == "__main__":

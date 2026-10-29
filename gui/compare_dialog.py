@@ -136,6 +136,9 @@ class CompareDialog(QDialog):
                     map_b[(ca, e.ioa)] = (f, e)
 
         # Find differences
+        # 元组中直接保存 fa/fb 帧对象：此前只存 fa.index，填表时用的是
+        # 循环残留变量（首个 key 为"仅A"时 fa 未绑定 → NameError；否则
+        # CA 张冠李戴）。
         all_keys = sorted(set(list(map_a.keys()) + list(map_b.keys())))
         diffs = []
         for key in all_keys:
@@ -146,20 +149,22 @@ class CompareDialog(QDialog):
                 val_a = str(ea.value) if ea.value is not None else "-"
                 val_b = str(eb.value) if eb.value is not None else "-"
                 if val_a != val_b:
-                    diffs.append(("不同", fa.index, ea, val_a, fb.index, eb, val_b))
+                    diffs.append(("不同", fa, ea, val_a, fb, eb, val_b))
                 else:
-                    diffs.append(("相同", fa.index, ea, val_a, fb.index, eb, val_b))
+                    diffs.append(("相同", fa, ea, val_a, fb, eb, val_b))
             elif key in map_a:
                 fa, ea = map_a[key]
-                diffs.append(("仅A", fa.index, ea, str(ea.value), "-", None, "-"))
+                val_a = str(ea.value) if ea.value is not None else "-"
+                diffs.append(("仅A", fa, ea, val_a, None, None, "-"))
             else:
                 fb, eb = map_b[key]
-                diffs.append(("仅B", "-", None, "-", fb.index, eb, str(eb.value)))
+                val_b = str(eb.value) if eb.value is not None else "-"
+                diffs.append(("仅B", None, None, "-", fb, eb, val_b))
 
         # Populate table
         self.result_table.setSortingEnabled(False)
         self.result_table.setRowCount(len(diffs))
-        for i, (status, idx_a, ea, val_a, idx_b, eb, val_b) in enumerate(diffs):
+        for i, (status, fa, ea, val_a, fb, eb, val_b) in enumerate(diffs):
             # 状态列
             status_item = QTableWidgetItem(status)
             if status == "不同":
@@ -171,10 +176,10 @@ class CompareDialog(QDialog):
                 status_item.setForeground(QColor("#4CAF50"))
             self.result_table.setItem(i, 0, status_item)
 
-            self.result_table.setItem(i, 1, QTableWidgetItem(str(idx_a)))
+            self.result_table.setItem(i, 1, QTableWidgetItem(str(fa.index) if fa else "-"))
             self.result_table.setItem(i, 2, QTableWidgetItem(ea.signal_type.label if ea else "-"))
             # IOA 列显示 "CA=x IOA=0x..." 格式
-            ca_str_a = f"CA={fa.asdu.common_address}" if fa.asdu else ""
+            ca_str_a = f"CA={fa.asdu.common_address}" if (fa and fa.asdu) else ""
             self.result_table.setItem(i, 3, QTableWidgetItem(f"{ca_str_a} IOA=0x{ea.ioa:06X}" if ea else "-"))
 
             val_a_item = QTableWidgetItem(val_a)
@@ -186,17 +191,17 @@ class CompareDialog(QDialog):
                 val_b_item.setFont(QFont(self.font().family(), self.font().pointSize(), QFont.Bold))
             self.result_table.setItem(i, 4, val_a_item)
 
-            self.result_table.setItem(i, 5, QTableWidgetItem(str(idx_b)))
+            self.result_table.setItem(i, 5, QTableWidgetItem(str(fb.index) if fb else "-"))
             self.result_table.setItem(i, 6, QTableWidgetItem(eb.signal_type.label if eb else "-"))
-            ca_str_b = f"CA={fb.asdu.common_address}" if fb.asdu else ""
+            ca_str_b = f"CA={fb.asdu.common_address}" if (fb and fb.asdu) else ""
             self.result_table.setItem(i, 7, QTableWidgetItem(f"{ca_str_b} IOA=0x{eb.ioa:06X}" if eb else "-"))
             self.result_table.setItem(i, 8, val_b_item)
 
         self.result_table.setSortingEnabled(True)
 
-        # 统计
+        # 统计（此前误用未定义的 all_ioas → NameError，应为 all_keys）
         diff_count = sum(1 for d in diffs if d[0] != "相同")
         same_count = sum(1 for d in diffs if d[0] == "相同")
         self.lbl_stats.setText(
-            f"共 {len(all_ioas)} 个 IOA | {diff_count} 个差异 | {same_count} 个相同"
+            f"共 {len(all_keys)} 个 IOA | {diff_count} 个差异 | {same_count} 个相同"
         )

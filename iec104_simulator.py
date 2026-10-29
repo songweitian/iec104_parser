@@ -7,6 +7,7 @@ import socket
 import threading
 import time
 import logging
+import struct
 from enum import Enum, IntEnum
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
@@ -15,6 +16,7 @@ from PyQt5.QtCore import QThread, pyqtSignal
 
 from iec104_parser import hex_to_bytes, IEC104Parser
 from frame_generator import generate_i_frame, generate_s_frame, generate_u_frame
+from iec104_protocol import SBO_COMMAND_TYPE_IDS, se_bit, value_mask
 
 logger = logging.getLogger(__name__)
 
@@ -32,14 +34,6 @@ class ConnectionState(Enum):
     CONNECTING = "连接中"
     CONNECTED = "已连接"
     STARTED = "数据传输中"
-    STOPPING = "停止中"
-
-
-class APCIType(IntEnum):
-    """APCI 帧类型标识 (控制域第1字节 bit0-bit1)"""
-    I_FORMAT = 0x00  # bit0=0: I 格式
-    S_FORMAT = 0x01  # bit0=1, bit1=0: S 格式
-    U_FORMAT = 0x03  # bit0=1, bit1=1: U 格式
 
 
 class UFunc(IntEnum):
@@ -99,20 +93,36 @@ DEFAULT_IOA_RANGES = {
 
 
 def create_default_points(yx_count: int = 4, yc_count: int = 8,
-                          yk_count: int = 2, yt_count: int = 2) -> Dict[int, PointData]:
-    """创建默认点位表"""
+                          yk_count: int = 2, yt_count: int = 2,
+                          ioa_bases: Optional[Dict[str, int]] = None) -> Dict[int, PointData]:
+    """创建默认点位表
+
+    ioa_bases: 各信号类型的 IOA 基址（对齐专业工具的可配置项），
+        缺省用 DEFAULT_IOA_RANGES 起点。建议仍按 YX/YC/YK/YT 分区，
+        否则对端按地址范围自动分类时会归错类。
+    """
+    bases = {
+        "YX": DEFAULT_IOA_RANGES["YX"][0],
+        "YC": DEFAULT_IOA_RANGES["YC"][0],
+        "YK": DEFAULT_IOA_RANGES["YK"][0],
+        "YT": DEFAULT_IOA_RANGES["YT"][0],
+    }
+    if ioa_bases:
+        for k, v in ioa_bases.items():
+            if k in bases and v:
+                bases[k] = v
     points = {}
     for i in range(yx_count):
-        ioa = DEFAULT_IOA_RANGES["YX"][0] + i
+        ioa = bases["YX"] + i
         points[ioa] = PointData(ioa=ioa, signal_type="YX", value=False)
     for i in range(yc_count):
-        ioa = DEFAULT_IOA_RANGES["YC"][0] + i
+        ioa = bases["YC"] + i
         points[ioa] = PointData(ioa=ioa, signal_type="YC", value=0.0)
     for i in range(yk_count):
-        ioa = DEFAULT_IOA_RANGES["YK"][0] + i
+        ioa = bases["YK"] + i
         points[ioa] = PointData(ioa=ioa, signal_type="YK", value=0)
     for i in range(yt_count):
-        ioa = DEFAULT_IOA_RANGES["YT"][0] + i
+        ioa = bases["YT"] + i
         points[ioa] = PointData(ioa=ioa, signal_type="YT", value=0.0)
     return points
 
@@ -152,7 +162,6 @@ class IEC104Simulator(QThread):
         # 点位数据 {ioa: PointData}
         self.points: Dict[int, PointData] = {}
         self._auto_send_enabled = False
-        self._auto_send_interval = 1000  # ms
 
         # 接收计数器 (用于 W 窗口控制)
         self._rx_count_since_last_s = 0
@@ -160,8 +169,10 @@ class IEC104Simulator(QThread):
         # TCP 流重组缓冲：recv 可能给出半包/粘包，跨包缓存直到凑出完整帧
         self._rx_buffer = bytearray()
         # 发送锁：GUI 线程(手动发送/定时上送)与工作线程(t3 TESTFR/t2 S帧)
-        # 可能并发 sendall，无锁会交错写出损坏字节流
-        self._send_lock = threading.Lock()
+        # 可能并发 sendall，无锁会交错写出损坏字节流。
+        # RLock：send_i_frame 需要在同一调用栈内再进入 _send_raw，
+        # 且"取序号→生成帧→发送→自增"必须整体原子，普通 Lock 会自死锁。
+        self._send_lock = threading.RLock()
 
         # 发送窗口：已发出但尚未被确认的 I 帧序号（用于 K 窗口限制）
         self._unacknowledged_i = 0
@@ -169,12 +180,32 @@ class IEC104Simulator(QThread):
         # SBO 预制状态：{ioa: (type_id, value)}，记录已选择待执行的遥控/遥调
         self._select_locks: Dict[int, tuple] = {}
 
-        # 协议参数
+        # 遥控/遥调 → 关联遥信/遥测点位映射（由 GUI 提供并同步）。
+        # 遥控/遥调本质是写点位：执行结果写入关联点位并变化上送，
+        # 不参与总召唤、也不靠控制回显帧传递状态。
+        self.yk_links: Dict[int, int] = {}
+        self.yt_links: Dict[int, int] = {}
+
+        # 协议参数（GUI 协议参数对话框可配置，对齐 lib60870/QTester104 等
+        # 专业工具暴露的可配置项）
         self.t1 = DEFAULT_T1
         self.t2 = DEFAULT_T2
         self.t3 = DEFAULT_T3
         self.k = DEFAULT_K
         self.w = DEFAULT_W
+        self.common_addr = 1        # ASDU 公共地址（站地址）
+        self.soe_enabled = False    # 遥信/遥测带 CP56Time2a 时标 (SOE)
+
+        # 协议超时重连判据：t1（I帧确认超时）/ t3（TESTFR 连续无应答）置位后，
+        # _handle_connection 退出内层循环，外层 while 重连。
+        self._testfr_unacked = 0
+        self._reconnect_requested = False
+
+        # 总召唤响应队列：[(ioa, PointData)...]，末尾 (None, None) 为
+        # ACTTERM 哨兵。按 K 窗口分段发送，避免一次发满后被丢弃。
+        self._gi_queue: list = []
+        self._gi_ca = 1
+        self._gi_cot = 20
 
         # 定时器状态
         self._last_send_time = 0      # 最后发送 I 帧的时间
@@ -239,9 +270,17 @@ class IEC104Simulator(QThread):
         self._set_state(ConnectionState.IDLE)
 
     def _close_sockets(self):
-        """关闭所有 socket"""
+        """关闭所有 socket
+
+        先 shutdown(SHUT_RDWR) 再 close，确保对端立即感知半关闭、避免
+        TIME_WAIT 堆积（此前只 close，对端可能短暂认为连接仍可用）。
+        """
         for sock in [self._client_socket, self._server_socket, self._socket]:
             if sock:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
                 try:
                     sock.close()
                 except Exception:
@@ -340,12 +379,17 @@ class IEC104Simulator(QThread):
 
     def _handle_connection(self):
         """处理已建立的连接 - 接收循环 + 定时任务"""
+        self._reconnect_requested = False
+        self._testfr_unacked = 0
         while self._running and self._client_socket:
             try:
                 # 接收数据
                 self._receive_and_process()
-                # 处理定时任务
+                # 处理定时任务（t1/t3 协议超时可能置位重连标志）
                 self._handle_timers()
+                if self._reconnect_requested:
+                    self.log_message.emit("[连接] 协议超时，触发重连…")
+                    break
             except ConnectionResetError:
                 self.log_message.emit("[连接] 对端断开")
                 break
@@ -430,7 +474,12 @@ class IEC104Simulator(QThread):
             if frame.apci:
                 desc = frame.description or ""
                 self.log_message.emit(f"[收] {ftype} {desc[:60]}")
-            self._handle_i_frame_received(frame)
+                self._handle_i_frame_received(frame, frame_data)
+            else:
+                # 此前无条件调用 _handle_i_frame_received，而后者首行即访问
+                # frame.apci.send_seq —— 畸形帧（apci 为 None）直接抛
+                # AttributeError 穿透到 run()，工作线程死亡、连接中断。
+                self.log_message.emit(f"[警告] I帧解析失败，已忽略: {hex_str[:40]}")
         elif ftype == "S-format":
             rn = ((frame_data[5] & 0x7F) << 8 | (frame_data[4] & 0xFE)) >> 1
             self.log_message.emit(f"[收] S帧 RN={rn}")
@@ -440,7 +489,7 @@ class IEC104Simulator(QThread):
             self.log_message.emit(f"[收] {desc}")
             self._handle_u_frame_received(frame_data)
 
-    def _handle_i_frame_received(self, frame):
+    def _handle_i_frame_received(self, frame, raw=None):
         """处理收到的 I 帧"""
         # 更新接收序号
         sn = frame.apci.send_seq
@@ -450,13 +499,22 @@ class IEC104Simulator(QThread):
             self.log_message.emit(f"[警告] 序号不连续: 期望{self._recv_seq}, 收到{sn}")
             self._recv_seq = (sn + 1) % 32768
 
+        # I 帧捎带确认：对方用 N(R) 确认我方已发的 I 帧，据此释放 K 窗口。
+        # 此前只有 S 帧会更新 _unacknowledged_i，捎带确认场景下窗口永不释放
+        # → 发满 k 帧后所有后续 I 帧（含总召唤 ACTTERM）被静默丢弃。
+        self._release_send_window(frame.apci.recv_seq)
+        # 捎带确认同样确认了我方未决的发送，t1 计时应复位——否则已确认
+        # 的发送在 15s 后仍被误判"确认超时"→ 无谓断连重连（总召唤数据
+        # 可能半途被从站 _reset_sequence_numbers 清空）。
+        self._last_send_time = 0
+
         self._rx_count_since_last_s += 1
         self._last_rx_time = time.time()
         self._pending_s_timer = True
 
         # 自动回复逻辑
         if self.role == SimulatorRole.SLAVE:
-            self._auto_reply_slave(frame)
+            self._auto_reply_slave(frame, raw)
         elif self.role == SimulatorRole.MASTER:
             self._auto_reply_master(frame)
 
@@ -465,15 +523,26 @@ class IEC104Simulator(QThread):
             self.send_s_frame()
 
 
+    def _release_send_window(self, rn: int):
+        """按对方 N(R) 缩减未确认发送窗口（K 窗口），S 帧与 I 帧捎带确认共用。
+
+        rn 为对方期望的下一个序号，即已确认 [0, rn-1]；我方已发到
+        _send_seq-1，故未确认数为 (_send_seq - rn) mod 32768。
+        必须取模：序号回绕后 rn 会大于 _send_seq，不取模窗口永不复位。
+        """
+        if not (0 <= rn < 32768):
+            return
+        pending = (self._send_seq - rn) % 32768
+        # 只收缩不膨胀：异常 rn（如对方重发旧确认）不应把窗口撑大
+        if pending < self._unacknowledged_i:
+            self._unacknowledged_i = pending
+
     def _handle_s_frame_received_raw(self, rn: int):
         """处理收到的 S 帧 (直接使用序号)
 
         对方确认到序号 rn-1 为止的 I 帧，据此缩减未确认窗口（K 窗口）。
         """
-        # 收到的 rn = 对方期望的下一个序号，即已确认 [0, rn-1]。
-        # 我方已发序号到 self._send_seq-1，未确认数为 send_seq - rn。
-        if rn <= self._send_seq:
-            self._unacknowledged_i = self._send_seq - rn
+        self._release_send_window(rn)
         self._last_rx_time = time.time()
         self._last_send_time = 0
 
@@ -490,7 +559,7 @@ class IEC104Simulator(QThread):
             # 主站自动发送总召唤
             if self.role == SimulatorRole.MASTER and self._auto_gi:
                 self.log_message.emit("[主站] 自动发送总召唤")
-                self.send_general_interrogation(common_addr=1)
+                self.send_general_interrogation(common_addr=self.common_addr)
         elif ctrl == UFunc.STOPDT_ACT:
             self.log_message.emit("[U帧] 收到 STOPDT_ACT, 回复 CON")
             self.send_u_frame("STOPDT_CON")
@@ -503,13 +572,15 @@ class IEC104Simulator(QThread):
             self.send_u_frame("TESTFR_CON")
         elif ctrl == UFunc.TESTFR_CON:
             self.log_message.emit("[U帧] 收到 TESTFR_CON")
+            # 对端确认了上一轮探活，清零无应答计数（t3 重连判据）
+            self._testfr_unacked = 0
         else:
             self.log_message.emit(f"[U帧] 未知功能码: 0x{ctrl:02X}")
 
         self._last_rx_time = time.time()
         self._last_activity_time = time.time()
 
-    def _auto_reply_slave(self, frame):
+    def _auto_reply_slave(self, frame, raw=None):
         """从站自动回复逻辑"""
         if not frame.asdu:
             return
@@ -534,18 +605,18 @@ class IEC104Simulator(QThread):
 
         elif tid in (13, 14, 45, 46, 47, 48, 49, 50, 61, 62, 63) and cot == 6:
             # 遥控/遥调/设点命令 → 按 SBO 预制流程处理
-            self._handle_control_command(frame, tid, ca)
+            self._handle_control_command(frame, tid, ca, raw)
 
-    # 遥控/遥调命令是否要求 SBO 预制流程（需要先"选择"再"执行"）
-    _SBO_COMMAND_TIDS = {45, 46, 47, 48, 49, 50, 61, 62, 63}
+    # 遥控/遥调命令是否要求 SBO 预制流程（定义见 iec104_protocol）
+    _SBO_COMMAND_TIDS = SBO_COMMAND_TYPE_IDS
 
     def _extract_sco(self, frame, tid: int) -> int:
-        """从解析结果还原控制命令的 SCO/设点字节（含 S/E 位，bit7）
+        """从解析结果还原控制命令的 SCO/设点字节（含 S/E 位）
 
-        各类型信息元素 value 结构不同，需按类型还原命令字节：
+        S/E 位含义遵循标准：1=选择(预制)、0=执行。
           - 45 C_SC:  {'scs':bit0, 'se':bit7}
           - 46 C_DC:  {'dcs':bit2-3, 'se':bit7}
-          - 47 C_RC:  {'rca':bit1-6, 'se':bit7, 'step_dir'/'step_down'}
+          - 47 C_RC:  {'rca':bit0-5, 'se':bit6}（bit7 为 QL）
           - 48/49/50/61/62/63 设点：parser 只给值，S/E 位在 QOS 未单独解析，
             此处以 S/E=执行 还原（设点命令极少用 SBO，且此处仅用于校验）
         """
@@ -554,95 +625,255 @@ class IEC104Simulator(QThread):
         elem = frame.asdu.information_elements[0]
         val = elem.value
         if isinstance(val, dict):
-            se = val.get("se", 1)
+            se = val.get("se", 0)
             if tid == 45:
                 body = val.get("scs", 0) & 0x01
             elif tid == 46:
                 body = (val.get("dcs", 0) & 0x03) << 2
             elif tid == 47:
                 rca = val.get("rca", 0) & 0x3F
-                body = (rca << 1)
-                if val.get("step_dir") == "升":
-                    body |= 0x01
+                if val.get("step_dir") == "降":
+                    rca |= 0x01
+                return (se << se_bit(tid)) | rca
             else:
                 body = 0
-            return (se << 7) | (body & 0x7F)
+            return (se << se_bit(tid)) | (body & value_mask(tid))
         if isinstance(val, int):
             return val & 0xFF
         return 0
 
-    def _handle_control_command(self, frame, tid: int, ca: int):
+    def _decode_command(self, raw: bytes, tid: int):
+        """从原始帧字节精确还原控制命令的 S/E 位与命令值。
+
+        _extract_sco 依赖解析结果、对短浮点设点(type 50)会丢失信息（浮点
+        值被当 0、S/E 位无法取得），故改为直接按类型解析字节：
+          - 45/46 (遥控/双点): 信息体 1 字节，bit7=S/E，低 7 位=命令值
+          - 47 (步调):        信息体 1 字节，bit6=S/E，bit0-5=RCA
+          - 48/49 (设点归一/标度):    信息体 2 字节值 + 1 字节 QOS(bit7=S/E)
+          - 50/63 (设点短浮点):       信息体 4 字节 float + 1 字节 QOS(bit7=S/E)
+          - 61/62 (设点带时标归一/标度): 2 字节值 + QOS + 7 字节时标
+        ASDU 自偏移 6 起，IOA 占 3 字节，信息体自偏移 15 起。
+        返回 (se, value)：se 为 1 表示选择/预制、0 表示执行；
+        value 对浮点用 ('f', float) 标记以便精确比较。
+        """
+        if not raw or len(raw) < 16:
+            return (None, None)
+        info = raw[15:]                      # 信息体起始
+        if tid in (45, 46):
+            b = info[0]
+            return ((b >> 7) & 1, b & 0x7F)
+        if tid == 47:
+            b = info[0]
+            return ((b >> 6) & 1, b & 0x3F)
+        if tid in (48, 49):
+            val = info[0] | (info[1] << 8)
+            return ((info[2] >> 7) & 1, val)
+        if tid == 50:
+            fv = struct.unpack('<f', bytes(info[0:4]))[0]
+            return ((info[4] >> 7) & 1, ('f', fv))
+        if tid in (61, 62):
+            val = info[0] | (info[1] << 8)
+            return ((info[2] >> 7) & 1, val)
+        if tid == 63:
+            fv = struct.unpack('<f', bytes(info[0:4]))[0]
+            return ((info[4] >> 7) & 1, ('f', fv))
+        return (None, None)
+
+    @staticmethod
+    def _cmd_value_equal(a, b) -> bool:
+        """比较预制值与执行值（浮点按原始字节，容忍浮点误差）"""
+        if isinstance(a, tuple) and isinstance(b, tuple) and a and b \
+                and a[0] == 'f' and b[0] == 'f':
+            return abs(a[1] - b[1]) < 1e-6
+        return a == b
+
+    def _handle_control_command(self, frame, tid: int, ca: int, raw=None):
         """按 SBO（select-before-operate）流程处理遥控/遥调/设点命令
 
         流程（IEC 104 §5.4.2.2，SBO 要求）：
-          1. 收到 COT=6 + S/E=0(选择)  → 回 COT=7(选择确认)，记录预制锁
-          2. 收到 COT=6 + S/E=1(执行)  → 校验预制锁，执行并回 COT=7(执行确认) + 变化上送
+          1. 收到 COT=6 + S/E=1(选择)  → 回 COT=7(选择确认)，记录预制锁
+          2. 收到 COT=6 + S/E=0(执行)  → 校验预制锁，执行并回 COT=7(执行确认) + 变化上送
           3. 未预制就执行 / 预制后值不一致 / 预制后超时 → 回 COT=8(激活终止)
+
+        直接操作（SBO 关闭场景下主站只发执行帧、无预制锁）按 direct operate
+        处理：直接执行并回执行确认，便于测试工具互相联调。
         """
         if not frame.asdu or not frame.asdu.information_elements:
             return
         ioa = frame.asdu.information_elements[0].ioa
-        sco = self._extract_sco(frame, tid)
-        se = (sco >> 7) & 1          # 0=选择(预制), 1=执行
-        value = sco & 0xFF
+        # 优先按字节精确解码（type 50 浮点必须）；无原始字节时回退 _extract_sco
+        if raw is not None:
+            decoded = self._decode_command(raw, tid)
+            if decoded[0] is not None:
+                se, value = decoded
+                raw_ok = True
+            else:
+                raw_ok = False
+        else:
+            raw_ok = False
+        if not raw_ok:
+            sco = self._extract_sco(frame, tid)
+            # RCO（47/60）的 S/E 在 bit6，其余在 bit7（见 iec104_protocol）
+            pos = se_bit(tid)
+            se = (sco >> pos) & 1
+            value = sco & value_mask(tid)
+        # 浮点设点用 ('f', x) 标记，回确认帧时需还原为真实浮点
+        send_value = value[1] if isinstance(value, tuple) and value \
+            and value[0] == 'f' else value
 
-        if se == 0:
-            # ===== 选择/预制 =====
+        if se == 1:
+            # ===== 选择/预制（S/E=1）=====
             self._select_locks[ioa] = (tid, value)
             self.log_message.emit(
                 f"[从站] SBO选择 IOA=0x{ioa:04X} TID={tid}，回选择确认")
             self.send_i_frame(type_id=tid, cot=7, common_addr=ca, ioa=ioa,
-                              value=value, select=True)
+                              value=send_value, select=True)
             return
 
         # ===== 执行 =====
         lock = self._select_locks.get(ioa)
-        if lock is None or lock[0] != tid:
-            # 未预制就执行 → 拒绝，回激活终止
+        if lock is None:
+            # 无预制锁：视为直接操作（SBO 关闭），直接执行并确认
             self.log_message.emit(
-                f"[从站] 拒绝未预制的执行 IOA=0x{ioa:04X} TID={tid}，回激活终止")
-            self.send_i_frame(type_id=tid, cot=8, common_addr=ca, ioa=ioa,
-                              value=value, select=False)
+                f"[从站] 直接操作(无预制) IOA=0x{ioa:04X} TID={tid}，回执行确认")
+            self._apply_control_to_point(ioa, tid, value, ca)
+            self.send_i_frame(type_id=tid, cot=7, common_addr=ca, ioa=ioa,
+                              value=send_value, select=False)
             return
-        # 比较命令内容位（剔除 S/E 位），选择与执行的 body 必须一致
-        if lock[1] != (value & 0x7F):
+        if lock[0] != tid or not self._cmd_value_equal(lock[1], value):
             # 预制值不一致 → 拒绝并清除预制锁（该选择已被尝试消耗）
             self._select_locks.pop(ioa, None)
             self.log_message.emit(
-                f"[从站] 执行值({value & 0x7F})与预制值({lock[1]})不一致，回激活终止")
+                f"[从站] 执行与预制不一致 IOA=0x{ioa:04X} TID={tid}，回激活终止")
             self.send_i_frame(type_id=tid, cot=8, common_addr=ca, ioa=ioa,
-                              value=value, select=False)
+                              value=send_value, select=False)
             return
 
         # 校验通过，执行操作并清除预制锁
         self._select_locks.pop(ioa, None)
-        self._apply_control_to_point(ioa, tid, value)
+        self._apply_control_to_point(ioa, tid, value, ca)
         self.log_message.emit(f"[从站] SBO执行 IOA=0x{ioa:04X} TID={tid}，回执行确认")
         self.send_i_frame(type_id=tid, cot=7, common_addr=ca, ioa=ioa,
-                          value=value, select=False)
+                          value=send_value, select=False)
 
-    def _apply_control_to_point(self, ioa: int, tid: int, value: int):
-        """把控制命令的作用结果应用到点位（剔除 S/E 位，仅存命令内容）"""
-        if ioa in self.points:
-            pt = self.points[ioa]
-            body = value & 0x7F
-            if tid in (45, 46, 47):
-                pt.value = body
-            elif tid in (48, 49, 50, 61, 62, 63):
-                pt.value = body
-            pt.timestamp = time.strftime("%H:%M:%S")
-            pt.is_valid = True
-            self.point_updated.emit(ioa, pt)
+    def _apply_control_to_point(self, ioa: int, tid: int, value, ca: int = 1):
+        """把控制命令的作用写入点位，并同步写入关联遥信/遥测后变化上送
+
+        遥控/遥调本质是写点位：遥控结果体现为关联遥信的合/分、遥调
+        结果体现为关联遥测的新值。主站靠这些 YX/YC 数据帧（COT=3）
+        刷新显示，而不是靠控制回显帧（那是命令回执，不是遥信）。
+        """
+        if ioa not in self.points:
+            return
+        pt = self.points[ioa]
+        is_float = isinstance(value, tuple) and value and value[0] == 'f'
+        if is_float:
+            # type 50/63 短浮点设点：直接存浮点
+            pt.value = value[1]
+        elif tid == 46:
+            # 双点命令 DCS 占 bit2-3：0=中间态 1=分 2=合 3=不确定。
+            # 直接 bool(body) 会把 0x04(分) 也判成合
+            pt.value = (value >> 2) & 0x03
+        else:
+            # 单点命令 SCS 占 bit0（0=分 1=合）
+            pt.value = value & 0x7F
+        pt.timestamp = time.strftime("%H:%M:%S")
+        pt.is_valid = True
+        self.point_updated.emit(ioa, pt)
+
+        # 写入关联点位并变化上送（控制变位是典型 SOE 场景，带时标可选）
+        links = (self.yk_links if pt.signal_type == "YK"
+                 else self.yt_links if pt.signal_type == "YT" else {})
+        link_ioa = links.get(ioa)
+        if not link_ioa or link_ioa not in self.points:
+            return
+        lp = self.points[link_ioa]
+        if is_float:
+            lp.value = value[1]
+        elif tid == 46:
+            lp.value = (pt.value == 2)     # DCS=2 才是合
+        else:
+            lp.value = bool(value & 0x7F)
+        lp.timestamp = pt.timestamp
+        lp.is_valid = True
+        self.point_updated.emit(link_ioa, lp)
+        if self.is_connected:
+            if lp.signal_type == "YX":
+                if self.soe_enabled:
+                    self.send_i_frame(type_id=30, cot=3, common_addr=ca,
+                                      ioa=link_ioa, value=bool(lp.value))
+                else:
+                    self.send_single_point(ioa=link_ioa, value=bool(lp.value),
+                                           common_addr=ca, cot=3)
+            elif lp.signal_type == "YC":
+                if self.soe_enabled:
+                    self.send_i_frame(type_id=36, cot=3, common_addr=ca,
+                                      ioa=link_ioa, value=float(lp.value))
+                else:
+                    self.send_measured_float(ioa=link_ioa, value=float(lp.value),
+                                             common_addr=ca, cot=3)
+            self.log_message.emit(
+                f"[从站] 控制写入关联点位 IOA=0x{link_ioa:04X} "
+                f"值={lp.value}，变化上送")
 
     def _send_all_points(self, common_addr: int, cot: int = 20):
-        """上送所有点位数据"""
-        for ioa, pt in sorted(self.points.items()):
+        """上送所有点位数据（按 K 窗口分段，末尾发激活终止）
+
+        此前在同一个同步调用栈里连续发送：发满 k=12 后其余点位被静默
+        丢弃，随后的 ACTTERM 也发不出去 → 主站必然等到 15s 超时才收尾。
+        改为入队 + 由收包循环（_handle_timers）分批刷新：每轮只发窗口
+        允许的量，对端 S 帧到达后窗口释放再继续，最终 ACTTERM 必定发出。
+        """
+        queue = [(ioa, pt) for ioa, pt in sorted(self.points.items())
+                 if pt.signal_type in ("YX", "YC")]
+        # 哨兵：数据发完后发 ACTTERM
+        queue.append((None, None))
+        self._gi_queue = queue
+        self._gi_ca = common_addr
+        self._gi_cot = cot
+        self._flush_gi_queue()
+
+    def _flush_gi_queue(self):
+        """按 K 窗口余量继续上送总召唤数据；队列清空后补发激活终止"""
+        queue = self._gi_queue
+        if not queue:
+            return
+
+        while queue and self._unacknowledged_i < self.k:
+            ioa, pt = queue[0]
+
+            if ioa is None:
+                # ACTTERM：窗口满时留到下一轮，绝不能丢弃（否则主站
+                # 收不到激活终止，只能等超时）
+                if not self.send_i_frame(type_id=100, cot=10,
+                                         common_addr=self._gi_ca,
+                                         ioa=0, value=20):
+                    return
+                queue.pop(0)
+                self.log_message.emit("[从站] 总召唤数据上送完成")
+                continue
+
             if pt.signal_type == "YX":
-                self.send_single_point(ioa=ioa, value=bool(pt.value),
-                                       common_addr=common_addr, cot=cot)
-            elif pt.signal_type == "YC":
-                self.send_measured_float(ioa=ioa, value=float(pt.value),
-                                         common_addr=common_addr, cot=cot)
+                if self.soe_enabled:
+                    ok = self.send_i_frame(type_id=30, cot=self._gi_cot,
+                                           common_addr=self._gi_ca,
+                                           ioa=ioa, value=bool(pt.value))
+                else:
+                    ok = self.send_single_point(ioa=ioa, value=bool(pt.value),
+                                                common_addr=self._gi_ca,
+                                                cot=self._gi_cot)
+            else:
+                if self.soe_enabled:
+                    ok = self.send_i_frame(type_id=36, cot=self._gi_cot,
+                                           common_addr=self._gi_ca,
+                                           ioa=ioa, value=float(pt.value))
+                else:
+                    ok = self.send_measured_float(ioa=ioa, value=float(pt.value),
+                                                  common_addr=self._gi_ca,
+                                                  cot=self._gi_cot)
+            if not ok:
+                return      # 发送失败或窗口已满，留待下一轮
+            queue.pop(0)
 
     def set_point_value(self, ioa: int, value: Any):
         """设置点位值（从站模式），自动上送变化数据"""
@@ -654,17 +885,33 @@ class IEC104Simulator(QThread):
         pt.timestamp = time.strftime("%H:%M:%S")
         pt.is_valid = True
         self.point_updated.emit(ioa, pt)
-        # 如果已连接且值有变化，自动上送
+        # 如果已连接且值有变化，自动上送（公共地址/带时标由协议参数决定）
         if self._auto_send_enabled and self.is_connected and old_val != value:
             if pt.signal_type == "YX":
-                self.send_single_point(ioa=ioa, value=bool(value), common_addr=1, cot=3)
+                if self.soe_enabled:
+                    self.send_i_frame(type_id=30, cot=3, common_addr=self.common_addr,
+                                      ioa=ioa, value=bool(value))
+                else:
+                    self.send_single_point(ioa=ioa, value=bool(value),
+                                           common_addr=self.common_addr, cot=3)
             elif pt.signal_type == "YC":
-                self.send_measured_float(ioa=ioa, value=float(value), common_addr=1, cot=3)
+                if self.soe_enabled:
+                    self.send_i_frame(type_id=36, cot=3, common_addr=self.common_addr,
+                                      ioa=ioa, value=float(value))
+                else:
+                    self.send_measured_float(ioa=ioa, value=float(value),
+                                             common_addr=self.common_addr, cot=3)
             self.log_message.emit(f"[从站] 变化上送 IOA=0x{ioa:04X} 值={value}")
 
     def _update_point_from_frame(self, frame):
         """从收到的帧更新点位数据（主站模式）"""
         if not frame.asdu:
+            return
+        # 控制命令回显（45/46/…/63 的 COT=7/8 确认帧）不是遥信数据：
+        # 预制(选择)回显也会带着命令值到达，若照单全收，主站在"预制"
+        # 阶段就会把显示值改成目标值——显示与从站真实状态不符。
+        # 主站学值只认数据帧（总召唤 COT=20 / 变化上送 COT=3）。
+        if frame.asdu.type_id in self._CONTROL_TIDS:
             return
         for elem in frame.asdu.information_elements:
             ioa = elem.ioa
@@ -682,7 +929,10 @@ class IEC104Simulator(QThread):
                 pt.quality = elem.quality.raw
             self.point_updated.emit(ioa, pt)
 
-    _CONTROL_TIDS = {13, 14, 45, 46, 47, 48, 49, 50, 61, 62, 63}
+    # 控制方向类型（C_ 开头命令帧）。注意 13/14 是监视方向的遥测短浮点
+    # （M_ME_NC_1/TC_1），绝不能混入——否则主站会把从站上送的遥测当
+    # 控制回显丢弃，遥测全解析不出来。
+    _CONTROL_TIDS = {45, 46, 47, 48, 49, 50, 51, 58, 59, 60, 61, 62, 63, 64}
 
     def _auto_reply_master(self, frame):
         """主站自动回复逻辑"""
@@ -734,11 +984,19 @@ class IEC104Simulator(QThread):
         return self._send_raw(hex_str)
 
     def send_s_frame(self):
-        """发送 S 帧确认"""
+        """发送 S 帧确认
+
+        仅在发送成功时才复位确认计数——失败时保留 _pending_s_timer，
+        由 t2 定时器重发。此前无条件清零：S 帧丢失后对端将永远等不到
+        确认，卡死在 K 窗口上（总召唤数据传一半即停摆），直至 t1 超时
+        断连重连、_gi_queue 被清空，数据丢失。
+        """
         hex_str = generate_s_frame(self._recv_seq)
-        self._rx_count_since_last_s = 0
-        self._pending_s_timer = False
-        return self._send_raw(hex_str)
+        if self._send_raw(hex_str):
+            self._rx_count_since_last_s = 0
+            self._pending_s_timer = False
+            return True
+        return False
 
     def send_i_frame(self, type_id: int, cot: int, common_addr: int,
                      ioa: int, value, vsq: int = 1, select: bool = False):
@@ -746,26 +1004,36 @@ class IEC104Simulator(QThread):
 
         select: 遥控/遥调命令（45/46/47/48/49/50/61/62/63）的预制标志。
             为 True 表示"选择/预制"，为 False 表示"执行"。
+
+        注意：K 窗口满时**不等待**直接返回 False。等待会自死锁——
+        _auto_reply_slave 在收包循环的同步调用栈内发送，工作线程无法
+        腾出手处理对端 S 帧，窗口永远不释放。需要可靠送达的批量帧
+        （如总召唤响应）请走 _gi_queue 分段发送。
         """
         if self._state != ConnectionState.STARTED:
             self.error_occurred.emit("未进入数据传输状态，请先发送 STARTDT")
             return False
-        # K 窗口：未确认 I 帧数达到上限时暂缓发送（IEC104 8.3 节）
-        if self._unacknowledged_i >= self.k:
-            self.log_message.emit(
-                f"[K窗口] 未确认I帧数已达 {self._unacknowledged_i}/{self.k}，暂缓发送")
-            return False
-        hex_str = generate_i_frame(
-            type_id=type_id, cot=cot, common_addr=common_addr,
-            ioa=ioa, value=value, send_seq=self._send_seq,
-            recv_seq=self._recv_seq, vsq=vsq, select=select
-        )
-        result = self._send_raw(hex_str)
-        if result:
-            self._send_seq = (self._send_seq + 1) % 32768
-            self._unacknowledged_i += 1
-            self._last_send_time = time.time()
-        return result
+
+        # "取序号→生成帧→发送→自增" 必须整体原子：GUI 线程（手动发送/
+        # 定时上送）与工作线程（t2 S帧/t3 TESTFR/总召唤响应）并发调用时，
+        # 无保护会产出两条相同 SN 的 I 帧或丢失自增。
+        with self._send_lock:
+            if self._unacknowledged_i >= self.k:
+                self.log_message.emit(
+                    f"[K窗口] 未确认I帧数已达 {self._unacknowledged_i}/{self.k}，暂缓发送")
+                return False
+
+            hex_str = generate_i_frame(
+                type_id=type_id, cot=cot, common_addr=common_addr,
+                ioa=ioa, value=value, send_seq=self._send_seq,
+                recv_seq=self._recv_seq, vsq=vsq, select=select
+            )
+            result = self._send_raw(hex_str)
+            if result:
+                self._send_seq = (self._send_seq + 1) % 32768
+                self._unacknowledged_i += 1
+                self._last_send_time = time.time()
+            return result
 
     def send_startdt(self):
         """发送 STARTDT_ACT"""
@@ -822,18 +1090,30 @@ class IEC104Simulator(QThread):
             if now - self._last_rx_time >= self.t2:
                 self.send_s_frame()
 
-        # t1: 发送 I 帧后等待确认超时
+        # t1: 发送 I 帧后等待确认超时（协议级致命，应重连）
         if self._last_send_time > 0:
             if now - self._last_send_time >= self.t1:
-                self.log_message.emit(f"[超时] t1={self.t1}s 发送确认超时")
+                self.log_message.emit(f"[超时] t1={self.t1}s 发送确认超时，连接视为断开")
                 self._last_send_time = 0
+                self._reconnect_requested = True
 
-        # t3: 空闲时发送 TESTFR
+        # t3: 空闲时发送 TESTFR 探活；连续 2 次无 CON 应答才判连接已死，
+        # 单次无应答（网络抖动/丢包）不轻易断开。
         if self._last_activity_time > 0:
             if now - self._last_activity_time >= self.t3:
-                self.log_message.emit(f"[定时] t3={self.t3}s 空闲，发送 TESTFR")
-                self.send_testfr()
+                if self._testfr_unacked >= 2:
+                    self.log_message.emit(
+                        f"[超时] t3={self.t3}s 连续 2 次 TESTFR 无应答，连接断开")
+                    self._reconnect_requested = True
+                else:
+                    self.log_message.emit(f"[定时] t3={self.t3}s 空闲，发送 TESTFR")
+                    self.send_testfr()
+                    self._testfr_unacked += 1
                 self._last_activity_time = now
+
+        # 总召唤响应：窗口释放后继续上送剩余点位 / 补发激活终止
+        if self._gi_queue:
+            self._flush_gi_queue()
 
     def _reset_sequence_numbers(self):
         """重置序列号与连接态状态"""
@@ -842,8 +1122,11 @@ class IEC104Simulator(QThread):
         self._rx_count_since_last_s = 0
         self._unacknowledged_i = 0
         self._select_locks.clear()
+        self._gi_queue.clear()    # 上一连接未完成的总召唤上送不得带入新连接
         self._rx_buffer.clear()   # 新连接从干净字节流开始，旧半包不得混入
         self._last_send_time = 0
         self._last_rx_time = time.time()
         self._last_activity_time = time.time()
         self._pending_s_timer = False
+        self._testfr_unacked = 0
+        self._reconnect_requested = False

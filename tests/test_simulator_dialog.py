@@ -25,7 +25,7 @@ _APP = QApplication.instance() or QApplication([])
 
 import gui.simulator_dialog as sd
 from gui.simulator_dialog import SimulatorDialog
-from iec104_simulator import ConnectionState, SimulatorRole
+from iec104_simulator import ConnectionState
 from frame_generator import generate_i_frame
 
 
@@ -98,7 +98,7 @@ class TestInitialStates:
             assert not dlg.btn_send_manual.isEnabled()
             for ops in dlg._yk_ops.values():
                 assert not ops["btn_on"].isEnabled()
-                assert not ops["btn_select"].isEnabled()
+                assert not ops["btn_off"].isEnabled()
             for ops in dlg._yt_ops.values():
                 assert not ops["btn_set"].isEnabled()
             assert not dlg.chk_auto_send.isEnabled()
@@ -175,22 +175,36 @@ class TestLifecycle:
             assert not master._btn_总召唤.isEnabled()
             assert _wait(lambda: master._btn_总召唤.text() == "总召唤", 15000), \
                 "总召唤应在收到 COT=10 后恢复按钮文案"
+            # 总召唤后主站应学到遥测真实值（曾因类型13被误归控制命令而全军覆没）
+            assert _wait(lambda: any(
+                p.is_valid for p in master._current_points.values()
+                if p.signal_type == "YC"), 15000), "总召唤后主站应学到遥测值"
 
-            # ---- SBO 预制 → 确认点亮 → 执行 → 复位 ----
+            # ---- SBO 预制 → 确认点亮 → 执行 → 复位（命令专属预制）----
             ioa = sorted(master._yk_ops)[0]
             ops = master._yk_ops[ioa]
-            ops["btn_select"].click()
-            assert _wait(lambda: ops["selected"], 8000), "预制应在从站确认后点亮"
-            assert ops["btn_select"].text() == "已预制"
-            assert ops["btn_on"].isEnabled()
+            # 预制控合
             ops["btn_on"].click()
-            assert _wait(lambda: not ops["btn_on"].isEnabled(), 5000), \
+            assert _wait(lambda: ops["selected"], 8000), "预制应在从站确认后点亮"
+            assert ops["selected_cmd"] == "on"
+            assert ops["btn_on"].text() == "执行合"
+            assert ops["btn_on"].isEnabled()
+            assert not ops["btn_off"].isEnabled(), "未预制的另一命令应禁用"
+            # 下发执行 → 预制态复位
+            ops["btn_on"].click()
+            assert _wait(lambda: ops["btn_on"].text() == "预制合", 5000), \
                 "执行后预制态应复位"
             assert _wait(lambda: any("执行确认" in r for r in
                                      [master.log_table.item(rr, 4).text()
                                       for rr in range(master.log_table.rowCount())
                                       if master.log_table.item(rr, 4)]), 5000), \
                 "应收到执行确认日志"
+            # 控合执行后，从站变化上送应把主站 YK 显示值刷成"合"
+            row = next(r for r in range(master.yk_table.rowCount())
+                       if master.yk_table.item(r, 1)
+                       and master.yk_table.item(r, 1).text() == f"0x{ioa:04X}")
+            assert _wait(lambda: master.yk_table.item(row, 4).text() == "合", 8000), \
+                f"主站 YK 显示值应与从站一致，实际: {master.yk_table.item(row, 4).text()}"
 
             # ---- 手动发送：结果提示 ----
             master.hex_combo.setCurrentText("68 04 43 00 00 00")
@@ -276,10 +290,12 @@ class TestStateMachine:
             assert dlg._btn_总召唤.isEnabled()
             assert dlg.btn_send_manual.isEnabled()
             assert "数据传输中" in dlg.lbl_status.text()
-            # 连接后行内按钮：SBO 开启 → 仅预制可用
+            # 连接后行内按钮：SBO 开启 → 点击合/分=发起对应命令预制
             for ops in dlg._yk_ops.values():
-                assert ops["btn_select"].isEnabled()
-                assert not ops["btn_on"].isEnabled()
+                assert ops["btn_on"].isEnabled()
+                assert ops["btn_off"].isEnabled()
+                assert ops["btn_on"].text() == "预制合"
+                assert ops["btn_off"].text() == "预制分"
             # 运行中锁配置
             assert not dlg.port_input.isEnabled()
             assert not dlg.btn_apply_points.isEnabled()
@@ -312,19 +328,27 @@ class TestStateMachine:
         try:
             ioa = sorted(dlg._yk_ops)[0]
             ops = dlg._yk_ops[ioa]
-            dlg._on_yk_select(ioa)
-            assert ops["btn_select"].text() == "预制…"
-            assert not ops["btn_select"].isEnabled()
-            # 从站选择确认 → 点亮执行
+            # 预制控分（SBO 开启：点击=发送选择命令）
+            dlg._on_yk_command(ioa, 0)
+            assert ops["btn_off"].text() == "预制分…"
+            assert not ops["btn_off"].isEnabled()
+            assert not ops["btn_on"].isEnabled(), "等待期另一命令应禁用"
+            # 从站选择确认 → 仅点亮"执行分"
             dlg._on_control_ack(ioa, 7, 45)
             assert ops["selected"] is True
-            assert ops["btn_select"].text() == "已预制"
-            assert ops["btn_on"].isEnabled() and ops["btn_off"].isEnabled()
-            # 执行 → 预制态复位
+            assert ops["selected_cmd"] == "off"
+            assert ops["btn_off"].text() == "执行分"
+            assert ops["btn_off"].isEnabled()
+            assert not ops["btn_on"].isEnabled(), "未预制的合应保持禁用"
+            # 预制的是分，点击合不应产生任何发送
+            n_sent = len(dlg.simulator.sent)
             dlg._on_yk_command(ioa, 1)
+            assert len(dlg.simulator.sent) == n_sent
+            # 执行 → 预制态复位，可重新预制
+            dlg._on_yk_command(ioa, 0)
             assert ops["selected"] is False
-            assert not ops["btn_on"].isEnabled()
-            assert ops["btn_select"].text() == "预制"
+            assert ops["btn_off"].text() == "预制分"
+            assert ops["btn_on"].isEnabled()
         finally:
             dlg.deleteLater()
 
@@ -333,12 +357,13 @@ class TestStateMachine:
         try:
             ioa = sorted(dlg._yk_ops)[0]
             ops = dlg._yk_ops[ioa]
-            dlg._on_yk_select(ioa)
+            dlg._on_yk_command(ioa, 1)   # 预制控合
+            assert ops["btn_on"].text() == "预制合…"
             # 模拟 5s 超时触发
             dlg._op_timeout(f"sel:45:{ioa}")
             assert ops["selected"] is False
-            assert ops["btn_select"].text() == "预制"
-            assert ops["btn_select"].isEnabled(), "超时后应可重新预制"
+            assert ops["btn_on"].text() == "预制合"
+            assert ops["btn_on"].isEnabled(), "超时后应可重新预制"
             assert any("超时" in (dlg.log_table.item(r, 4).text() or "")
                        for r in range(dlg.log_table.rowCount())
                        if dlg.log_table.item(r, 4)), "应记录超时日志"
@@ -362,19 +387,89 @@ class TestStateMachine:
         dlg = self._connected_dialog(tmp_path, monkeypatch)
         try:
             ioa = sorted(dlg._yk_ops)[0]
-            dlg._on_yk_select(ioa)
+            dlg._on_yk_command(ioa, 1)   # 预制控合
             # 连接掉线：模拟器状态退回连接中（真实掉线/重试时如此），
             # is_connected=False 才是行内按钮禁用的驱动源
             dlg.simulator._state = ConnectionState.CONNECTING
             dlg._on_disconnected()      # 会话中断
             for ops in dlg._yk_ops.values():
                 assert not ops["btn_on"].isEnabled()
-                assert not ops["btn_select"].isEnabled()
+                assert not ops["btn_off"].isEnabled()
                 assert ops["selected"] is False
-                assert ops["btn_select"].text() == "预制"
+                assert ops["btn_on"].text() == "预制合"
             assert not dlg._btn_总召唤.isEnabled()
             assert not dlg.btn_send_manual.isEnabled()
             assert not dlg._pending_ops, "断开应取消等待中的操作"
+        finally:
+            dlg.deleteLater()
+
+
+class TestProtocolParams:
+    """协议参数对话框、持久化与周期总召唤定时器"""
+
+    def test_params_dialog_roundtrip(self):
+        d = sd.ProtocolParamsDialog(sd.DEFAULT_PARAMS)
+        d.sp_t1.setValue(30.0)
+        d.sp_ca.setValue(9)
+        d.sp_gi.setValue(300)
+        d.chk_soe.setChecked(True)
+        p = d.get_params()
+        assert p["t1"] == 30.0
+        assert p["ca"] == 9
+        assert p["gi_period"] == 300
+        assert p["soe"] is True
+
+    def test_params_dialog_validates_t2_lt_t1(self, tmp_path, monkeypatch):
+        # 校验失败只弹警告不关闭对话框；离屏环境下屏蔽弹窗
+        monkeypatch.setattr(sd.QMessageBox, "warning",
+                            staticmethod(lambda *a, **k: None))
+        d = sd.ProtocolParamsDialog(sd.DEFAULT_PARAMS)
+        d.sp_t1.setValue(5.0)
+        d.sp_t2.setValue(10.0)
+        d._on_accept()
+        assert d.result() != sd.QDialog.Accepted
+
+    def test_params_applied_to_simulator_and_timer(self, tmp_path, monkeypatch):
+        dlg = _make_dialog(tmp_path, monkeypatch)
+        try:
+            dlg._params["gi_period"] = 30
+            dlg._params["ca"] = 5
+            # 未启动：应用参数不崩、定时器不跑
+            dlg._apply_params_to_simulator()
+            dlg._update_gi_timer()
+            assert not dlg._gi_timer.isActive()
+            # 主站连接后定时器启动
+            dlg.simulator = _FakeSim()
+            dlg._refresh_ui_state()
+            assert dlg._gi_timer.isActive()
+            assert dlg._gi_timer.interval() == 30 * 1000
+            # 总召唤使用配置的公共地址（_FakeSim 记录 ("gi", common_addr) 元组）
+            dlg._on_gi()
+            assert ("gi", 5) in dlg.simulator.sent
+        finally:
+            dlg.deleteLater()
+
+    def test_params_persisted_and_restored(self, tmp_path, monkeypatch):
+        dlg = _make_dialog(tmp_path, monkeypatch)
+        dlg._params["ca"] = 42
+        dlg._params["soe"] = True
+        dlg._save_config()
+        dlg.deleteLater()
+
+        dlg2 = _make_dialog(tmp_path, monkeypatch)
+        try:
+            assert dlg2._params["ca"] == 42
+            assert dlg2._params["soe"] is True
+        finally:
+            dlg2.deleteLater()
+
+    def test_apply_points_uses_ioa_bases(self, tmp_path, monkeypatch):
+        dlg = _make_dialog(tmp_path, monkeypatch)
+        try:
+            dlg._params["base_yx"] = 0x0100
+            dlg._on_apply_points()
+            assert 0x0100 in dlg._current_points
+            assert dlg._current_points[0x0100].signal_type == "YX"
         finally:
             dlg.deleteLater()
 

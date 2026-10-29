@@ -1,12 +1,13 @@
 """Phase 1 回归测试 - Bug修复和重构验证"""
 import sys
 import os
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from iec104_parser import (
     IEC104Parser, ParseMode, hex_to_bytes, is_log_format,
-    split_concatenated_frames, parse_cp24time2a, parse_cp56time2a
+    split_concatenated_frames, parse_cp24time2a, detect_input_format
 )
 from datetime import datetime
 
@@ -39,14 +40,25 @@ class TestIsLogFormat:
     def test_rx_tx_format(self):
         assert is_log_format("13:25:00.692 RX:") is True
 
-    def test_dot_separator_format(self):
-        assert is_log_format("68 04 .01 00") is True
+    def test_dot_separator_is_not_log_format(self):
+        """点分隔的 hex dump 不再算日志格式
+
+        此前 `\\b[0-9A-Fa-f]{2}\\s+\\.` 也会命中，导致从抓包工具复制的 dump
+        被自动判成 XN3000，而 XN3000 提取器要求收发标记行 → 0 帧。
+        """
+        assert is_log_format("68 04 .01 00") is False
+        assert detect_input_format("68 04 .01 00") is ParseMode.NORMAL
 
     def test_plain_hex(self):
         assert is_log_format("68 04 01 00 0E 00") is False
 
     def test_xn8000_format(self):
-        assert is_log_format("17- 9:24:59.947 send:") is False
+        """XN8000 的 "日- 时:分:秒.毫秒 send/recv:" 属于日志格式
+
+        旧断言为 False，于是该格式在普通模式下被当纯 hex，时间戳数字混进报文。
+        """
+        assert is_log_format("17- 9:24:59.947 send:") is True
+        assert detect_input_format("17- 9:24:59.947 send:") is ParseMode.XN8000
 
 
 class TestSplitConcatenatedFrames:
@@ -119,21 +131,24 @@ class TestParserBasic:
 
 class TestXNFormats:
     def test_xn3000_parse(self):
-        test_file = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+        test_file = os.path.join(os.path.dirname(__file__), "data",
                                   "XN3000测试报文.txt")
-        if os.path.exists(test_file):
-            with open(test_file, "r", encoding="utf-8") as f:
-                text = f.read()
-            from iec104_parser import parse_log_format_blocks
-            frames, lines = parse_log_format_blocks(text)
-            assert len(frames) > 0
+        if not os.path.exists(test_file):
+            # 测试报文不随仓库分发：缺失时显式跳过，而不是静默 PASS 成绿
+            pytest.skip(f"测试报文缺失: {test_file}")
+        with open(test_file, "r", encoding="utf-8") as f:
+            text = f.read()
+        from iec104_parser import parse_log_format_blocks
+        frames, lines = parse_log_format_blocks(text)
+        assert len(frames) > 0
 
     def test_xn8000_parse(self):
-        test_file = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+        test_file = os.path.join(os.path.dirname(__file__), "data",
                                   "XN8000测试报文.txt")
-        if os.path.exists(test_file):
-            with open(test_file, "r", encoding="utf-8") as f:
-                text = f.read()
-            from iec104_parser import parse_log_format_blocks
-            frames, lines = parse_log_format_blocks(text)
-            assert len(frames) > 0
+        if not os.path.exists(test_file):
+            pytest.skip(f"测试报文缺失: {test_file}")
+        with open(test_file, "r", encoding="utf-8") as f:
+            text = f.read()
+        from iec104_parser import parse_log_format_blocks
+        frames, lines = parse_log_format_blocks(text)
+        assert len(frames) > 0

@@ -10,6 +10,7 @@ IEC60870-5-104 (2002) 协议报文解析器
 - 多种类型标识的数据解析
 """
 
+import re
 import struct
 import calendar
 import logging
@@ -17,6 +18,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import IntEnum, Enum
 from typing import List, Optional, Dict, Any
+
+from iec104_protocol import (
+    CONTROL_TYPE_IDS, MONITOR_TYPE_IDS, SE_BYTE_OFFSETS, se_bit,
+)
 
 
 # 解析模式
@@ -555,23 +560,66 @@ def parse_cp24time2a(data: bytes, hour: int = 0) -> datetime:
 # 公共工具函数
 # ============================================================================
 
+_HEX_ALLOWED = set('0123456789ABCDEFabcdef')
+
+
+def clean_hex_text(hex_string: str) -> tuple:
+    """清洗十六进制文本，返回 (cleaned, dropped)
+
+    dropped 是被丢弃的字符及位置（最多保留前 20 个），用于给用户提示——
+    此前这些字符被静默吞掉，用户只看到"解析出的报文不对"，无从查起。
+    通常被丢弃的合法分隔符（空格/点/逗号/0x 前缀/括号）先单独剥掉，剩下的
+    才算可疑字符。
+    """
+    text = hex_string
+    for sep in (" ", "\t", "\n", "\r", ".", ",", "[", "]", ":"):
+        text = text.replace(sep, "")
+    text = text.replace("0x", "").replace("0X", "")
+    cleaned_chars = []
+    dropped = []
+    for idx, ch in enumerate(text):
+        if ch in _HEX_ALLOWED:
+            cleaned_chars.append(ch)
+        elif len(dropped) < 20:
+            dropped.append((idx, ch))
+    return "".join(cleaned_chars), dropped
+
+
 def hex_to_bytes(hex_string: str) -> bytes:
-    """十六进制字符串 → 字节，支持空格/点/换行/0x前缀等格式"""
-    cleaned = hex_string.replace(" ", "").replace("\n", "").replace("\r", "")
-    cleaned = cleaned.replace("0x", "").replace("0X", "")
-    cleaned = cleaned.replace(",", "").replace("[", "").replace("]", "")
-    cleaned = cleaned.replace(".", "")
-    cleaned = ''.join(c for c in cleaned if c in '0123456789ABCDEFabcdef')
+    """十六进制字符串 → 字节，支持空格/点/换行/0x前缀等格式
+
+    非法字符（如 68h 的 h、注释文字）会被丢弃；需要知道丢了什么请用
+    clean_hex_text()。
+    """
+    cleaned, _dropped = clean_hex_text(hex_string)
     if len(cleaned) % 2 != 0:
         raise ValueError("十六进制字符串长度为奇数")
     return bytes.fromhex(cleaned)
 
 
+# 日志格式的"真标记"：时间 + RX/TX（XN3000）或 日期时间 + send/recv（XN8000）。
+# 此前还接受 `\b[0-9A-Fa-f]{2}\s+\.`（十六进制 dump 的点分隔）作为日志特征，
+# 结果从抓包工具复制的纯 dump 被判成 XN3000，而 XN3000 提取器要求标记行 →
+# 一条报文都解析不出来（用户只看到"点了解析没反应"）。
+_LOG_MARKER_RE = re.compile(
+    r'\d{2}:\d{2}:\d{2}(?:[.,]\d{1,6})?\s+(RX|TX):', re.IGNORECASE)
+_SEND_RECV_MARKER_RE = re.compile(
+    r'(?:\d{1,4}-\d{1,2}-\d{1,2}|\d{1,2}-)\s*\d{1,2}:\d{2}:\d{2}'
+    r'(?:[.,]\d{1,6})?\s+(send|recv):', re.IGNORECASE)
+
+
+def detect_input_format(text: str) -> ParseMode:
+    """判定输入文本属于哪种格式（唯一判定入口，主窗口与解析器共用）"""
+    if _SEND_RECV_MARKER_RE.search(text):
+        return ParseMode.XN8000
+    if _LOG_MARKER_RE.search(text):
+        return ParseMode.XN3000
+    return ParseMode.NORMAL
+
+
 def is_log_format(text: str) -> bool:
-    """检测是否为通信日志格式（含时间戳和RX/TX标记或点分隔符）"""
-    import re
-    return bool(re.search(r'\d{2}:\d{2}:\d{2}\.\d{3}\s+(RX|TX):', text)) or \
-           bool(re.search(r'\b[0-9A-Fa-f]{2}\s+\.', text))
+    """是否为带收发标记的通信日志格式"""
+    return detect_input_format(text) != ParseMode.NORMAL
 
 
 def split_concatenated_frames(hex_block: str) -> list:
@@ -605,40 +653,44 @@ def split_concatenated_frames(hex_block: str) -> list:
     return frames
 
 
-def parse_log_format_blocks(text: str) -> tuple:
-    """解析通信日志格式，返回 (frames_list, line_map_list)"""
+def _parse_log_blocks(text: str) -> list:
+    """把通信日志切成块，返回 [(hex_text, 行号列表, 时间戳, RX/TX)]
+
+    RX/TX 标记与行首时间戳此前被直接丢弃——普通模式下方向只能靠"类型推断 +
+    交替猜测"，S 帧/U 帧（无类型标识）方向经常标反，时间列也永远是"-"。
+    """
     import re
     lines = text.strip().split('\n')
     blocks = []
     current_hex = []
     current_line_nums = []
+    current_ts = ""
+    current_dir = ""
 
+    def flush():
+        if current_hex:
+            blocks.append((' '.join(current_hex), list(current_line_nums),
+                           current_ts, current_dir))
+
+    ts_re = re.compile(r'(\d{2}:\d{2}:\d{2}(?:[.,]\d{1,6})?)')
+    # 标记行：可带前缀（时间/日期），RX/TX 与 send/recv 两种写法都认，
+    # 冒号后可跟同行十六进制（如 "13:25:00.692 RX: 68 04 ..."）。
+    # 此前只认行尾形式且不认 send/recv：XN8000 日志的时间数字会被当 hex 混进报文。
+    marker_re = re.compile(
+        r'^[\d\-:. ]*(RX|TX|send|recv)\s*:\s*(.*)$', re.IGNORECASE)
     for i, line in enumerate(lines):
         line = line.strip()
         if not line:
             continue
 
-        # RX:/TX: 标记行，冒号后可带同行十六进制（如 "13:25:00.692 RX: 68 04 ..."）。
-        # 此前只认行尾形式，同行格式会把时间戳数字混进 hex 流（数字恰为合法
-        # 十六进制字符），报文字节错乱。
-        m = re.match(r'[\d:.\s]+(RX|TX):\s*(.*)$', line)
+        m = marker_re.match(line)
         if m:
-            if current_hex:
-                blocks.append((' '.join(current_hex), list(current_line_nums)))
-                current_hex = []
-                current_line_nums = []
-            same_line = m.group(2).strip()
-            if same_line and re.search(r'[0-9A-Fa-f]{2}', same_line):
-                current_hex.append(same_line)
-                current_line_nums.append(i)
-            continue
-
-        m = re.match(r'^(RX|TX):\s*(.*)$', line)
-        if m:
-            if current_hex:
-                blocks.append((' '.join(current_hex), list(current_line_nums)))
-                current_hex = []
-                current_line_nums = []
+            flush()
+            current_hex, current_line_nums = [], []
+            kind = m.group(1).upper()
+            current_dir = "RX" if kind in ("RX", "RECV") else "TX"
+            tm = ts_re.search(line)
+            current_ts = tm.group(1) if tm else ""
             same_line = m.group(2).strip()
             if same_line and re.search(r'[0-9A-Fa-f]{2}', same_line):
                 current_hex.append(same_line)
@@ -646,28 +698,42 @@ def parse_log_format_blocks(text: str) -> tuple:
             continue
 
         if re.search(r'[0-9A-Fa-f]{2}', line):
+            if not current_hex and not current_ts:
+                tm = ts_re.search(line)
+                current_ts = tm.group(1) if tm else ""
             current_hex.append(line)
             current_line_nums.append(i)
 
-    if current_hex:
-        blocks.append((' '.join(current_hex), list(current_line_nums)))
+    flush()
+    return blocks
 
-    result_frames = []
-    result_lines = []
-    for block, src_lines in blocks:
+
+def parse_log_format_frames(text: str) -> tuple:
+    """解析通信日志格式 → (frames, line_map, timestamps, directions)"""
+    result_frames, result_lines = [], []
+    result_ts, result_dirs = [], []
+    for block, src_lines, ts, direction in _parse_log_blocks(text):
         frames = split_concatenated_frames(block)
         result_frames.extend(frames)
         result_lines.extend([src_lines] * len(frames))
-    return result_frames, result_lines
+        result_ts.extend([ts] * len(frames))
+        result_dirs.extend([direction] * len(frames))
+    return result_frames, result_lines, result_ts, result_dirs
+
+
+def parse_log_format_blocks(text: str) -> tuple:
+    """解析通信日志格式，返回 (frames_list, line_map_list)（兼容旧接口）"""
+    frames, line_map, _, _ = parse_log_format_frames(text)
+    return frames, line_map
 
 
 # ============================================================================
 # IEC104 帧解析器
 # ============================================================================
 
-# TypeID 集合：用于方向判定
-_CONTROL_TYPE_IDS = set(range(45, 65)) | set(range(100, 111)) | set(range(120, 128))
-_MONITOR_TYPE_IDS = set(range(1, 41)) | {70}
+# TypeID 集合：用于方向判定（定义见 iec104_protocol，模拟器共用同一份）
+_CONTROL_TYPE_IDS = CONTROL_TYPE_IDS
+_MONITOR_TYPE_IDS = MONITOR_TYPE_IDS
 
 
 class IEC104Parser:
@@ -843,13 +909,19 @@ class IEC104Parser:
 
             apci = frame.apci
 
-            # 1. APDU长度校验
-            if apci.apdu_length > 253:
+            # 1. 长度域与实际字节数是否一致
+            #    原规则是"APDU长度 > 253"，但 _parse_apci 在解析阶段就拒绝该长度，
+            #    这类帧根本进不了 frames —— 规则永远不触发（死规则）。
+            #    真正可达的问题是本工具按长度域切帧后仍有剩余字节。
+            expected = apci.apdu_length + 2
+            actual = len(clean_hex_text(frame.raw_hex)[0]) // 2
+            if actual and actual != expected:
                 issues.append({
                     "frame_index": frame.index,
-                    "type": "APDU超长",
-                    "severity": "error",
-                    "detail": f"报文#{frame.index}: APDU长度={apci.apdu_length}，超过最大253字节"
+                    "type": "长度域不符",
+                    "severity": "warning",
+                    "detail": (f"报文#{frame.index}: 长度域={apci.apdu_length}"
+                               f"（应为{expected}字节），实际{actual}字节")
                 })
 
             # 2. I帧最小长度
@@ -1089,15 +1161,15 @@ class IEC104Parser:
             signal_type=SignalType.from_type_id(type_id),
         )
 
-        # 传送原因 (2字节, 低字节在前)
-        # Byte 0: Cause(bit0-5) + P/N(bit6) + T(bit7)
-        # Byte 1: Originator Address (ORG)
-        cot = data[2] + (data[3] << 8)
+        # 传送原因 (2字节)：Byte0 = Cause(bit0-5) + P/N(bit6) + T(bit7)，
+        # Byte1 = ORG（源发方地址）。此前把 ORG 也并进 COT 高字节——
+        # ORG≠0 时 COT 变成 0x01FF 之类的值，传送原因显示/统计全错。
+        cot = data[2]
         asdu.cot = cot
         asdu.cot_cause = cot & 0x3F
         asdu.cot_test = bool((cot >> 7) & 1)
         asdu.cot_pn = bool((cot >> 6) & 1)
-        asdu.org = data[3]  # 源发方地址 = COT高字节
+        asdu.org = data[3]  # 源发方地址
 
         # 公共地址 (2字节, 低字节在前)
         asdu.common_address = data[4] + (data[5] << 8)
@@ -1135,9 +1207,12 @@ class IEC104Parser:
 
             asdu.information_elements.append(elem)
 
-        # 0补齐对齐
-        if len(data) % 2 == 1:
-            asdu.pad = data[-1]
+        # 补齐字段：部分装置把 ASDU 补零对齐到偶数字节，尾部会多出 1 个 0x00。
+        # 此前按 len(data) 的奇偶取最后一个字节 —— 任何奇数长度的 ASDU 都会
+        # 凭空多出一个"补齐字段"节点，值还恰好是最后一个信息字节（误报）。
+        leftover = elem_data[offset:]
+        if leftover and len(leftover) <= 2 and not any(leftover):
+            asdu.pad = 0
 
         return asdu
 
@@ -1250,8 +1325,11 @@ class IEC104Parser:
 
             elif type_id == 15:  # M_IT_NA_1 累计量 (遥脉)
                 if len(data) >= 4:
-                    elem.value = data[0] + (data[1] << 8) + (data[2] << 16) + (data[3] << 24)
-                    elem.value_desc = f"累计量={elem.value} | DEC={elem.value} HEX=0x{elem.value:08X}"
+                    # BCR 为 32 位补码（与 16/37 保持一致），此前按无符号解析
+                    # 会把负计数显示成 40 亿级的大数
+                    elem.value = struct.unpack('<i', data[0:4])[0]
+                    elem.value_desc = (f"累计量={elem.value} | DEC={elem.value} "
+                                       f"HEX=0x{elem.value & 0xFFFFFFFF:08X}")
                     consumed = 4
                     if len(data) >= 5:
                         elem.quality = QualityDescriptor(data[4])
@@ -1313,7 +1391,9 @@ class IEC104Parser:
 
             elif type_id == 5:  # M_ST_NA_1 步位置信息 (遥测): step(1) + QDS(1) = 2
                 if len(data) >= 2:
-                    signed_val = self._to_signed(data[0], 8)
+                    # VTI 为 7 位补码（-64..63），bit7 保留；按 8 位取符号会
+                    # 把 bit7=1 的保留位当成负数
+                    signed_val = self._to_signed(data[0] & 0x7F, 7)
                     elem.value = signed_val
                     elem.value_desc = f"步位置={signed_val} | DEC={signed_val} HEX=0x{data[0]:02X}"
                     elem.quality = QualityDescriptor(data[1])
@@ -1321,7 +1401,7 @@ class IEC104Parser:
 
             elif type_id == 6:  # M_ST_TA_1 带时标的步位置信息 (遥测): step(1) + QDS(1) + CP24Time2a(3) = 5
                 if len(data) >= 2:
-                    signed_val = self._to_signed(data[0], 8)
+                    signed_val = self._to_signed(data[0] & 0x7F, 7)
                     elem.value = signed_val
                     elem.value_desc = f"步位置={signed_val} | DEC={signed_val} HEX=0x{data[0]:02X}"
                     elem.quality = QualityDescriptor(data[1])
@@ -1426,8 +1506,10 @@ class IEC104Parser:
         elif type_id == 32:  # M_ST_TB_1 步位置 (遥测): step(1) + QDS(1) + CP56Time2a(7) = 9
             if len(data) < 9:
                 return len(data)
-            elem.value = data[0]
-            elem.value_desc = f"步位置={data[0]} | DEC={data[0]} HEX=0x{data[0]:02X}"
+            # VTI 7 位补码，见 M_ST_NA_1 说明
+            step = self._to_signed(data[0] & 0x7F, 7)
+            elem.value = step
+            elem.value_desc = f"步位置={step} | DEC={step} HEX=0x{data[0]:02X}"
             elem.quality = QualityDescriptor(data[1])
             elem.timestamp = parse_cp56time2a(data[2:9])
             return 9
@@ -1539,7 +1621,7 @@ class IEC104Parser:
             se = (sco >> 7) & 1
             scs = sco & 0x01
             val_dec = "合" if scs else "分"
-            sel_exec = "执行" if se else "选择"
+            sel_exec = "选择(预制)" if se else "执行"
             elem.value = {"scs": scs, "se": se}
             elem.value_desc = (
                 f"[{ctrl_type}] 单点={val_dec} | 操作={sel_exec} "
@@ -1550,7 +1632,7 @@ class IEC104Parser:
             se = (sco >> 7) & 1
             dcs = (sco >> 2) & 0x03
             dcs_map = {0: "不允许", 1: "分", 2: "合", 3: "不允许"}
-            sel_exec = "执行" if se else "选择"
+            sel_exec = "选择(预制)" if se else "执行"
             elem.value = {"dcs": dcs, "se": se}
             elem.value_desc = (
                 f"[{ctrl_type}] 双点={dcs_map.get(dcs, str(dcs))} | 操作={sel_exec} "
@@ -1558,11 +1640,14 @@ class IEC104Parser:
             )
 
         elif type_id == 47:  # C_RC_NA_1 调节步命令 (遥调)
-            se = (sco >> 7) & 1
-            step_down = (sco >> 0) & 0x01
-            rca = (sco >> 1) & 0x3F
-            sel_exec = "执行" if se else "选择"
-            direction = "升" if step_down else "降"
+            # RCO 结构：bit0-5 = RCA，bit6 = S/E，bit7 = QL（附加定义）。
+            # 此前按 SCO 的布局取 bit7 作 S/E、bit1-6 作 RCA，位偏移全错；
+            # RCA 最低位为方向位：0=升一步，1=降一步（此前显示反了）。
+            rca = sco & 0x3F
+            se = (sco >> 6) & 1
+            step_down = rca & 0x01
+            sel_exec = "选择(预制)" if se else "执行"
+            direction = "降" if step_down else "升"
             elem.value = {"rca": rca, "step_dir": direction, "se": se}
             elem.value_desc = (
                 f"[{ctrl_type}] 步方向={direction} | 操作={sel_exec} "
@@ -1579,6 +1664,7 @@ class IEC104Parser:
                 elem.value_desc = (
                     f"[{ctrl_type}] 归一化设定值={normalized:.6f} "
                     f"| DEC={signed_val} HEX=0x{raw_val:04X} "
+                    f"| 操作={'选择(预制)' if (qdp >> 7) & 1 else '执行'} "
                     f"| QDS=0x{qdp:02X}"
                 )
                 consumed = 3
@@ -1593,6 +1679,7 @@ class IEC104Parser:
                 elem.value_desc = (
                     f"[{ctrl_type}] 标度化设定值={signed_val} "
                     f"| DEC={signed_val} HEX=0x{signed_val & 0xFFFF:04X} "
+                    f"| 操作={'选择(预制)' if (qdp >> 7) & 1 else '执行'} "
                     f"| QDS=0x{qdp:02X}"
                 )
                 consumed = 3
@@ -1608,6 +1695,7 @@ class IEC104Parser:
                 elem.value_desc = (
                     f"[{ctrl_type}] 浮点设定值={elem.value} "
                     f"| DEC={raw_int} HEX=0x{raw_int:08X} "
+                    f"| 操作={'选择(预制)' if (qdp >> 7) & 1 else '执行'} "
                     f"| QDS=0x{qdp:02X}"
                 )
                 consumed = 5
@@ -1622,6 +1710,7 @@ class IEC104Parser:
                 elem.value_desc = (
                     f"[{ctrl_type}] 32比特串=0x{val:08X} "
                     f"| DEC={val} HEX=0x{val:08X} "
+                    f"| 操作={'选择(预制)' if (qdp >> 7) & 1 else '执行'} "
                     f"| QDS=0x{qdp:02X}"
                 )
                 consumed = 5
@@ -1748,10 +1837,35 @@ class IEC104Parser:
         parts.append(f"{a.signal_type.label}")
         parts.append(f"{TypeID.get_description(a.type_id)}")
         parts.append(f"VSQ=0x{a.vsq:02X}({a.number_of_objects}个对象{'顺序' if a.is_sequence else '离散'})")
-        parts.append(COT.get_description(a.cot))
+        cot_desc = COT.get_description(a.cot)
+        # 控制命令帧标注 S/E 位：否则选择(预制)帧与执行帧在报文列表里
+        # 显示完全一样（都叫"激活"），无法分辨实际下发的是哪种
+        if a.type_id in self._CMD_SE_OFFSETS and a.cot_cause in (6, 7):
+            se = self._command_se_bit(a)
+            if se is not None:
+                if a.cot_cause == 6:
+                    cot_desc += "（选择/预制）" if se else "（执行）"
+                else:
+                    cot_desc += "（选择确认）" if se else "（执行确认）"
+        parts.append(cot_desc)
         parts.append(f"ORG={a.org}, 公共地址={a.common_address}")
 
         frame.description = "、".join(parts)
+
+    # 控制命令帧 S/E 位在 ASDU 内的字节偏移与位位置（定义见 iec104_protocol）
+    _CMD_SE_OFFSETS = SE_BYTE_OFFSETS
+
+    @classmethod
+    def _command_se_bit(cls, asdu):
+        """从 ASDU 原始字节取控制命令的 S/E 位；非命令帧返回 None
+
+        返回值语义遵循标准：1 = 选择/预制，0 = 执行。
+        """
+        off = cls._CMD_SE_OFFSETS.get(asdu.type_id)
+        raw = asdu.raw_data
+        if off is None or not raw or len(raw) <= off:
+            return None
+        return (raw[off] >> se_bit(asdu.type_id)) & 1
 
     @staticmethod
     def _to_signed(val: int, bits: int) -> int:

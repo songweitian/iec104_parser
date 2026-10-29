@@ -69,23 +69,3 @@ def _doc_icon(tag: str, tag_color: str) -> QIcon:
 
     p.end()
     return QIcon(pm)
-
-
-def _arrow_icon(rightward: bool) -> QIcon:
-    """水平方向箭头（通信模拟 ⇄ 用一支）"""
-    pm = QPixmap(64, 64)
-    pm.fill(Qt.transparent)
-    p = QPainter(pm)
-    p.setRenderHint(QPainter.Antialiasing)
-    pen = QPen(_ICON_PRIMARY, 6, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
-    p.setPen(pen)
-    if rightward:
-        p.drawLine(10, 24, 48, 24)
-        p.drawLine(40, 15, 50, 24)
-        p.drawLine(40, 33, 50, 24)
-    else:
-        p.drawLine(54, 40, 16, 40)
-        p.drawLine(24, 31, 14, 40)
-        p.drawLine(24, 49, 14, 40)
-    p.end()
-    return QIcon(pm)

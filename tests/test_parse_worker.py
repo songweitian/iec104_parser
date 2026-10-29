@@ -55,7 +55,8 @@ class TestExtractHexLines:
         text = "680401000e00"
         hex_lines, line_map = w._extract_hex_lines(text)
         assert hex_lines == ["680401000e00"]
-        assert line_map == [[0]] if line_map == [[0]] else True
+        # 整块是单个完整 APDU：行映射应指向源行 0（原断言恒真，已修正）
+        assert line_map == [[0]]
 
     def test_single_line_multi_frames_split(self):
         """单行拼接多帧应拆开，行映射沿用源行
@@ -97,6 +98,24 @@ class TestExtractHexLines:
         hex_lines, line_map = w._extract_hex_lines("   \n# only comment\n")
         assert hex_lines == []
         assert line_map == []
+
+
+class TestHexWarnings:
+    """被清洗掉的字符要有据可查（此前静默丢弃，用户无从判断）"""
+
+    def test_suspicious_chars_reported_with_line_number(self):
+        w = ParseWorker(IEC104Parser(), "", ParseMode.NORMAL)
+        w.raw_text = "68 04 07 00 00 00\n68h 04 13 00 00 00"
+        frames = _run_sync(w)
+        assert len(frames) == 2          # h 被忽略，报文仍解析出来
+        assert w.hex_warnings, "非法字符未报告"
+        assert "h" in w.hex_warnings[0]
+        assert "2" in w.hex_warnings[0]  # 指向第 2 行
+
+    def test_clean_input_has_no_warning(self):
+        w = ParseWorker(IEC104Parser(), "68 04 07 00 00 00", ParseMode.NORMAL)
+        _run_sync(w)
+        assert w.hex_warnings == []
 
 
 class TestSplitConcatenatedFrames:

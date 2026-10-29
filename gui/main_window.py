@@ -11,33 +11,29 @@ from datetime import datetime
 from typing import List, Optional
 
 from PyQt5.QtWidgets import (
-    QMainWindow, QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-    QSplitter, QTreeWidget, QTreeWidgetItem, QTextEdit, QPushButton,
-    QToolBar, QFileDialog, QMessageBox, QStatusBar,
-    QLabel, QLineEdit, QGroupBox, QComboBox,
-    QTabWidget, QTableWidget, QProgressBar, QMenu,
-    QDialog, QPlainTextEdit, QInputDialog,
-    QStyledItemDelegate, QStyle
+    QMainWindow, QApplication, QWidget, QVBoxLayout,
+    QTreeWidgetItem, QTextEdit, QFileDialog, QMessageBox,
+    QTableWidget, QMenu, QDialog, QPlainTextEdit, QInputDialog,
 )
-from PyQt5.QtCore import Qt, QTimer, QSettings, QSize, QPoint
-from PyQt5.QtGui import (QFont, QColor, QTextCursor, QIcon,
-                         QPainter, QBrush, QPen, QPixmap, QFontMetrics)
+from PyQt5.QtCore import Qt, QTimer, QSettings
+from PyQt5.QtGui import QFont, QColor, QTextCursor
 
 # 确保能找到父模块
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from iec104_parser import (
     IEC104Parser, IEC104Frame, SignalType, TypeID, COT,
-    ParseMode
+    ParseMode, detect_input_format
 )
 from gui.about_dialog import AboutDialog
 from gui.stats_dialog import StatsDialog
 from gui.ioa_alias_dialog import IOAAliasDialog, get_alias
-from gui.style import LIGHT_QSS, DARK_QSS
+from gui.style import LIGHT_QSS, DARK_QSS, apply_selection_palette
 from gui.exporters import export_csv, export_json, export_txt
 # 拆分出去的模块，这里重新导出以保持 `from gui.main_window import ...` 既有引用不变
-from gui.icons import create_app_icon, _doc_icon, _ICON_PRIMARY
 from gui.parse_worker import ParseWorker
+from gui.frame_table import FrameTableMixin, FILTER_BTN_STYLE_IDLE, FILTER_BTN_STYLE_ACTIVE
+from gui.ui_layout import UiLayoutMixin
 from version import APP_TITLE, APP_VERSION
 
 logger = logging.getLogger(__name__)
@@ -50,17 +46,7 @@ MAX_BIN_IMPORT_BYTES = 8 * 1024 * 1024     # 二进制转hex导入上限 8MB
 _SETTINGS_ORG = "SWT"
 _SETTINGS_APP = "IEC104 Parser"
 
-# 过滤按钮样式：空闲蓝色 / 生效中橙色（让用户一眼看出过滤还在起作用）
-FILTER_BTN_STYLE_IDLE = (
-    "QPushButton { background-color: #2196F3; color: white; font-weight: bold; "
-    "padding: 3px 12px; border-radius: 3px; border: none; }"
-    "QPushButton:hover { background-color: #1976D2; }"
-)
-FILTER_BTN_STYLE_ACTIVE = (
-    "QPushButton { background-color: #FF9800; color: white; font-weight: bold; "
-    "padding: 3px 12px; border-radius: 3px; border: none; }"
-    "QPushButton:hover { background-color: #F57C00; }"
-)
+# 过滤按钮样式常量见 gui/frame_table.py（随视图层一起迁走）
 
 # 授权状态常驻按钮：状态色
 LICENSE_COLOR_OK = "#2E7D32"
@@ -68,64 +54,7 @@ LICENSE_COLOR_WARN = "#FF9800"    # 剩余 ≤7 天 / 未激活
 LICENSE_COLOR_DANGER = "#F44336"  # 剩余 ≤3 天 / 已到期
 
 
-class FrameCellDelegate(QStyledItemDelegate):
-    """报文列表虚拟绘制器。
-
-    不再为每条/每列创建 QTableWidgetItem，而是在每个单元格绘制时实时从
-    MainWindow.all_frames 与 _view_order（视图行→帧索引）取值。
-    万帧级数据下填充开销从 O(N×12) 次 item 构造降至 O(1)，仅重绘可见区。
-    """
-
-    def __init__(self, window, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._w = window
-
-    def paint(self, painter, option, index):
-        w = self._w
-        if w is None or not w.all_frames or not w._view_order:
-            return super().paint(painter, option, index)
-        vi = index.row()
-        if not (0 <= vi < len(w._view_order)):
-            return super().paint(painter, option, index)
-        fi = w._view_order[vi]
-        if not (0 <= fi < len(w.all_frames)):
-            return super().paint(painter, option, index)
-
-        cell = w._cell(vi, index.column())
-        painter.save()
-        rect = option.rect
-        # 选中判定：优先查 selectionModel。部分环境下 hover 重绘时
-        # option.state 的 Selected 位不稳定，会导致选中行配色错乱、文字看不清。
-        selected = bool(option.state & QStyle.State_Selected)
-        try:
-            sm = w.table_widget.selectionModel()
-            if sm is not None:
-                selected = sm.isSelected(index)
-        except Exception:
-            pass
-        if selected:
-            # 选中行：固定深蓝背景 + 白色文字（不依赖系统高亮色，保证可读性）
-            painter.fillRect(rect, QColor("#2196F3"))
-            fg = QColor("#FFFFFF")
-        else:
-            painter.fillRect(rect, cell["bg"])
-            fg = cell.get("fg") or (
-                QColor("#E0E0E0") if w._dark_theme else QColor("#000000"))
-        painter.setPen(fg)
-        font = painter.font()
-        font.setBold(cell.get("bold", False))
-        painter.setFont(font)
-        painter.drawText(rect.adjusted(4, 0, -4, 0),
-                         int(cell.get("align", Qt.AlignLeft | Qt.AlignVCenter)),
-                         cell["text"])
-        painter.restore()
-
-    def sizeHint(self, option, index):
-        # 沿用默认行高；列宽由“估算/用户拖拽”决定，无需按内容精确量宽
-        return super().sizeHint(option, index)
-
-
-class MainWindow(QMainWindow):
+class MainWindow(UiLayoutMixin, FrameTableMixin, QMainWindow):
     """主窗口"""
 
     def __init__(self):
@@ -175,6 +104,8 @@ class MainWindow(QMainWindow):
         self._setup_ui()
         # 浅色基础样式表：统一各控件圆角/内边距/焦点环（深色主题切换时整体替换）
         self.setStyleSheet(LIGHT_QSS)
+        # 下拉弹出列表 hover/选中配色（QSS ::item:hover 对弹出不生效）
+        apply_selection_palette(self, dark=False)
         self._setup_menu()
         self._setup_toolbar()
         self._setup_statusbar()
@@ -188,464 +119,6 @@ class MainWindow(QMainWindow):
         # 恢复上次关闭时的界面状态（窗口大小/分栏/主题/列宽/目录）
         self._load_ui_settings()
 
-    def _setup_ui(self):
-        """构建界面布局"""
-        central = QWidget()
-        self.setCentralWidget(central)
-        main_layout = QVBoxLayout(central)
-        main_layout.setContentsMargins(6, 6, 6, 6)
-        main_layout.setSpacing(4)
-
-        self.splitter = QSplitter(Qt.Horizontal)
-
-        # === 左侧: 输入面板 ===
-        self.left_panel = QWidget()
-        left_panel = self.left_panel
-        left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-
-        # 十六进制输入
-        hex_group = QGroupBox("原始报文输入 (十六进制)")
-        hex_layout = QVBoxLayout(hex_group)
-        # 多标签页输入
-        self.input_tabs = QTabWidget()
-        self.input_tabs.setTabsClosable(True)
-        self.input_tabs.tabCloseRequested.connect(self._close_input_tab)
-        self.input_tabs.currentChanged.connect(self._on_tab_changed)
-        hex_layout.addWidget(self.input_tabs)
-
-        # 创建第一个输入标签页（启动初始化，不走激活校验）
-        self._input_tab_list = []  # [(tab_widget, hex_input), ...]
-        self._tab_data = {}  # {tab_index: {"frames": [...], "input_lines": [...], "bookmarks": set()}}
-        self._current_tab_index = 0
-        self._bookmarks = set()  # Set of frame indices
-        self._add_input_tab(require_license=False)
-
-        # 输入操作按钮
-        btn_layout = QHBoxLayout()
-        self.btn_parse = QPushButton("▶ 解析报文")
-        self.btn_parse.clicked.connect(self._on_parse)
-        self.btn_parse.setStyleSheet(
-            "QPushButton { background-color: #2196F3; color: white; "
-            "font-weight: bold; padding: 6px 16px; border-radius: 4px; border: none; }"
-            "QPushButton:hover { background-color: #1976D2; }"
-        )
-        self.btn_clear = QPushButton("清空")
-        self.btn_clear.clicked.connect(self._on_clear)
-        self.btn_clear.setToolTip("清空当前输入与解析结果 (Ctrl+L)")
-        self.btn_import_file = QPushButton("📁 导入文件")
-        self.btn_import_file.clicked.connect(self._on_import_file)
-        self.btn_import_file.setStyleSheet(
-            "QPushButton { border: 1px solid #ccc; padding: 5px 12px; border-radius: 3px; }"
-            "QPushButton:hover { background-color: #e3f2fd; border-color: #2196F3; }"
-        )
-
-        btn_layout.setSpacing(6)
-        btn_layout.addWidget(self.btn_parse)
-        btn_layout.addWidget(self.btn_clear)
-        btn_layout.addWidget(self.btn_import_file)
-        btn_layout.addStretch()
-        self.lbl_input_status = QLabel("")
-        self.lbl_input_status.setStyleSheet("color: #888; font-size: 9pt;")
-        btn_layout.addWidget(self.lbl_input_status)
-        self.lbl_line_count = QLabel("0 行")
-        self.lbl_line_count.setStyleSheet("color: #666; font-size: 9pt; padding-right: 4px;")
-        btn_layout.addWidget(self.lbl_line_count)
-        hex_layout.addLayout(btn_layout)
-        left_layout.addWidget(hex_group)
-
-        # 解析模式选择
-        mode_group = QGroupBox("解析模式")
-        mode_layout = QHBoxLayout(mode_group)
-        mode_layout.addWidget(QLabel("模式:"))
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItem("自动检测", ParseMode.NORMAL)
-        self.mode_combo.addItem("普通模式", ParseMode.NORMAL)
-        self.mode_combo.addItem("XN3000 模式", ParseMode.XN3000)
-        self.mode_combo.addItem("XN8000 模式", ParseMode.XN8000)
-        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
-        self.mode_combo.setToolTip("自动: 自动识别格式\n普通: 标准十六进制格式\nXN3000: 带时间戳 RX/TX 格式\nXN8000: 带时间戳 send/recv 格式")
-        mode_layout.addWidget(self.mode_combo)
-        mode_layout.addStretch()
-        left_layout.addWidget(mode_group)
-
-        # 过滤选项 - 分组布局（标签+控件对齐，筛选/重置独立在行尾）
-        filter_group = QGroupBox("过滤条件")
-        filter_layout = QVBoxLayout(filter_group)
-        filter_layout.setSpacing(4)
-
-        # 第1行: 信号类型 | 类型标识 | 传送原因 | 地址
-        row1 = QHBoxLayout()
-        row1.setSpacing(6)
-        row1.addWidget(QLabel("信号:"))
-        self.filter_signal = QComboBox()
-        self.filter_signal.addItem("全部", "")
-        self.filter_signal.addItem("遥信", "遥信")
-        self.filter_signal.addItem("遥测", "遥测")
-        self.filter_signal.addItem("遥控", "遥控")
-        self.filter_signal.addItem("遥调", "遥调")
-        self.filter_signal.addItem("遥脉", "遥脉")
-        row1.addWidget(self.filter_signal)
-
-        row1.addWidget(QLabel("类型:"))
-        self.filter_type = QComboBox()
-        self.filter_type.setMinimumWidth(120)
-        self.filter_type.addItem("全部", -1)
-        for tid in sorted(TypeID):
-            desc = TypeID.get_description(tid.value)
-            self.filter_type.addItem(f"{tid.value}: {tid.name} ({desc})", tid.value)
-        row1.addWidget(self.filter_type, 1)
-
-        row1.addWidget(QLabel("COT:"))
-        self.filter_cot = QComboBox()
-        self.filter_cot.setMinimumWidth(100)
-        self.filter_cot.addItem("全部", -1)
-        for cot in range(1, 42):
-            self.filter_cot.addItem(f"{cot}: {COT.get_description(cot)}", cot)
-        row1.addWidget(self.filter_cot)
-
-        row1.addWidget(QLabel("地址:"))
-        self.filter_addr = QLineEdit()
-        self.filter_addr.setPlaceholderText("CA/0x1A")
-        self.filter_addr.setMaximumWidth(90)
-        self.filter_addr.setToolTip("公共地址(ASDU地址)，支持十进制或 0x 十六进制")
-        row1.addWidget(self.filter_addr)
-        filter_layout.addLayout(row1)
-
-        # 第2行: 方向 | 时间范围 | IOA范围 | 筛选/重置
-        row2 = QHBoxLayout()
-        row2.setSpacing(6)
-        row2.addWidget(QLabel("方向:"))
-        self.filter_direction = QComboBox()
-        self.filter_direction.addItem("全部", "")
-        self.filter_direction.addItem("主→从", "主站→子站")
-        self.filter_direction.addItem("从→主", "子站→主站")
-        row2.addWidget(self.filter_direction)
-
-        row2.addWidget(QLabel("时间:"))
-        self.filter_time_from = QLineEdit()
-        self.filter_time_from.setPlaceholderText("HH:MM:SS")
-        self.filter_time_from.setMaximumWidth(85)
-        row2.addWidget(self.filter_time_from)
-        row2.addWidget(QLabel("~"))
-        self.filter_time_to = QLineEdit()
-        self.filter_time_to.setPlaceholderText("HH:MM:SS")
-        self.filter_time_to.setMaximumWidth(85)
-        row2.addWidget(self.filter_time_to)
-
-        row2.addWidget(QLabel("IOA:"))
-        self.ioa_from_input = QLineEdit()
-        self.ioa_from_input.setPlaceholderText("起始")
-        self.ioa_from_input.setMaximumWidth(65)
-        self.ioa_from_input.setToolTip("IOA起始地址，支持十进制或0x前缀")
-        row2.addWidget(self.ioa_from_input)
-        row2.addWidget(QLabel("~"))
-        self.ioa_to_input = QLineEdit()
-        self.ioa_to_input.setPlaceholderText("结束")
-        self.ioa_to_input.setMaximumWidth(65)
-        self.ioa_to_input.setToolTip("IOA结束地址")
-        row2.addWidget(self.ioa_to_input)
-
-        row2.addStretch(1)
-        self.filter_btn = QPushButton("筛选")
-        self.filter_btn.clicked.connect(self._on_filter)
-        self.filter_btn.setStyleSheet(FILTER_BTN_STYLE_IDLE)
-        self.filter_btn.setToolTip("按条件过滤报文列表")
-        row2.addWidget(self.filter_btn)
-        self.filter_reset = QPushButton("重置")
-        self.filter_reset.clicked.connect(self._on_filter_reset)
-        row2.addWidget(self.filter_reset)
-        filter_layout.addLayout(row2)
-
-        left_layout.addWidget(filter_group)
-
-        self.splitter.addWidget(left_panel)
-
-        # === 右侧: 解析结果 ===
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-
-        self.result_tabs = QTabWidget()
-
-        # 标签页1: 树形结构
-        self.tree_widget = QTreeWidget()
-        self.tree_widget.setHeaderLabels(["字段", "值", "说明"])
-        self.tree_widget.setAlternatingRowColors(True)
-        self.tree_widget.setColumnWidth(0, 200)
-        self.tree_widget.setColumnWidth(1, 260)
-        self.tree_widget.setColumnWidth(2, 300)
-        self.tree_widget.header().setStretchLastSection(True)
-        self.tree_widget.setRootIsDecorated(True)
-        self.tree_widget.setUniformRowHeights(True)
-        self.tree_widget.itemSelectionChanged.connect(self._on_tree_select)
-        # 空状态提示
-        placeholder = QTreeWidgetItem(self.tree_widget)
-        placeholder.setText(0, "请在左侧粘贴报文后点击「解析报文」或拖放文件到窗口")
-        placeholder.setFlags(Qt.NoItemFlags)
-        placeholder.setForeground(0, QColor("#999"))
-        self.result_tabs.addTab(self.tree_widget, "解析详情")
-
-        # 标签页2: 报文列表 (带搜索栏)
-        table_container = QWidget()
-        table_layout = QVBoxLayout(table_container)
-        table_layout.setContentsMargins(0, 0, 0, 0)
-        table_layout.setSpacing(2)
-
-        search_layout = QHBoxLayout()
-        search_layout.setSpacing(4)
-        search_layout.addWidget(QLabel("🔍 搜索:"))
-        self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("输入关键字或正则搜索...")
-        self.search_input.setClearButtonEnabled(True)
-        self._search_timer = QTimer()
-        self._search_timer.setSingleShot(True)
-        self._search_timer.setInterval(300)
-        self._search_timer.timeout.connect(self._do_search)
-        self.search_input.textChanged.connect(self._on_search_text_changed)
-        search_layout.addWidget(self.search_input, 1)
-        self.lbl_search_count = QLabel("")
-        self.lbl_search_count.setStyleSheet("color: #888; font-size: 9pt;")
-        search_layout.addWidget(self.lbl_search_count)
-        table_layout.addLayout(search_layout)
-
-        self.table_widget = QTableWidget()
-        self.table_widget.setColumnCount(12)
-        self.table_widget.setHorizontalHeaderLabels(
-            ["序号", "原始时间", "方向", "信号类型", "类型标识", "传送原因", "公共地址", "对象数", "值", "描述", "输入行", "时间间隔"]
-        )
-        self.table_widget.setAlternatingRowColors(True)
-        self.table_widget.setSelectionBehavior(QTableWidget.SelectRows)
-        self.table_widget.horizontalHeader().setStretchLastSection(True)
-        self.table_widget.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.table_widget.verticalHeader().setDefaultSectionSize(26)
-        # 虚拟绘制：不创建单元格对象，由 FrameCellDelegate 实时绘制（万帧级性能）
-        self._cell_delegate = FrameCellDelegate(self)
-        self.table_widget.setItemDelegate(self._cell_delegate)
-        self.table_widget.horizontalHeader().sectionClicked.connect(
-            self._on_header_sort)
-        self.table_widget.cellClicked.connect(self._on_table_click)
-        self.table_widget.cellDoubleClicked.connect(self._on_table_double_click)
-        self.table_widget.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.table_widget.customContextMenuRequested.connect(self._on_table_context_menu)
-        self.table_widget.horizontalHeader().setContextMenuPolicy(Qt.CustomContextMenu)
-        self.table_widget.horizontalHeader().customContextMenuRequested.connect(
-            self._on_header_context_menu)
-        # 键盘导航
-        self.table_widget.keyPressEvent = self._table_key_press
-        table_layout.addWidget(self.table_widget)
-
-        self.result_tabs.addTab(table_container, "报文列表")
-
-        # 标签页3: 十六进制对照
-
-
-        self.hex_view = QTextEdit()
-        self.hex_view.setReadOnly(True)
-        self.hex_view.setFont(QFont("Consolas", 10))
-        self.result_tabs.addTab(self.hex_view, "原始十六进制")
-
-        right_layout.addWidget(self.result_tabs)
-
-        # 导出按钮
-        export_layout = QHBoxLayout()
-        export_layout.addStretch()
-        for label, slot in [
-            ("导出CSV", self._on_export_csv),
-            ("导出JSON", self._on_export_json),
-            ("导出TXT", self._on_export_txt),
-        ]:
-            btn = QPushButton(label)
-            btn.clicked.connect(slot)
-            export_layout.addWidget(btn)
-        right_layout.addLayout(export_layout)
-
-        self.splitter.addWidget(right_panel)
-        self.splitter.setSizes([420, 900])
-        self.splitter.setStretchFactor(0, 1)
-        self.splitter.setStretchFactor(1, 2)
-        self.splitter.setHandleWidth(8)
-        self.left_panel.setMinimumWidth(280)
-        main_layout.addWidget(self.splitter)
-
-    def _setup_menu(self):
-        """设置菜单栏"""
-        menubar = self.menuBar()
-
-        file_menu = menubar.addMenu("文件(&F)")
-        file_menu.addAction("导入文件(&I)...", self._on_import_file, "Ctrl+I")
-        file_menu.addAction("新建标签页(&N)", self._add_input_tab, "Ctrl+N")
-        file_menu.addAction("导出CSV(&C)...", self._on_export_csv, "Ctrl+Shift+C")
-        file_menu.addAction("导出JSON(&J)...", self._on_export_json, "Ctrl+Shift+J")
-        file_menu.addAction("导出TXT(&T)...", self._on_export_txt, "Ctrl+Shift+T")
-        file_menu.addSeparator()
-        file_menu.addAction("退出(&X)", self.close, "Alt+F4")
-
-        view_menu = menubar.addMenu("查看(&V)")
-        view_menu.addAction("解析报文(&P)", self._on_parse, "F5")
-        view_menu.addAction("清空(&L)", self._on_clear, "Ctrl+L")
-        view_menu.addAction("定位原始报文(&O)", lambda: self._locate_original_message(self.table_widget.currentRow()), "F2")
-        view_menu.addAction("切换主题(&D)", self._toggle_theme, "Ctrl+Shift+D")
-        view_menu.addSeparator()
-        view_menu.addAction("折叠/展开输入面板(&B)", self._toggle_input_panel, "Ctrl+B")
-        view_menu.addSeparator()
-        view_menu.addAction("查找(&F)...", self._on_focus_search, "Ctrl+F")
-        view_menu.addAction("统计图表(&T)...", self._on_show_stats, "Ctrl+T")
-        view_menu.addSeparator()
-        view_menu.addAction("解析详情", lambda: self.result_tabs.setCurrentIndex(0), "Ctrl+1")
-        view_menu.addAction("报文列表", lambda: self.result_tabs.setCurrentIndex(1), "Ctrl+2")
-        view_menu.addAction("原始十六进制", lambda: self.result_tabs.setCurrentIndex(2), "Ctrl+3")
-        view_menu.addSeparator()
-        view_menu.addAction("下一个书签", self._goto_next_bookmark, "Ctrl+Down")
-        view_menu.addAction("上一个书签", self._goto_prev_bookmark, "Ctrl+Up")
-
-        tools_menu = menubar.addMenu("工具(&T)")
-        tools_menu.addAction("报文对比(&C)...", self._open_compare, "Ctrl+Shift+M")
-        tools_menu.addAction("通信模拟(&U)...", self._open_simulator, "Ctrl+M")
-        tools_menu.addAction("帧生成器(&G)...", self._open_generator, "Ctrl+G")
-        tools_menu.addAction("历史报文管理(&H)...", self._open_history_manager, "Ctrl+Shift+R")
-        tools_menu.addSeparator()
-        tools_menu.addAction("序号检查(&S)...", self._on_check_sequence, "Ctrl+Shift+S")
-        tools_menu.addAction("协议合规检查(&R)...", self._on_check_compliance)
-        tools_menu.addAction("报文配对分析(&P)...", self._on_find_pairs)
-        tools_menu.addSeparator()
-        tools_menu.addAction("IOA地址别名(&I)...", self._on_manage_aliases, "Ctrl+Shift+I")
-
-        help_menu = menubar.addMenu("帮助(&H)")
-        help_menu.addAction("软件激活(&A)...", self._open_license_dialog)
-        help_menu.addSeparator()
-        help_menu.addAction("版本信息(&V)...", self._on_about)
-        help_menu.addAction("IOA 地址说明(&I)...", self._on_ioa_help)
-
-    def _setup_toolbar(self):
-        """设置工具栏"""
-        toolbar = QToolBar("主工具栏")
-        toolbar.setMovable(False)
-        toolbar.setIconSize(QSize(18, 18))
-        toolbar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self.addToolBar(toolbar)
-
-        act_parse = toolbar.addAction(self._vector_icon("parse"), "解析", self._on_parse)
-        act_parse.setToolTip("解析报文 (F5)")
-        act_import = toolbar.addAction(self._vector_icon("import"), "导入", self._on_import_file)
-        act_import.setToolTip("导入文件 (Ctrl+I)")
-        toolbar.addSeparator()
-        act_gen = toolbar.addAction(self._vector_icon("gen"), "生成报文", self._open_generator)
-        act_gen.setToolTip("帧生成器 (Ctrl+G)")
-        act_sim = toolbar.addAction(self._vector_icon("sim"), "通信模拟", self._open_simulator)
-        act_sim.setToolTip("IEC104 通信模拟器 (Ctrl+M)")
-        toolbar.addSeparator()
-        act_csv = toolbar.addAction(_doc_icon("CSV", "#43A047"), "CSV", self._on_export_csv)
-        act_csv.setToolTip("导出CSV (Ctrl+Shift+C)")
-        act_json = toolbar.addAction(_doc_icon("JSON", "#FB8C00"), "JSON", self._on_export_json)
-        act_json.setToolTip("导出JSON (Ctrl+Shift+J)")
-        toolbar.addSeparator()
-        self._left_panel_visible = True
-        self._toggle_input_action = toolbar.addAction(self._vector_icon("hideinput"),
-                                                      "◀ 隐藏输入")
-        self._toggle_input_action.triggered.connect(self._toggle_input_panel)
-        self._toggle_input_action.setToolTip("折叠/展开原始报文输入面板 (Ctrl+B)")
-        toolbar.addSeparator()
-        act_about = toolbar.addAction(self._vector_icon("about"), "关于", self._on_about)
-        act_about.setToolTip("关于本软件")
-
-    def _setup_icon(self):
-        """设置应用图标（渐变精修版，同时注册为全局图标）"""
-        icon = create_app_icon()
-        self.setWindowIcon(icon)
-        QApplication.setWindowIcon(icon)
-
-    def _vector_icon(self, name: str) -> QIcon:
-        """按名称绘制工具栏矢量小图标（蓝 #1565C0 线条风格）"""
-        pm = QPixmap(64, 64)
-        pm.fill(Qt.transparent)
-        p = QPainter(pm)
-        p.setRenderHint(QPainter.Antialiasing)
-        pen = QPen(_ICON_PRIMARY, 5, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
-        p.setPen(pen)
-
-        if name == "parse":          # ▶ 解析
-            p.setBrush(QBrush(_ICON_PRIMARY))
-            p.setPen(Qt.NoPen)
-            p.drawPolygon([QPoint(22, 16), QPoint(22, 48), QPoint(50, 32)])
-        elif name == "import":       # 文件夹 导入
-            p.setBrush(QColor("#90CAF9"))
-            p.drawRoundedRect(8, 24, 48, 28, 5, 5)
-            p.drawRoundedRect(8, 15, 22, 12, 3, 3)
-            p.setBrush(Qt.NoBrush)
-            p.setPen(pen)
-            p.drawRoundedRect(8, 24, 48, 28, 5, 5)
-        elif name == "gen":          # ✨ 生成（魔棒+火花）
-            p.drawLine(16, 50, 42, 24)
-            p.drawLine(46, 14, 46, 20)
-            p.drawLine(43, 17, 49, 17)
-            p.drawLine(54, 24, 54, 30)
-            p.drawLine(51, 27, 57, 27)
-        elif name == "sim":          # ⇄ 通信模拟
-            p.drawLine(10, 26, 46, 26)
-            p.drawLine(38, 18, 48, 26)
-            p.drawLine(38, 34, 48, 26)
-            p.drawLine(54, 40, 18, 40)
-            p.drawLine(26, 32, 16, 40)
-            p.drawLine(26, 48, 16, 40)
-        elif name == "hideinput":    # ◀ 折叠输入面板
-            p.drawRect(10, 14, 44, 36)
-            p.setBrush(QBrush(_ICON_PRIMARY))
-            p.drawRect(10, 14, 10, 36)
-            p.drawLine(38, 25, 29, 32)
-            p.drawLine(29, 32, 38, 39)
-        elif name == "about":        # ⓘ 关于
-            p.drawEllipse(11, 11, 42, 42)
-            p.drawPoint(32, 21)
-            p.drawLine(32, 21, 32, 22)
-            p.drawLine(32, 30, 32, 45)
-
-        p.end()
-        return QIcon(pm)
-
-    def _setup_statusbar(self):
-        """设置状态栏"""
-        self.statusbar = QStatusBar()
-        self.setStatusBar(self.statusbar)
-
-        self.lbl_stats = QLabel("就绪")
-        self.statusbar.addWidget(self.lbl_stats, 1)
-
-        # 授权状态常驻按钮（点击打开激活对话框；颜色随时效变化）
-        self.btn_license_state = QPushButton("")
-        self.btn_license_state.setFlat(True)
-        self.btn_license_state.setCursor(Qt.PointingHandCursor)
-        self.btn_license_state.clicked.connect(self._open_license_dialog)
-        self.btn_license_state.setToolTip("授权状态，点击查看详情 / 激活")
-        self.statusbar.addPermanentWidget(self.btn_license_state)
-
-        # 进度条（解析时显示）
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setMaximumWidth(200)
-        self.progress_bar.setMaximumHeight(18)
-        self.progress_bar.setTextVisible(True)
-        self.progress_bar.setFormat("%v/%m (%p%)")
-        self.progress_bar.setVisible(False)
-        self.statusbar.addWidget(self.progress_bar)
-
-        # 取消按钮（解析时显示）
-        self.btn_cancel_parse = QPushButton("取消解析")
-        self.btn_cancel_parse.setMaximumHeight(20)
-        self.btn_cancel_parse.setStyleSheet(
-            "QPushButton { background-color: #f44336; color: white; padding: 2px 8px; border-radius: 3px; border: none; }"
-            "QPushButton:hover { background-color: #d32f2f; }"
-        )
-        self.btn_cancel_parse.clicked.connect(self._on_cancel_parse)
-        self.btn_cancel_parse.setVisible(False)
-        self.statusbar.addWidget(self.btn_cancel_parse)
-
-        self.lbl_count = QLabel("报文: 0")
-        self.lbl_count.setStyleSheet("color: #666; padding: 0 8px;")
-        self.statusbar.addPermanentWidget(self.lbl_count)
-
-        self.lbl_version = QLabel(f"v{APP_VERSION}")
-        self.lbl_version.setStyleSheet("color: #999; padding: 0 8px;")
-        self.statusbar.addPermanentWidget(self.lbl_version)
 
     def _update_status_stats(self):
         """更新状态栏统计（基于 self.all_frames，过滤时反映过滤结果）"""
@@ -703,19 +176,41 @@ class MainWindow(QMainWindow):
             return
         self._start_parse(text)
 
+    def _live_worker(self):
+        """返回解析线程对象；Python 包装器指向已销毁的 C++ 对象时返回 None
+
+        QThread 被 deleteLater 销毁后，包装器仍可能被引用；此时任何
+        isRunning()/wait() 都会抛 RuntimeError("wrapped C/C++ object ...
+        has been deleted")，而槽里的未捕获异常会让 PyQt5 走 qFatal →
+        进程直接消失（用户看到的"闪退"，连报错框都没有）。
+        """
+        worker = self._parse_worker
+        if worker is None:
+            return None
+        try:
+            worker.isRunning()
+        except RuntimeError:
+            self._parse_worker = None
+            return None
+        return worker
+
     def _start_parse(self, raw_text: str):
         """启动解析流程"""
 
         # 上一次解析未结束时：请求取消并等待其收尾，避免双线程并发写结果
-        if self._parse_worker and self._parse_worker.isRunning():
-            self._parse_worker.cancel()
-            try:
-                self._parse_worker.parse_finished.disconnect(self._on_parse_finished)
-                self._parse_worker.progress_updated.disconnect(self._on_parse_progress)
-                self._parse_worker.parse_error.disconnect(self._on_parse_error)
-            except TypeError:
-                pass  # 信号本就未连接
-            if not self._parse_worker.wait(2000):
+        worker = self._live_worker()
+        if worker is not None and worker.isRunning():
+            worker.cancel()
+            for sig, slot in (
+                (worker.parse_finished, self._on_parse_finished),
+                (worker.progress_updated, self._on_parse_progress),
+                (worker.parse_error, self._on_parse_error),
+            ):
+                try:
+                    sig.disconnect(slot)
+                except TypeError:
+                    pass  # 该信号本就未连接，不能因此漏掉后面的
+            if not worker.wait(2000):
                 self.statusbar.showMessage("上一次解析仍在结束中，请稍候再试", 3000)
                 return
 
@@ -725,6 +220,15 @@ class MainWindow(QMainWindow):
         self._byte_position_map = []
         self._frame_byte_offset = []
         self._frame_input_lines = []
+        # 书签是"帧下标"集合，重新解析后指向完全不同的报文，必须清空
+        self._bookmarks.clear()
+        # 搜索框文本若留着，视图却是全量 → 搜索态与显示不一致
+        self._pre_search_view = None
+        if getattr(self, "search_input", None) is not None \
+                and self.search_input.text():
+            self.search_input.blockSignals(True)
+            self.search_input.clear()
+            self.search_input.blockSignals(False)
         self.tree_widget.clear()
         self.table_widget.setRowCount(0)
         self.hex_view.clear()
@@ -732,14 +236,19 @@ class MainWindow(QMainWindow):
         # 自动检测模式
         if self._auto_detect:
             detected = self._auto_detect_mode(raw_text)
-            if detected != ParseMode.NORMAL:
+            # 必须无条件应用检测结果：此前只在 detected != NORMAL 时才切换，
+            # 于是"先解析过日志报文，再清空导入纯十六进制"时 parse_mode 仍停在
+            # XN3000，普通报文被按日志切块 → 0 帧（用户看到"点了解析没反应"）。
+            if detected != self.parse_mode:
                 self.parse_mode = detected
                 idx = self.mode_combo.findData(detected)
                 if idx >= 0:
                     self.mode_combo.blockSignals(True)
                     self.mode_combo.setCurrentIndex(idx)
                     self.mode_combo.blockSignals(False)
-                self.statusbar.showMessage(f"自动检测到 {detected.value.upper()} 模式", 2000)
+                if detected != ParseMode.NORMAL:
+                    self.statusbar.showMessage(
+                        f"自动检测到 {detected.value.upper()} 模式", 2000)
 
         # 启动后台解析
         self._is_parsing = True
@@ -752,6 +261,15 @@ class MainWindow(QMainWindow):
         self._parse_worker.progress_updated.connect(self._on_parse_progress)
         self._parse_worker.parse_finished.connect(self._on_parse_finished)
         self._parse_worker.parse_error.connect(self._on_parse_error)
+        # 结束后自动回收：此前从不 deleteLater，反复解析会累积 QThread 对象，
+        # 且上面 wait(2000) 超时后旧线程仍在跑，GC 回收时触发
+        # "QThread: Destroyed while thread is still running"。
+        # finished 在 run() 返回后发射，晚于 parse_finished，槽函数安全。
+        # 必须先清 self._parse_worker 引用再 deleteLater：否则引用悬空指向
+        # 已销毁的 C++ 对象，下次解析/取消/退出时 isRunning() 抛
+        # RuntimeError，PyQt5 对槽内未捕获异常会 qFatal → 整个程序闪退。
+        self._parse_worker.finished.connect(self._on_parse_worker_finished)
+        self._parse_worker.finished.connect(self._parse_worker.deleteLater)
 
         # 更新UI状态
         self._set_parsing_state(True)
@@ -762,17 +280,46 @@ class MainWindow(QMainWindow):
 
     def _on_clear(self):
         """清空"""
+        # 丢弃"在飞"的解析结果：否则旧线程的 parse_finished 回来后又把刚清空的
+        # 界面填满（用户以为清空没生效）；线程继续跑到结束再自然回收，
+        # 引用保留在 _parse_worker 上，关闭窗口时仍能等待它，不会悬空。
+        worker = self._live_worker()
+        if worker is not None and worker.isRunning():
+            worker.cancel()
+            for sig in (worker.parse_finished, worker.progress_updated,
+                        worker.parse_error):
+                try:
+                    sig.disconnect()
+                except TypeError:
+                    pass
+            self._is_parsing = False
+            self._set_parsing_state(False)
+
         self.hex_input.clear()
         self.parser.clear()
         self.all_frames.clear()
         self._byte_position_map = []
         self._frame_byte_offset = []
         self._frame_input_lines = []
+        self._frame_intervals = []
+        self._current_frame_idx = 0
+        self._last_send_seq = -1
         self._bookmarks.clear()
         self._tab_data.pop(self._current_tab_index, None)
         self.tree_widget.clear()
-        self.table_widget.setRowCount(0)
         self.hex_view.clear()
+        # 搜索/过滤/虚拟视图状态一并复位：此前只清数据不清视图，之后清空
+        # 搜索框会把旧 _view_order 长度还原成 N 行空白（幽灵行），状态栏
+        # 也仍显示"过滤中"。
+        self._pre_search_view = None
+        self._filter_active = False
+        self._filter_counts = None
+        if self.search_input.text():
+            self.search_input.blockSignals(True)
+            self.search_input.clear()
+            self.search_input.blockSignals(False)
+        self.lbl_search_count.setText("")
+        self._populate_table()
         self.lbl_line_count.setText("0 行")
         self._update_status_stats()
 
@@ -800,6 +347,20 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(current)
         self.statusbar.showMessage(f"正在解析报文... {current}/{total}")
 
+    def _on_parse_worker_finished(self):
+        """解析线程结束：清空引用，避免残留指向已被 deleteLater 销毁的
+        C++ 对象的悬空包装器（下次解析/取消/退出访问即崩溃）
+
+        必须校验 sender：上一次解析被 wait() 收尾期间排队到达的 finished
+        会在新 worker 启动后才投递，无条件下清引用会把**新** worker 丢掉，
+        随后取消/关闭都拿不到它 → "QThread: Destroyed while thread is
+        still running"。
+        """
+        worker = self.sender()
+        if isinstance(worker, ParseWorker) and worker is not self._parse_worker:
+            return
+        self._parse_worker = None
+
     def _set_frames(self, frames: list):
         """更新全量帧表并同步主解析器
 
@@ -813,13 +374,24 @@ class MainWindow(QMainWindow):
     def _on_parse_finished(self, frames: list):
         """解析完成处理"""
         self._is_parsing = False
+
+        # 元数据一律取自**发信号的那个** worker：排队信号可能在新一轮解析
+        # 启动后才投递，读 self._parse_worker 会读到别人的映射/上限标志
+        worker = self.sender()
+        if not isinstance(worker, ParseWorker):
+            worker = self._live_worker()
+        elif worker is not self._parse_worker:
+            # 过期 worker 的迟到结果：丢弃，但按钮状态必须恢复，
+            # 否则界面永远停在"解析中"
+            self._set_parsing_state(False)
+            return
+
         self._set_frames(frames)
 
         # 存储输入行映射
-        if hasattr(self._parse_worker, '_frame_input_lines'):
-            self._frame_input_lines = self._parse_worker._frame_input_lines
-        else:
-            self._frame_input_lines = [[] for _ in self.all_frames]
+        lines = getattr(worker, '_frame_input_lines', None)
+        self._frame_input_lines = (lines if lines is not None
+                                   else [[] for _ in self.all_frames])
 
         # 应用输入行颜色（仅普通模式）
         if self.parse_mode == ParseMode.NORMAL:
@@ -837,8 +409,20 @@ class MainWindow(QMainWindow):
         # 恢复按钮状态
         self._set_parsing_state(False)
 
+        # 输入清洗提示：告诉用户哪些字符被丢弃了（此前静默丢弃，用户只看到
+        # "解析出来的报文不对"，分不清是抄错还是工具问题）
+        hex_warns = getattr(worker, 'hex_warnings', None) or []
+        if hex_warns:
+            first = hex_warns[0]
+            more = f" 等 {len(hex_warns)} 处" if len(hex_warns) > 1 else ""
+            self.lbl_input_status.setText(
+                f"⚠ 解析时忽略了非法字符：{first}{more}")
+            self.lbl_input_status.setStyleSheet(
+                "color: #E65100; font-size: 9pt;")
+            self.lbl_input_status.setToolTip("\n".join(hex_warns[:20]))
+
         # 统计信息（用户取消时明确提示为部分结果；未激活截断时提示单条限制）
-        limit_hit = getattr(self._parse_worker, 'hit_frame_limit', False)
+        limit_hit = getattr(worker, 'hit_frame_limit', False)
         error_count = sum(1 for f in self.all_frames if f.error)
         if self._parse_cancelled:
             self._parse_cancelled = False
@@ -851,22 +435,40 @@ class MainWindow(QMainWindow):
             self.statusbar.showMessage(
                 f"解析完成: {len(self.all_frames)} 条报文, {error_count} 条失败", 5000)
 
-        # 未激活被截断 → 弹窗说明并提供激活入口
+        # 未激活被截断 → 提示并提供激活入口（非阻塞）
         if limit_hit:
-            box = QMessageBox(self)
-            box.setWindowTitle("功能限制")
-            box.setIcon(QMessageBox.Information)
-            box.setText(
-                "未激活版本每次只能解析 1 条报文，本次输入中的其余报文已被忽略。\n\n"
-                "激活后可一次性解析全部报文，并解锁文件导入、导出等功能。")
-            box.addButton("打开激活窗口", QMessageBox.ActionRole)
-            box.addButton("知道了", QMessageBox.RejectRole)
-            box.exec_()
-            if box.buttonRole(box.clickedButton()) == QMessageBox.ActionRole:
-                self._open_license_dialog()
+            self._show_limit_dialog()
 
         # 自动切换到报文列表标签
         self.result_tabs.setCurrentIndex(1)
+
+    def _show_limit_dialog(self):
+        """未激活次数限制提示（非阻塞）
+
+        此前用 box.exec_() 在 parse_finished 槽里再开一层事件循环：此时队列里
+        还排着 worker 的 finished/deleteLater，会在嵌套循环里把发信号的对象
+        销毁，槽返回时访问 sender 属于未定义行为（严重时整个进程消失）。
+        改为 open()，槽立即返回。
+        """
+        box = QMessageBox(self)
+        box.setAttribute(Qt.WA_DeleteOnClose, True)
+        box.setWindowTitle("功能限制")
+        box.setIcon(QMessageBox.Information)
+        box.setText(
+            "未激活版本每次只能解析 1 条报文，本次输入中的其余报文已被忽略。\n\n"
+            "激活后可一次性解析全部报文，并解锁文件导入、导出等功能。")
+        open_btn = box.addButton("打开激活窗口", QMessageBox.ActionRole)
+        box.addButton("知道了", QMessageBox.RejectRole)
+
+        def _on_done(_result, box=box, btn=open_btn):
+            try:
+                if box.clickedButton() is btn:
+                    self._open_license_dialog()
+            except RuntimeError:
+                pass    # 对话框已销毁
+
+        box.finished.connect(_on_done)
+        box.open()
 
     def _on_parse_error(self, error_msg: str):
         """解析错误处理"""
@@ -876,39 +478,30 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "解析错误", f"解析过程中发生错误:\n\n{error_msg}")
 
     def _analyze_time_intervals(self):
-        """分析帧间时间间隔"""
+        """分析帧间时间间隔（毫秒；跨零点按 +24h 处理）"""
         self._frame_intervals = []
+        prev = None
         for i, frame in enumerate(self.all_frames):
             if i == 0:
                 self._frame_intervals.append(0)
+                prev = self._timestamp_to_sort_key(frame.original_timestamp)
                 continue
-            ts_current = frame.original_timestamp
-            ts_previous = self.all_frames[i-1].original_timestamp
-            if ts_current and ts_previous:
-                try:
-                    def parse_ts(ts):
-                        parts = ts.replace(',', '.').split(':')
-                        if len(parts) == 3:
-                            h, m, s = int(parts[0]), int(parts[1]), float(parts[2])
-                            return h * 3600 + m * 60 + s
-                        return None
-                    curr = parse_ts(ts_current)
-                    prev = parse_ts(ts_previous)
-                    if curr is not None and prev is not None:
-                        interval = curr - prev
-                        if interval < 0:
-                            interval += 86400
-                        self._frame_intervals.append(round(interval * 1000, 1))
-                        continue
-                except Exception:
-                    pass
-            self._frame_intervals.append(None)
+            cur = self._timestamp_to_sort_key(frame.original_timestamp)
+            if cur < 0 or prev is None or prev < 0:
+                self._frame_intervals.append(None)
+            else:
+                interval = cur - prev
+                if interval < 0:
+                    interval += 86400000      # 跨零点
+                self._frame_intervals.append(round(interval, 1))
+            prev = cur
 
     def _on_cancel_parse(self):
         """取消解析"""
-        if self._parse_worker and self._parse_worker.isRunning():
+        worker = self._live_worker()
+        if worker is not None and worker.isRunning():
             self._parse_cancelled = True
-            self._parse_worker.cancel()
+            worker.cancel()
             self.btn_cancel_parse.setEnabled(False)
             self.statusbar.showMessage("正在取消解析...", 0)
             # 线程在检查点自行退出并回调 _on_parse_finished 呈现部分结果，
@@ -922,14 +515,8 @@ class MainWindow(QMainWindow):
         self.statusbar.showMessage(f"已切换到 {mode_name}", 2000)
 
     def _auto_detect_mode(self, text: str) -> ParseMode:
-        """自动检测输入格式"""
-        if re.search(r'\d{2}:\d{2}:\d{2}\.\d{3}\s+(RX|TX):', text):
-            return ParseMode.XN3000
-        if re.search(r'\d+-\s*\d{2}:\d{2}:\d{2}\.\d{3}\s+(send|recv):', text):
-            return ParseMode.XN8000
-        if re.search(r'\b[0-9A-Fa-f]{2}\s+\.', text):
-            return ParseMode.XN3000
-        return ParseMode.NORMAL
+        """自动检测输入格式（判定规则唯一实现见 iec104_parser.detect_input_format）"""
+        return detect_input_format(text)
 
     # ==================================================================
     # 主题切换
@@ -966,6 +553,8 @@ class MainWindow(QMainWindow):
             "QPushButton:hover { background-color: #b71c1c; }"
         )
         self._apply_status_label_colors(dark=True)
+        # 下拉弹出列表 hover/选中配色（QSS ::item:hover 对弹出不生效）
+        apply_selection_palette(self, dark=True)
 
     def _apply_light_theme(self):
         """应用浅色主题（恢复基础样式表）"""
@@ -981,6 +570,7 @@ class MainWindow(QMainWindow):
             "QPushButton:hover { background-color: #d32f2f; }"
         )
         self._apply_status_label_colors(dark=False)
+        apply_selection_palette(self, dark=False)
 
     def _apply_status_label_colors(self, dark: bool):
         """按主题设置状态文字标签颜色（次要信息在深色下提亮、浅色下正常）"""
@@ -999,6 +589,8 @@ class MainWindow(QMainWindow):
     def _apply_theme_to_dialog(self, dialog):
         """将当前主题应用到子对话框（浅色为统一基础表，深色为完整暗色表）"""
         dialog.setStyleSheet(self.styleSheet())
+        # 下拉弹出列表 hover/选中配色（QSS ::item:hover 对弹出不生效）
+        apply_selection_palette(dialog, self._dark_theme)
         # 同步主题标记（供对话框内部绘制时区分深浅色）
         if hasattr(dialog, "_dark_theme"):
             dialog._dark_theme = self._dark_theme
@@ -1027,7 +619,7 @@ class MainWindow(QMainWindow):
         hex_input.setFont(QFont("Consolas", 11))
         hex_input.setLineWrapMode(QPlainTextEdit.NoWrap)
         hex_input.setAcceptDrops(False)
-        hex_input.textChanged.connect(self._on_input_changed)
+        hex_input.textChanged.connect(self._on_input_timer_start)
         hex_input.setContextMenuPolicy(Qt.CustomContextMenu)
         hex_input.customContextMenuRequested.connect(self._on_input_context_menu)
         tab_layout.addWidget(hex_input)
@@ -1049,9 +641,22 @@ class MainWindow(QMainWindow):
         """关闭输入标签页"""
         if len(self._input_tab_list) <= 1:
             return  # 至少保留一个标签页
-        self.input_tabs.removeTab(index)
+
+        # removeTab 会同步触发 currentChanged → _on_tab_changed，后者按"切换
+        # 到目标页"的逻辑把**被关闭页**的解析结果存进目标页索引（此时
+        # _input_tab_list/_tab_data 都还没重排），随后重排又整体错位一格，
+        # 表现为"关掉 A 后 B 显示的是 A 的报文"，且再切页会把错数据写回。
+        # 正确处理：先保存当前页 → 屏蔽信号关闭 → 重排 → 显式加载目标页。
+        self._save_current_tab_state()
+
+        blocked = self.input_tabs.blockSignals(True)
+        try:
+            self.input_tabs.removeTab(index)
+        finally:
+            self.input_tabs.blockSignals(blocked)
+
         self._input_tab_list.pop(index)
-        # 清理标签页数据并重建索引
+
         old_data = dict(self._tab_data)
         self._tab_data.clear()
         for old_idx, data in old_data.items():
@@ -1059,10 +664,13 @@ class MainWindow(QMainWindow):
                 self._tab_data[old_idx] = data
             elif old_idx > index:
                 self._tab_data[old_idx - 1] = data
-        if self._input_tab_list:
-            idx = min(index, len(self._input_tab_list) - 1)
-            self.hex_input = self._input_tab_list[idx][1]
-            self.input_tabs.setCurrentIndex(idx)
+
+        if not self._input_tab_list:
+            return
+        new_index = min(index, len(self._input_tab_list) - 1)
+        self._current_tab_index = new_index
+        self.hex_input = self._input_tab_list[new_index][1]
+        self._load_tab_state(new_index)
 
     def _on_tab_changed(self, index: int):
         """标签页切换时保存当前状态并加载目标标签页状态"""
@@ -1092,7 +700,10 @@ class MainWindow(QMainWindow):
         """加载指定标签页的解析结果"""
         if index in self._tab_data:
             data = self._tab_data[index]
-            self._set_frames(data["frames"])
+            # 传副本：_set_frames 后 all_frames 与存档是同一个 list，
+            # 之后 _start_parse/_on_clear 里的 all_frames.clear() 会把存档一起清掉
+            # （表现为解析中途切标签页，上一页结果丢失）
+            self._set_frames(list(data["frames"]))
             self._frame_input_lines = data["input_lines"]
             self._bookmarks = data["bookmarks"]
             self._populate_table()
@@ -1215,296 +826,8 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "导出失败", str(e))
 
     # ==================================================================
-    # 填充表格/树
+    # 填充解析树（表格视图见 gui/frame_table.py）
     # ==================================================================
-
-    @staticmethod
-    def _timestamp_to_sort_key(timestamp: str) -> float:
-        """将时间戳字符串转为数值（毫秒），用于排序"""
-        if not timestamp:
-            return -1
-        try:
-            parts = timestamp.replace(',', '.').split(':')
-            if len(parts) == 3:
-                h, m = int(parts[0]), int(parts[1])
-                s = float(parts[2])
-                return h * 3600000 + m * 60000 + s * 1000
-        except (ValueError, IndexError):
-            pass
-        return -1
-
-    def _row_color_for_frame(self, frame: IEC104Frame) -> QColor:
-        """根据帧类型和当前主题返回行背景色"""
-        if self._dark_theme:
-            if frame.error:
-                return QColor("#3D2020")  # 错误: 暗红
-            if not frame.apci:
-                return QColor("#2b2b2b")
-            ftype = frame.apci.frame_type
-            if ftype == "I-format":
-                if frame.signal_type in (SignalType.YK, SignalType.YT):
-                    return QColor("#3D3520")  # 控制: 暗橙
-                return QColor("#20283D")  # 数据: 暗蓝
-            elif ftype == "S-format":
-                return QColor("#203D20")  # 确认: 暗绿
-            elif ftype == "U-format":
-                return QColor("#3D2035")  # 控制: 暗粉
-            return QColor("#2b2b2b")
-        else:
-            if frame.error:
-                return QColor("#FFF0F0")  # 错误: 浅红
-            if not frame.apci:
-                return QColor("#FFFFFF")
-            ftype = frame.apci.frame_type
-            if ftype == "I-format":
-                if frame.signal_type in (SignalType.YK, SignalType.YT):
-                    return QColor("#FFF8E1")  # 控制: 浅橙
-                return QColor("#F5FAFF")  # 数据: 浅蓝
-            elif ftype == "S-format":
-                return QColor("#F5FFF5")  # 确认: 浅绿
-            elif ftype == "U-format":
-                return QColor("#FFF5FA")  # 控制: 浅粉
-            return QColor("#FFFFFF")
-
-    def _populate_table(self):
-        """填充报文列表表格 - 虚拟化：不创建单元格对象，仅更新映射与行数。
-
-        由 FrameCellDelegate 在绘制时实时调用 _cell() 取内容。
-        万帧级数据填充开销从 O(N×12) 降为 O(1)，仅重绘可见区域。
-        注：all_frames 恒为全量，_view_order 只描述“当前可见行”（过滤/搜索/
-        排序后仍可见的帧索引）——因此排序/搜索/点击/导出都经 _frame_idx_at_row 映射。
-        """
-        n = len(self.all_frames)
-        # 数据源(重新解析/换标签页)改变后，回到默认序号序并清空搜索快照
-        self._set_view(list(range(n)))
-        self._sort_column = -1
-        self.table_widget.horizontalHeader().setSortIndicator(-1, Qt.AscendingOrder)
-
-        if not self.all_frames:
-            self.table_widget.viewport().update()
-            return
-
-        # 调整列宽：优先套用用户上次的列宽（同时避免大表全量自适应卡顿），
-        # 没有则按前 300 行采样估算
-        if self._saved_col_widths:
-            for c, wd in enumerate(self._saved_col_widths):
-                if c < self.table_widget.columnCount() and wd >= 20:
-                    self.table_widget.setColumnWidth(c, wd)
-        else:
-            for c, wd in enumerate(self._estimate_col_widths()):
-                self.table_widget.setColumnWidth(c, wd)
-
-        # 自动选中第一条报文
-        self._current_frame_idx = 0
-        if n > 0:
-            self.table_widget.selectRow(0)
-            self._populate_tree(0)
-        self.table_widget.viewport().update()
-
-    def _set_view(self, display_indices: list, from_search: bool = False):
-        """把表格显示行设为 display_indices（all_frames 的索引序列）。
-
-        统一供填充/过滤/搜索/重置使用：重建 _view_order 与反查表、重设行数，
-        随后整体重绘可见区。搜索路径传 from_search=True 以保留搜索快照；
-        其余调用（重新解析/过滤/换标签页）都会取消活跃搜索。
-
-        无可见数据时保留一行空态占位（delegate 绘制引导文字）。
-        """
-        self._view_order = [int(x) for x in display_indices]
-        self._frame_to_row = {fi: vi for vi, fi in enumerate(self._view_order)}
-        if not from_search and self._pre_search_view is not None:
-            # 视图被数据源/过滤重建，活跃搜索随之取消
-            self._pre_search_view = None
-            lbl = getattr(self, "lbl_search_count", None)
-            if lbl is not None:
-                lbl.setText("")
-        self.table_widget.setRowCount(0)
-        if not self._view_order:
-            # 空态：一行占位，delegate 据此绘制引导提示
-            self._view_order = [-1]
-            self._frame_to_row = {}
-        self.table_widget.setRowCount(len(self._view_order))
-        self.table_widget.viewport().update()
-
-    def _cell(self, vi: int, col: int) -> dict:
-        """视图行 vi、列 col 的单元格内容（FrameCellDelegate 绘制时调用）。"""
-        if not (0 <= vi < len(self._view_order)):
-            return self._frame_cell(-1, col)
-        fi = self._view_order[vi]
-        if fi == -1:
-            # 空态占位行：第0列显示引导，其余列为空
-            if self._pre_search_view is not None:
-                text = "无匹配报文 — 请调整搜索关键字或清空搜索框" if col == 0 else ""
-            else:
-                text = "无报文可显示 — 请先在左侧粘贴/导入报文后点击「解析报文」" if col == 0 else ""
-            return {"text": text, "bg": self._empty_bg(), "fg": self._empty_fg(),
-                    "bold": False, "align": Qt.AlignLeft | Qt.AlignVCenter,
-                    "sort": None}
-        if not (0 <= fi < len(self.all_frames)):
-            return self._frame_cell(-1, col)
-        return self._frame_cell(fi, col)
-
-    def _empty_bg(self):
-        return QColor("#1e1e1e") if self._dark_theme else QColor("#FFFFFF")
-
-    def _empty_fg(self):
-        return QColor("#888") if self._dark_theme else QColor("#aaa")
-
-    def _frame_cell(self, fi: int, col: int) -> dict:
-        """帧索引 fi、列 col 的单元格内容（供 _cell 与搜索匹配复用）。
-
-        返回 dict：text / bg / fg / bold / align 以及 sort 排序键。
-        """
-        empty = {"text": "-", "bg": self._empty_bg(), "fg": self._empty_fg(),
-                 "bold": False, "align": Qt.AlignLeft | Qt.AlignVCenter,
-                 "sort": None}
-        if not (0 <= fi < len(self.all_frames)):
-            return empty
-        frame = self.all_frames[fi]
-        row_color = self._row_color_for_frame(frame)
-        i = fi
-        line_map = getattr(self, '_frame_input_lines', [])
-
-        # 序号（书签帧在行首以 📌 标记）
-        text = str(frame.index)
-        if frame.index - 1 in self._bookmarks:
-            text = "📌 " + text
-        if col == 0:
-            return {"text": text, "bg": row_color, "fg": None, "bold": False,
-                    "align": Qt.AlignLeft | Qt.AlignVCenter, "sort": frame.index}
-
-        if col == 1:  # 原始时间
-            ts_text = frame.original_timestamp if frame.original_timestamp else "-"
-            return {"text": ts_text, "bg": row_color,
-                    "sort": self._timestamp_to_sort_key(frame.original_timestamp)}
-
-        if col == 2:  # 方向
-            dir_text = frame.direction
-            if not dir_text and frame.original_direction:
-                dir_text = frame.original_direction.upper()
-            fg = None
-            if "主站→子站" in dir_text or "TX" in dir_text or "SEND" in dir_text:
-                fg = QColor("#E91E63")
-            elif "子站→主站" in dir_text or "RX" in dir_text or "RECV" in dir_text:
-                fg = QColor("#2196F3")
-            return {"text": dir_text, "bg": row_color, "fg": fg, "sort": None}
-
-        if col == 3:  # 信号类型
-            label = frame.signal_label if frame.signal_label else "-"
-            is_sig = frame.signal_type != SignalType.OTHER
-            return {"text": label, "bg": row_color,
-                    "fg": QColor(frame.signal_type.color_hex) if is_sig else None,
-                    "bold": is_sig, "sort": None}
-
-        if col == 4:  # 类型标识
-            tid_text = (f"{frame.asdu.type_id}: "
-                        f"{TypeID.get_description(frame.asdu.type_id)}"
-                        if frame.asdu else
-                        (frame.apci.frame_type if frame.apci else "-"))
-            return {"text": tid_text, "bg": row_color, "sort": None}
-
-        if col == 5:  # 传送原因
-            cot_text = (f"({frame.asdu.cot_cause}) "
-                        f"{COT.get_description(frame.asdu.cot)}"
-                        if frame.asdu else "-")
-            return {"text": cot_text, "bg": row_color, "sort": None}
-
-        if col == 6:  # 公共地址
-            ca_text = f"0x{frame.asdu.common_address:04X}" if frame.asdu else "-"
-            return {"text": ca_text, "bg": row_color, "sort": None}
-
-        if col == 7:  # 对象数
-            obj_text = str(frame.asdu.number_of_objects) if frame.asdu else "-"
-            obj_count = frame.asdu.number_of_objects if frame.asdu else 0
-            return {"text": obj_text, "bg": row_color, "sort": obj_count}
-
-        if col == 8:  # 值（汇总）
-            if frame.asdu and frame.asdu.information_elements:
-                vals = []
-                for elem in frame.asdu.information_elements:
-                    alias = get_alias(elem.ioa, frame.asdu.common_address)
-                    prefix = f"[{alias}] " if alias else ""
-                    vals.append(f"{prefix}{elem.value_desc}")
-                text = " | ".join(vals)
-            else:
-                text = "-"
-            return {"text": text, "bg": row_color, "sort": None}
-
-        if col == 9:  # 描述
-            desc = frame.description if frame.description else (
-                frame.error if frame.error else "")
-            if frame.error:
-                desc = f"❌ {desc}"
-            return {"text": desc, "bg": row_color, "sort": None}
-
-        if col == 10:  # 输入行号
-            fidx = frame.index - 1
-            if fidx < len(line_map) and line_map[fidx]:
-                src_lines = line_map[fidx]
-                line_text = ", ".join(str(n + 1) for n in src_lines)
-                line_sort = src_lines[0] if src_lines else 0
-            else:
-                line_text = "-"
-                line_sort = 0
-            return {"text": line_text, "bg": row_color, "sort": line_sort}
-
-        if col == 11:  # 时间间隔 (ms)
-            if i < len(self._frame_intervals):
-                interval = self._frame_intervals[i]
-                if interval is not None:
-                    text = f"{interval:.0f}ms" if interval > 0 else "-"
-                    fg = None
-                    if interval > 1000:
-                        fg = QColor("#F44336")
-                    elif interval > 500:
-                        fg = QColor("#FF9800")
-                    return {"text": text, "bg": row_color, "fg": fg,
-                            "sort": interval if interval > 0 else -1}
-            return {"text": "-", "bg": row_color, "sort": -1}
-
-        return empty
-
-    def _on_header_sort(self, col: int):
-        """表头点击 → 按该列对 _view_order 排序（数值优先，文本回退）"""
-        if self._sort_column == col:
-            self._sort_order = (Qt.DescendingOrder
-                                if self._sort_order == Qt.AscendingOrder
-                                else Qt.AscendingOrder)
-        else:
-            self._sort_column = col
-            self._sort_order = Qt.AscendingOrder
-
-        self._sort_view_by(col, self._sort_order)
-        self.table_widget.horizontalHeader().setSortIndicator(
-            col, self._sort_order)
-        self.table_widget.viewport().update()
-
-    def _sort_view_by(self, col: int, order: int):
-        """按列排序 _view_order，采用与旧版一致的“数值优先/文本回退”规则"""
-        if not self._view_order:
-            return
-
-        def key_of(fi):
-            # sort 传递给 key_of 的是 _view_order 的元素——即“帧索引”fi，
-            # 因此直接用 _frame_cell(fi, col) 取键；若用 _cell(vi, col) 会把
-            # fi 当成视图行再做一层 _view_order 反查，非恒等视图时键会错乱。
-            cell = self._frame_cell(fi, col)
-            sk = cell.get("sort")
-            if sk is None:
-                # 无数值：按显示文本兜底，排在有数值行之后
-                return (False, 0, cell["text"])
-            if isinstance(sk, bool):
-                return (True, float(sk), cell["text"])
-            try:
-                return (True, float(sk), cell["text"])
-            except (TypeError, ValueError):
-                return (False, 0, cell["text"])
-
-        self._view_order.sort(key=key_of, reverse=(order == Qt.DescendingOrder))
-        if self._pre_search_view:
-            # 搜索激活中排序：快照与视图同步排序，后续输入的匹配范围不回退到旧顺序
-            self._pre_search_view.sort(key=key_of, reverse=(order == Qt.DescendingOrder))
-        self._frame_to_row = {fi: vi for vi, fi in enumerate(self._view_order)}
 
     def _populate_tree(self, frame_index: int):
         """填充解析树"""
@@ -1760,15 +1083,6 @@ class MainWindow(QMainWindow):
     # 事件处理
     # ==================================================================
 
-    def _frame_idx_at_row(self, row: int) -> int:
-        """视图行号 -> all_frames 索引（经 _view_order 映射，排序/搜索后仍正确）"""
-        if 0 <= row < len(self._view_order):
-            return self._view_order[row]
-        return row
-
-    def _row_of_frame(self, frame_idx: int) -> int:
-        """all_frames 索引 -> 视图行号；找不到返回 -1"""
-        return self._frame_to_row.get(frame_idx, -1)
 
     def _on_table_click(self, row: int, col: int):
         """表格行单击 -> 更新解析详情（不切换标签页）"""
@@ -2038,7 +1352,10 @@ class MainWindow(QMainWindow):
         line_map = getattr(self, '_frame_input_lines', [])
         doc = self.hex_input.document()
 
-        if frame_index >= len(line_map) or not line_map[frame_index]:
+        # 负下标必须显式拦截：空列表/无选中帧时 frame_index 为 -1，
+        # 此前会走到 line_map[-1]（高亮最后一条报文，且可能越界构造游标）
+        if frame_index < 0 or frame_index >= len(line_map) \
+                or not line_map[frame_index]:
             self.hex_input.setExtraSelections([])
             return
 
@@ -2081,25 +1398,31 @@ class MainWindow(QMainWindow):
             for ln in src_lines:
                 line_to_frame[ln] = fidx
 
+        # 行数过大时整片着色代价过高（每行都要构造 QTextCursor 与
+        # ExtraSelection），直接跳过：着色只是可读性增强，不影响解析结果。
+        MAX_COLORED_LINES = 5000
+        if len(all_lines) > MAX_COLORED_LINES:
+            self.hex_input.setExtraSelections([])
+            return
+
         selections = []
         colors = [QColor("#F5F5F5"), QColor("#FFFFFF")]
+        # 线性推进字符偏移：此前在循环内 sum(...for j in range(i)) 是 O(n²)，
+        # 5 万行输入需要 12.5 亿次操作，界面直接冻死。
+        pos = 0
         for i, line in enumerate(all_lines):
-            if not line.strip() or line.strip().startswith("#"):
-                continue
-            fidx = line_to_frame.get(i, -1)
-            if fidx < 0:
-                continue
-
-            pos_start = sum(len(all_lines[j]) + 1 for j in range(i))
-            pos_end = pos_start + len(line)
-
-            sel = QTextEdit.ExtraSelection()
-            sel.format.setBackground(colors[fidx % 2])
-            cursor = self.hex_input.textCursor()
-            cursor.setPosition(pos_start)
-            cursor.setPosition(pos_end, QTextCursor.KeepAnchor)
-            sel.cursor = cursor
-            selections.append(sel)
+            line_len = len(line)
+            if line.strip() and not line.strip().startswith("#"):
+                fidx = line_to_frame.get(i, -1)
+                if fidx >= 0:
+                    sel = QTextEdit.ExtraSelection()
+                    sel.format.setBackground(colors[fidx % 2])
+                    cursor = self.hex_input.textCursor()
+                    cursor.setPosition(pos)
+                    cursor.setPosition(pos + line_len, QTextCursor.KeepAnchor)
+                    sel.cursor = cursor
+                    selections.append(sel)
+            pos += line_len + 1   # +1 为换行符
 
         self.hex_input.setExtraSelections(selections)
 
@@ -2177,6 +1500,10 @@ class MainWindow(QMainWindow):
     # ==================================================================
     # 实时输入校验
     # ==================================================================
+
+    def _on_input_timer_start(self):
+        """输入变化仅重启防抖定时器，真正的校验由 _on_input_changed 执行"""
+        self._input_timer.start()
 
     def _on_input_changed(self):
         """输入区内容变化时实时校验（忽略注释行与日志格式的时间/方向标记）"""
@@ -2268,6 +1595,11 @@ class MainWindow(QMainWindow):
             self._end_search()
             return
 
+        # 防御 ReDoS：搜索框直接把用户输入当正则编译。嵌套量词（如 (a+)+$）
+        # 配合较长匹配串会指数级回溯卡死 UI。单元格文本天然很短，主要风险
+        # 来自异常长的模式，故限制长度；编译失败（语法非法）再回退字面量。
+        if len(text) > 256:
+            text = text[:256]
         try:
             pattern = re.compile(text, re.IGNORECASE)
         except re.error:
@@ -2538,9 +1870,9 @@ class MainWindow(QMainWindow):
         dlg = IOAAliasDialog(self)
         self._apply_theme_to_dialog(dlg)
         dlg.exec_()
-        # 刷新当前显示
+        # 刷新当前显示（保留过滤/搜索条件，不退回全量视图）
         if self.all_frames:
-            self._populate_table()
+            self._apply_current_view()
             if self._current_frame_idx < len(self.all_frames):
                 self._populate_tree(self._current_frame_idx)
 
@@ -2630,8 +1962,8 @@ class MainWindow(QMainWindow):
             if bm < current_fi:
                 self._select_bookmark_row(bm)
                 return
-        # Wrap around
-        self._select_bookmark_row(sorted(self._bookmarks)[0])
+        # Wrap around（回绕到最大书签，此前误用 [0] 跳到最小）
+        self._select_bookmark_row(sorted(self._bookmarks)[-1])
 
     # ==================================================================
     # 快捷添加IOA别名
@@ -2645,10 +1977,16 @@ class MainWindow(QMainWindow):
         if ok and alias:
             aliases = load_aliases()
             aliases[f"0x{ioa:06X}"] = alias
-            save_aliases(aliases)
+            try:
+                save_aliases(aliases)
+            except OSError as e:
+                # 槽函数里抛未捕获异常会被 PyQt5 当致命错误；写盘失败
+                # （只读目录/占用）只提示，不带走整个程序
+                QMessageBox.warning(self, "保存失败", f"别名写入失败: {e}")
+                return
             self.statusbar.showMessage(f"已设置别名: 0x{ioa:06X} -> {alias}", 2000)
-            # Refresh table to show new alias
-            self._populate_table()
+            # 刷新显示（保留过滤/搜索条件）
+            self._apply_current_view()
 
     # ==================================================================
     # 键盘导航
@@ -2657,28 +1995,62 @@ class MainWindow(QMainWindow):
     def _table_key_press(self, event):
         """表格键盘导航"""
         current_row = self.table_widget.currentRow()
+        # 视图行 → 帧下标：过滤/搜索/排序后视图行号 ≠ 帧下标，用 len(all_frames)
+        # 做上界判断会把有效行判成越界（反之亦然），统一走映射函数
+        fi = self._frame_idx_at_row(current_row)
+        valid_row = fi >= 0
 
         if event.key() == Qt.Key_Return or event.key() == Qt.Key_Enter:
             # Enter: 显示解析详情
-            if 0 <= current_row < len(self.all_frames):
+            if valid_row:
                 self._show_detail(current_row)
         elif event.key() == Qt.Key_F2:
             # F2: 定位原始报文
-            if 0 <= current_row < len(self.all_frames):
+            if valid_row:
                 self._locate_original_message(current_row)
         elif event.key() == Qt.Key_Space:
             # Space: 切换书签
-            if 0 <= current_row < len(self.all_frames):
+            if valid_row:
                 self._toggle_bookmark(current_row)
         else:
             QTableWidget.keyPressEvent(self.table_widget, event)
 
     def closeEvent(self, event):
         """关闭窗口时安全停止后台线程并保存界面状态"""
-        if self._parse_worker and self._parse_worker.isRunning():
-            self._parse_worker.cancel()
-            # 等待线程自行退出（不用 terminate：强杀线程有崩溃风险）
-            self._parse_worker.wait(5000)
+
+        # 模拟器对话框是非模态子窗口且 WA_DeleteOnClose=False，主窗口析构
+        # 子对象时 Qt **不会**触发它的 closeEvent → 其中 sim.stop() /
+        # _save_config() 全部不执行，退出时报
+        # "QThread: Destroyed while thread is still running"（可能 abort）。
+        sim_dlg = getattr(self, '_simulator_dialog', None)
+        if sim_dlg is not None:
+            sim_dlg.close()
+
+        worker = self._live_worker()
+        if worker is not None and worker.isRunning():
+            worker.cancel()
+            # 断开信号，避免线程收尾时回调已半销毁的控件。
+            # 逐个 try：某个信号本就没连接时 disconnect 抛 TypeError，
+            # 写在同一个 try 里会让后面的信号继续连着。
+            for sig in (worker.parse_finished, worker.progress_updated,
+                        worker.parse_error):
+                try:
+                    sig.disconnect()
+                except TypeError:
+                    pass
+            # 等待线程自行退出（不用 terminate：强杀线程有崩溃风险）。
+            # 但 wait 超时后若直接 accept 退出，QThread 仍可能在运行中被
+            # 析构 → abort；此时 terminate 是唯一可行兜底（退出前一刻，
+            # 可接受）。
+            if not worker.wait(5000):
+                logger.warning("解析线程 5s 内未退出，强制终止")
+                worker.terminate()
+                worker.wait(500)
+        if worker is not None:
+            # 此前从不回收：旧线程仍可能被 GC 时销毁于运行中
+            worker.deleteLater()
+            self._parse_worker = None
+
         self._save_ui_settings()
         event.accept()
 
@@ -2735,22 +2107,6 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.warning(f"保存界面设置失败: {e}")
 
-    def _estimate_col_widths(self, sample_rows: int = 300) -> list:
-        """按前 N 行文本实际宽度估算各列列宽。
-
-        大报表（数千行）调用 resizeColumnsToContents 会逐单元格测量导致明显卡顿，
-        抽样估算在毫秒级完成，视觉效果接近。
-        """
-        fm = QFontMetrics(self.table_widget.font())
-        cols = self.table_widget.columnCount()
-        rows = min(self.table_widget.rowCount(), sample_rows)
-        max_w = [40] * cols
-        for r in range(rows):
-            for c in range(cols):
-                w = fm.horizontalAdvance(self._cell(r, c)["text"]) + 28
-                if w > max_w[c]:
-                    max_w[c] = w
-        return [min(w, 420) for w in max_w]
 
     def _on_about(self):
         """版本信息对话框"""
@@ -3027,10 +2383,6 @@ class MainWindow(QMainWindow):
         self.filter_time_to.clear()
         self.ioa_from_input.clear()
         self.ioa_to_input.clear()
-        self._filter_active = False
-        self._filter_counts = None
-        self.filter_btn.setStyleSheet(FILTER_BTN_STYLE_IDLE)
-        self.filter_btn.setToolTip("按条件过滤报文列表")
-        self._populate_table()
+        self._populate_table()   # 内部会复位过滤状态与按钮外观
         self._update_status_stats()
         self.statusbar.showMessage("过滤已重置", 2000)

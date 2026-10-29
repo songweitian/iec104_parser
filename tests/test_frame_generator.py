@@ -161,31 +161,44 @@ class TestM5TimedFix:
 
 
 class TestSboSelectBit:
-    """遥控/设点命令 S/E（选择/执行）位编码（SBO 预制）"""
+    """遥控/设点命令 S/E（选择/执行）位编码（SBO 预制）
+
+    标准（IEC 60870-5-101 §7.2.6）：S/E=1 选择、S/E=0 执行。
+    此前实现反了（select=True 写 bit7=0），与真实装置联调时预制帧会被
+    对端当作执行帧，注册即置位——测试同步改为标准语义。
+    """
 
     def test_single_point_select_execute(self):
-        """45 单点命令：select=True 置 S/E=0，False 置 S/E=1"""
+        """45 单点命令：select=True 置 S/E=1，False 置 S/E=0"""
         # ASDU 值字节位于帧偏移 15（6 + 9头）
         f_sel = _frame_bytes(generate_i_frame(45, 6, 1, 0x4001, 1, select=True))
-        assert f_sel[15] == 0x01, f"选择帧 SCO={f_sel[15]:#x}，期望 0x01(S/E=0)"
+        assert f_sel[15] == 0x81, f"选择帧 SCO={f_sel[15]:#x}，期望 0x81(S/E=1)"
         f_exec = _frame_bytes(generate_i_frame(45, 6, 1, 0x4001, 1, select=False))
-        assert f_exec[15] == 0x81, f"执行帧 SCO={f_exec[15]:#x}，期望 0x81(S/E=1)"
+        assert f_exec[15] == 0x01, f"执行帧 SCO={f_exec[15]:#x}，期望 0x01(S/E=0)"
 
     def test_double_point_select_execute(self):
         """46 双点命令：value 为完整 SCO 字节（DCS=2 已编码在 bit2-3）"""
         # DCS=2(合) 编码为 0x08（bit2-3），select 只改 S/E 位
         f_sel = _frame_bytes(generate_i_frame(46, 6, 1, 0x4001, 0x08, select=True))
-        assert f_sel[15] == 0x08, f"选择帧 SCO={f_sel[15]:#x}"
+        assert f_sel[15] == 0x88, f"选择帧 SCO={f_sel[15]:#x}"
         f_exec = _frame_bytes(generate_i_frame(46, 6, 1, 0x4001, 0x08, select=False))
-        assert f_exec[15] == 0x88, f"执行帧 SCO={f_exec[15]:#x}"
+        assert f_exec[15] == 0x08, f"执行帧 SCO={f_exec[15]:#x}"
+
+    def test_rc_step_command_se_bit6(self):
+        """47 调节步命令：RCO 的 S/E 在 bit6（bit7 是 QL）"""
+        # RCA=1（降一步）→ 0x01；选择 → bit6 → 0x41
+        f_sel = _frame_bytes(generate_i_frame(47, 6, 1, 0x4001, 0x01, select=True))
+        assert f_sel[15] == 0x41, f"选择帧 RCO={f_sel[15]:#x}，期望 0x41"
+        f_exec = _frame_bytes(generate_i_frame(47, 6, 1, 0x4001, 0x01, select=False))
+        assert f_exec[15] == 0x01, f"执行帧 RCO={f_exec[15]:#x}，期望 0x01"
 
     def test_setpoint_qos_select_execute(self):
         """48 设点命令：QOS 的 S/E 位（第 4 字节 bit7）"""
         # 48: IOA后 2字节值 + 1字节QOS → QOS 在帧偏移 15+2=17
         f_sel = _frame_bytes(generate_i_frame(48, 6, 1, 0x4001, 100, select=True))
-        assert f_sel[17] == 0x00, f"选择 QOS={f_sel[17]:#x}，期望 S/E=0"
+        assert f_sel[17] == 0x80, f"选择 QOS={f_sel[17]:#x}，期望 S/E=1"
         f_exec = _frame_bytes(generate_i_frame(48, 6, 1, 0x4001, 100, select=False))
-        assert f_exec[17] == 0x80, f"执行 QOS={f_exec[17]:#x}，期望 S/E=1"
+        assert f_exec[17] == 0x00, f"执行 QOS={f_exec[17]:#x}，期望 S/E=0"
 
     def test_select_param_ignored_for_plain_measurement(self):
         """对非命令类型（如 9 测量值），select 参数不改变字节"""
